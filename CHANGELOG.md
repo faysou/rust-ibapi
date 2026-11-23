@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ContractDetails::last_trade_date_time()` joins the expiry date and `last_trade_time` into a `time::PrimitiveDateTime`, wall clock with no zone applied: `2026-12-18 08:30` for ES 202612. `None` when TWS sends the date alone, as for standard monthly US equity options; `Error::Parse` for a time that isn't `HH:MM:SS`. Its rustdoc records that TWS labels the time with the requested exchange's zone while the clock follows the contract (a US equity option on CBOE carries its New York time under `US/Central`), so resolving the zone stays with the caller (#PR).
 - `ExpirationDate` and `ContractMonth` implement `Copy` (#1260).
 - `ContractDetails::event_contract_topic`, `event_contract_description` and `event_contract_question`: a ForecastEx event contract's topic (`"US Fed Funds Target Rate"`), description (strike, expiry and right, `"FF Jan28'27 3.125"`) and full question. TWS sent them, and the client dropped them. Empty for other contracts. A struct literal or pattern naming every field must add them; see `docs/migration-6.0.md` §35 (#1251).
 - Historical and realtime `Bar`, and `TickLast`, `TickBidAsk`, `TickMidpoint`, `TickAttributeLast` and `TickAttributeBidAsk`, implement `Default`: zero values, empty strings and a Unix-epoch timestamp, with `count` `-1` on a historical `Bar` (what TWS sends for non-TRADES bars) and no `volume` or `wap` on a realtime `Bar` (#1232, #1244).
