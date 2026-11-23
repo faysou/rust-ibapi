@@ -1158,3 +1158,25 @@ enum rejects a name or a tagged object. An open string enum (`SecurityType`, `Se
 unrecognized code. A `Contract` stored by 5.x with `"security_type":"Stock"` loads as
 `SecurityType::Other("Stock")`, and a request built from it sends `Stock` to TWS. Convert stored JSON before loading it, by mapping each variant name to
 its code (`as_str()` lists the codes for the string enums, `i32::from` for the integer ones).
+
+### 48. Order codes outside 200-399 move out of `NoticeCategory::Error`
+
+Eleven order codes outside the order-rejection band no longer classify as `NoticeCategory::Error`.
+Each was verified against a paper account (`docs/wire-facts/orders.md`):
+
+| Codes | Category | Meaning |
+| ----- | -------- | ------- |
+| 103, 110, 10244, 10317 | `OrderRejection` | TWS rejected a new order and created none |
+| 104, 105, 10067, 10147, 10148, 10241, 10242 | `OrderChangeRejection` (new) | TWS refused a cancel or modify, and the request changed nothing |
+
+`NoticeCategory` is `#[non_exhaustive]`, so a `match` compiles unchanged, but a
+`NoticeCategory::Error` arm or a wildcard arm no longer sees these codes. `is_error()` is still
+true for all of them, and they still end the `place_order` or `cancel_order` subscription.
+
+Check code that drops an order on `is_order_rejection()`. On a modify of a working order, TWS also
+answers with an `OrderRejection` code (201, 321), and the order goes on working with its earlier
+terms. Treat the order as gone only when no status has been seen for it. For an
+`OrderChangeRejection`, the order keeps its state; read its statuses or `open_orders` to learn it.
+
+A refused cancel or modify that arrives before any status for the order no longer starts an
+`order_status_stream`, so `wait_for_fill` does not report it as `OrderOutcome::Rejected`.
