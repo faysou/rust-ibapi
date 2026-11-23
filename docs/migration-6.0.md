@@ -1028,3 +1028,25 @@ and no longer matches. A serialized `Contract` with one of these types writes `"
 or `"EventContract"` where it wrote `{"Other":"IOPT"}`, and JSON written by 5.x for them still
 deserializes as `Other`, which compares unequal to the new variant; re-parse with
 `t.as_str().parse()` to normalize.
+
+### 44. A completed order's `OrderData::order_id` is the order's id
+
+`completed_orders` and the `StartupMessage::CompletedOrder` callback returned every record with
+`OrderData::order_id` set to `-1`; the id was only in `order.order_id`. The `CompletedOrder`
+message has no top-level id, and 3.0 kept `-1` from the text decoder. `OrderData::order_id` is
+now `order.order_id`, as it is for open orders.
+
+```rust,ignore
+// 5.x
+let id = data.order.order_id;    // data.order_id was -1
+if data.order_id == -1 { /* completed record */ }
+
+// 6.0
+let id = data.order_id;          // or data.order.order_id; both hold the id
+```
+
+The compiler doesn't catch code that tests `order_id == -1` to tell a completed record from an
+open one. Track which request a record came from instead.
+
+To read a completed record's status and quantities, use `OrderData::completed_order_status()`.
+A completed order's `order.total_quantity` is the quantity left unfilled, not the size ordered.

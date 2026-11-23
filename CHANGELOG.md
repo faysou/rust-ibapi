@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `OrderData::completed_order_status()` returns the `OrderStatus` of a record from `completed_orders`, the status `wait_for_fill` builds: `remaining` is `order.total_quantity`, which TWS sends as the quantity left unfilled (`0` once filled), and the fill prices are `None`. Computing remaining as `total_quantity - filled_quantity` from the record is wrong, and nothing public gave the right value (#PR).
 - `ExpirationDate` and `ContractMonth` implement `Copy` (#1260).
 - `ContractDetails::event_contract_topic`, `event_contract_description` and `event_contract_question`: a ForecastEx event contract's topic (`"US Fed Funds Target Rate"`), description (strike, expiry and right, `"FF Jan28'27 3.125"`) and full question. TWS sent them, and the client dropped them. Empty for other contracts. A struct literal or pattern naming every field must add them; see `docs/migration-6.0.md` §35 (#1251).
 - Historical and realtime `Bar`, and `TickLast`, `TickBidAsk`, `TickMidpoint`, `TickAttributeLast` and `TickAttributeBidAsk`, implement `Default`: zero values, empty strings and a Unix-epoch timestamp, with `count` `-1` on a historical `Bar` (what TWS sends for non-TRADES bars) and no `volume` or `wap` on a realtime `Bar` (#1232, #1244).
@@ -27,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `OrderData::order_id` of a completed order is the order's id, the same as `order.order_id`. It was always `-1`, so matching completed orders on it matched nothing. See `docs/migration-6.0.md` §44 (#PR).
 - `ContractDetails::under_security_type` is `Option<SecurityType>` instead of `String`, `None` where TWS sends nothing. JSON written by 5.x (`"STK"`, `""`) no longer deserializes. See `docs/migration-6.0.md` §41 (#1254).
 - `OptionChain::expirations` is `Vec<Expiry>` instead of `Vec<String>`. TWS sends each expiration as a `YYYYMMDD` date, now an `Expiry::Date(ExpirationDate)` that goes straight into `Contract::option`; a `YYYYMM` entry is an `Expiry::Month`, other text is kept as `Expiry::Unknown`, and an empty entry is dropped. `Expiry` has no order; the new `Expiry::date()` and `Expiry::month()` return the inner date or month by value, which do. See `docs/migration-6.0.md` §40 (#1253).
 - `ContractDescription::derivative_security_types` is `Vec<SecurityType>` instead of `Vec<String>`. A code the crate doesn't model is `SecurityType::Other`, and an empty entry is dropped. See `docs/migration-6.0.md` §42 (#1261).
