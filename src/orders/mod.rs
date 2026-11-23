@@ -52,7 +52,7 @@ pub use crate::client::ids::OrderId;
 pub use builder::order_builder::{AttachedOrdersBuilder, BracketOrderBuilder, ClientBound, Detached, OrderBuilder};
 pub use builder::types::{AttachedOrderIds, BracketOrderIds};
 pub use exercise_options_builder::ExerciseOptionsBuilder;
-pub use fills::{pair_executions, Fill, FillMatcher, ReportMatch, Unpaired};
+pub use fills::{Fill, FillMatcher, ReportMatch, Unpaired};
 pub use order_type::OrderType;
 
 // Re-export condition types and builders
@@ -1484,8 +1484,8 @@ impl_wire_enum!(OrderOpenClose, fallback Unknown);
 /// [`order_update_stream`](crate::Client::order_update_stream)).
 ///
 /// [`FillMatcher`] does the join on a stream, in either arrival order, and
-/// [`pair_executions`] on a whole `executions` reply. Both yield a [`Fill`]. TWS sends no
-/// report for some executions; see [`Execution::expects_commission_report`].
+/// [`FillMatcher::pair_executions`] on a whole `executions` reply. Both yield a [`Fill`]. TWS sends no
+/// report for some executions; see [`FillMatcher::expects_report`].
 ///
 /// # Examples
 ///
@@ -1510,7 +1510,7 @@ impl_wire_enum!(OrderOpenClose, fallback Unknown);
 #[derive(Clone, Debug, Default)]
 pub struct CommissionAndFeesReport {
     /// The [`Execution::execution_id`] this commission belongs to; [`FillMatcher`]
-    /// and [`pair_executions`] join on it (see the type-level docs).
+    /// joins on it (see the type-level docs).
     pub execution_id: String,
     /// The commissions and fees charged for the execution.
     pub commission_and_fees: f64,

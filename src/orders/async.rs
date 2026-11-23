@@ -634,7 +634,7 @@ impl Client {
     /// Both [`ExecutionData`] and
     /// [`CommissionAndFeesReport`] are delivered on this
     /// stream. To join each commission to its execution, read the reply with
-    /// `collect_to_end_within` and pass it to [`pair_executions`].
+    /// `collect_to_end_within` and pass it to [`FillMatcher::pair_executions`].
     ///
     /// # Examples
     ///
