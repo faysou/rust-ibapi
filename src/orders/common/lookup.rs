@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::client::ids::OrderId;
 use crate::orders::{OrderData, OrderLookup, Orders};
+use crate::Error;
 
 /// How often a lookup reads completed orders again while neither reply lists
 /// the order. A finished order leaves open orders before it reaches completed
@@ -24,6 +25,16 @@ pub(crate) enum OrderKey {
 }
 
 impl OrderKey {
+    /// The key for `perm_id`, checked where it enters the crate. TWS assigns
+    /// positive perm ids; a record without one carries `0`, which a key of
+    /// `0` or below would match.
+    pub(crate) fn perm_id(perm_id: i64) -> Result<Self, Error> {
+        if perm_id <= 0 {
+            return Err(Error::InvalidArgument(format!("perm id must be positive, got {perm_id}")));
+        }
+        Ok(OrderKey::PermId(perm_id))
+    }
+
     /// [`OrderLookup::Working`] when an open-orders reply lists the order with
     /// a status that is not terminal. A finished order can still be listed for
     /// a few milliseconds with its final status (live: `Inactive`), which is
