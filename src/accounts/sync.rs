@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 
 use crate::client::blocking::{ClientRequestBuilders, Subscription, SubscriptionBuilderExt};
 use crate::common::request_helpers::{self, empty_on_end_of_stream, expect_proto};
-use crate::messages::OutgoingMessages;
+use crate::messages::{resubscribed_notice, OutgoingMessages};
 use crate::{client::sync::Client, Error};
 
 use super::common::snapshots::SnapshotBuilder;
@@ -228,6 +228,9 @@ impl Client {
     /// emitted only when a row changed a value since the previous one. Choose `quiet` longer than
     /// the gap between the rows of one push, which arrive within milliseconds of each other.
     ///
+    /// The stream ends when the transport reconnects; to resubscribe and keep going, use
+    /// [`account_summary_snapshots_resubscribing`](Self::account_summary_snapshots_resubscribing).
+    ///
     /// To fold the rows with your own batching instead, use [`AccountSummarySnapshot::apply`].
     ///
     /// Notices that arrive on the subscription are logged at `warn!`. For other streams that dump
@@ -268,6 +271,66 @@ impl Client {
             subscription,
             builder: SnapshotBuilder::default(),
             quiet,
+        })
+    }
+
+    /// [`account_summary_snapshots`](Self::account_summary_snapshots) that survives transport
+    /// reconnects.
+    ///
+    /// When the connection drops, it waits for the reconnect, requests the summary again, and
+    /// yields `Err(`[`Error::Notice`]`)` with code [`TRANSPORT_RECONNECT_CODE`](crate::TRANSPORT_RECONNECT_CODE)
+    /// before the next snapshot, as [`resubscribing`](Self::resubscribing) does. The next snapshot
+    /// is built from scratch: it completes at the new subscription's `End`, holds only the rows
+    /// that subscription reports, and drops rows not yet emitted before the outage. Values that
+    /// changed during the outage are missing.
+    ///
+    /// It ends after yielding any other error, the error [`wait_connected`](Self::wait_connected)
+    /// returns when the reconnect gave up, or once the subscription ends.
+    ///
+    /// # Arguments
+    /// * `group` - Set to "All" to return account summary data for all accounts, or set to a specific Advisor Account Group name that has already been created in TWS Global Configuration.
+    /// * `tags`  - List of the desired tags.
+    /// * `quiet` - How long without a row completes a pushed update.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::client::blocking::Client;
+    /// use ibapi::accounts::AccountSummaryTags;
+    /// use ibapi::accounts::types::AccountGroup;
+    /// use ibapi::{Error, TRANSPORT_RECONNECT_CODE};
+    /// use std::time::Duration;
+    ///
+    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
+    ///
+    /// let group = AccountGroup("All".to_string());
+    /// let tags = &[AccountSummaryTags::NET_LIQUIDATION];
+    ///
+    /// let snapshots = client
+    ///     .account_summary_snapshots_resubscribing(&group, tags, Duration::from_secs(1))
+    ///     .expect("error requesting account summary");
+    /// for snapshot in snapshots {
+    ///     match snapshot {
+    ///         Ok(snapshot) => println!("{} rows", snapshot.len()),
+    ///         Err(Error::Notice(n)) if n.code == TRANSPORT_RECONNECT_CODE => println!("gap: {n}"),
+    ///         Err(e) => eprintln!("error: {e}"),
+    ///     }
+    /// }
+    /// ```
+    pub fn account_summary_snapshots_resubscribing(
+        &self,
+        group: &AccountGroup,
+        tags: &[&str],
+        quiet: Duration,
+    ) -> Result<AccountSummarySnapshotsResubscribing<'_>, Error> {
+        let snapshots = self.account_summary_snapshots(group, tags, quiet)?;
+
+        Ok(AccountSummarySnapshotsResubscribing {
+            client: self,
+            group: group.clone(),
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            quiet,
+            snapshots: Some(snapshots),
         })
     }
 
@@ -619,6 +682,76 @@ impl Iterator for AccountSummarySnapshots {
                 Some(Err(e)) => return Some(Err(e)),
                 None => return self.builder.flush().map(Ok),
             }
+        }
+    }
+}
+
+/// Account summary snapshots that survive transport reconnects, from
+/// [`Client::account_summary_snapshots_resubscribing`].
+pub struct AccountSummarySnapshotsResubscribing<'a> {
+    client: &'a Client,
+    group: AccountGroup,
+    tags: Vec<String>,
+    quiet: Duration,
+    /// `None` once the stream has ended.
+    snapshots: Option<AccountSummarySnapshots>,
+}
+
+impl std::fmt::Debug for AccountSummarySnapshotsResubscribing<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountSummarySnapshotsResubscribing")
+            .field("group", &self.group)
+            .field("tags", &self.tags)
+            .field("quiet", &self.quiet)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AccountSummarySnapshotsResubscribing<'_> {
+    /// Cancels the underlying subscription. Iteration then ends, after a final snapshot of any rows
+    /// not yet emitted.
+    pub fn cancel(&self) {
+        if let Some(snapshots) = &self.snapshots {
+            snapshots.cancel();
+        }
+    }
+
+    /// Waits for the reconnect and requests the summary again. Returns the gap notice, or the
+    /// error that ends the stream.
+    fn resubscribe(&mut self) -> Error {
+        let tags: Vec<&str> = self.tags.iter().map(String::as_str).collect();
+        loop {
+            if let Err(e) = self.client.wait_connected() {
+                return e;
+            }
+            match self.client.account_summary_snapshots(&self.group, &tags, self.quiet) {
+                Ok(snapshots) => {
+                    self.snapshots = Some(snapshots);
+                    return Error::Notice(resubscribed_notice());
+                }
+                Err(e) if e.is_connection_lost() => {}
+                Err(e) => return e,
+            }
+        }
+    }
+}
+
+impl Iterator for AccountSummarySnapshotsResubscribing<'_> {
+    type Item = Result<AccountSummarySnapshot, Error>;
+
+    /// Returns the next snapshot, the reconnect notice, or `None` once the stream has ended.
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.snapshots.as_mut()?.next() {
+            Some(Err(e)) if e.is_connection_lost() => {
+                // Its request died with the old session; dropping it sends no cancel.
+                self.snapshots = None;
+                Some(Err(self.resubscribe()))
+            }
+            None => {
+                self.snapshots = None;
+                None
+            }
+            item => item,
         }
     }
 }
