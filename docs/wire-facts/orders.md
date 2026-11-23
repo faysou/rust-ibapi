@@ -4,16 +4,52 @@ Placement, echoes, status, executions and completed orders. Format: [README](REA
 
 ### `transmit` absent means held
 
-*Live 2026-09-23, paper Gateway, server 220; #841 (closed, not a bug).*
+*Live 2026-11-23 off-hours, paper TWS, server 223, AAPL BUY 1 LMT 1.00; first seen 2026-09-23,
+paper Gateway, server 220 (#841, closed, not a bug).*
 
 - A placeOrder proto with `transmit` left out (what `some_bool(false)` produces): TWS holds the
-  order. permId assigned, no OrderStatus, absent from open_orders; cancel returns 202 "Order was
-  discarded" + 161. Control with `transmit=true` goes PreSubmitted → Submitted.
+  order. It gets a permId but sends nothing for it: no OpenOrder, OrderStatus or notice on
+  `order_update_stream` within 3 s. Control with `transmit=true` goes PreSubmitted → Submitted.
+- A held order is listed nowhere: absent from `open_orders`, `all_open_orders` and
+  `completed_orders(false)` while held, and from `completed_orders` after it is cancelled.
+- Cancelling it is order-bound: the cancel's own subscription receives OrderStatus `Cancelled`
+  (with the permId) and 202 "Order Canceled - reason:Order was discarded.", then 161 "Cancel
+  attempted when order is not in a cancellable state. Order permId =…" as an error that ends the
+  subscription. The same three frames reach `order_update_stream`. Server 220 showed 202 + 161.
+- Cancelling the id again returns 10148 "…cannot be cancelled, state: Cancelled."; an id that was
+  never sent returns 10147 "…is not found." So a cancel tells the three states apart: 202 =
+  was held, 10148 = already done, 10147 = never reached TWS.
+- It survives a disconnect: held, `disconnect()`, reconnect 3 s later with the same client id. It
+  is still listed nowhere, and the cancel returns 202 "Order was discarded" + 161.
+- It survives a pause: two orders held for 20 s were released by the last order's
+  `transmit=true` like an immediate one.
 - The official clients (`EClientUtils` in C#/Java/Python/C++) also set `transmit` only when
   true. Our decoder's `unwrap_or(true)` applies to inbound messages only and says nothing about
   how TWS reads an absent flag in outbound ones.
 - An untransmitted order gets no open-order or status frames, so a TWS-derived value (e.g. a
   VOL order's limit) is only visible once transmitted.
+- **Not probed:** how long a held order lasts beyond 20 s or a 3 s disconnect, whether a TWS
+  restart discards it, and whether another client id (or client 0) can cancel it.
+
+### Held parent and children
+
+*Live 2026-11-23 off-hours, paper TWS, server 223, AAPL parent BUY 1 LMT 1.00 with SELL LMT
+5000 / 6000 children.*
+
+- Parent and first child held, last child `transmit=true`: all three go PreSubmitted within
+  0.4 s and are listed by `open_orders`. Cancelling the parent then cancels both children
+  (OrderStatus `Cancelled` + 202 for each id).
+- Cancelling a held parent does **not** discard its held child: the child's own cancel still
+  returns 202 "Order was discarded" + 161, not 10147. Cleaning up a partly sent list therefore
+  needs a cancel per held order, not just the parent's.
+- Re-sending a held parent with `transmit=true` releases its held child too: both go
+  PreSubmitted.
+- `submit_linked_orders` and bracket `submit_all` (sync and async share the code) on this
+  session: all three orders PreSubmitted, then cancelled through the parent; a list whose last id
+  is 1,500,000,000 failed with `OrderIdInRequestRange` and sent nothing (cancels of the first two
+  ids returned 10147).
+- **Not probed:** fills of a released bracket, and a send failing part-way on a live connection
+  (the client checks every order before sending, so only a lost connection fails a later send).
 
 ### Attached orders (`attached_orders`)
 
