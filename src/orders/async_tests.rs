@@ -1461,7 +1461,7 @@ async fn wait_for_fill_fails_on_connection_reset() {
 #[tokio::test]
 async fn find_order_reports_each_outcome() {
     for case in crate::orders::common::test_tables::lookup_cases() {
-        let message_bus = Arc::new(MessageBusStub::with_replies(case.replies));
+        let message_bus = Arc::new(MessageBusStub::with_responses_per_request(case.replies));
         let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
         let result = match case.perm_id {
@@ -1501,7 +1501,7 @@ async fn find_order_by_perm_id_rejects_a_perm_id_below_one() {
 async fn find_order_rechecks_completed_orders_until_the_bound() {
     let open = proto_response(IncomingMessages::OpenOrderEnd, open_order_end().encode_proto());
     let none = proto_response(IncomingMessages::CompletedOrdersEnd, completed_orders_end().encode_proto());
-    let message_bus = Arc::new(MessageBusStub::with_replies(
+    let message_bus = Arc::new(MessageBusStub::with_responses_per_request(
         std::iter::once(vec![open]).chain(std::iter::repeat_n(vec![none], 20)).collect(),
     ));
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
