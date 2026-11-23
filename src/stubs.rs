@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         LazyLock, Mutex, RwLock,
@@ -38,6 +38,9 @@ pub(crate) struct MessageBusStub {
     pub request_messages: RwLock<Vec<Vec<u8>>>,
     /// Pre-built responses, served in order.
     pub ordered_responses: Vec<ResponseMessage>,
+    /// One reply per request, in request order, served instead of
+    /// `ordered_responses`. See [`MessageBusStub::with_replies`].
+    replies: Mutex<VecDeque<Vec<ResponseMessage>>>,
     /// The `limit` of each bounded `send_request_capped` call, in order. The stub
     /// doesn't enforce it; overflow is tested on the real buses.
     pub buffer_limits: RwLock<Vec<usize>>,
@@ -105,6 +108,7 @@ impl Default for MessageBusStub {
             buffer_limits: RwLock::new(vec![]),
             #[cfg(feature = "async")]
             executions_requests: RwLock::new(vec![]),
+            replies: Mutex::default(),
             connection_resets: AtomicUsize::new(0),
             session_generation: AtomicU64::new(0),
             #[cfg(feature = "async")]
@@ -146,6 +150,15 @@ impl MessageBusStub {
     pub fn with_ordered_responses(ordered_responses: Vec<ResponseMessage>) -> Self {
         let mut stub = Self::default();
         stub.ordered_responses = ordered_responses;
+        stub
+    }
+
+    /// Answer each request with the next of `replies`, for a caller that sends
+    /// one request several times and reads a different reply each time.
+    /// Requests past the last reply get the ordered responses (none here).
+    pub fn with_replies(replies: Vec<Vec<ResponseMessage>>) -> Self {
+        let stub = Self::default();
+        *stub.replies.lock().unwrap() = replies.into();
         stub
     }
 
@@ -242,6 +255,9 @@ impl MessageBusStub {
         if remaining > 0 {
             self.connection_resets.store(remaining - 1, Ordering::SeqCst);
             return vec![RoutedItem::Error(Error::ConnectionReset)];
+        }
+        if let Some(reply) = self.replies.lock().unwrap().pop_front() {
+            return reply.into_iter().map(classify_like_dispatcher).collect();
         }
         self.routed_items()
     }
