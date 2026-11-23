@@ -1583,7 +1583,11 @@ impl<T> OrderBuilder<T> {
 
     /// Size the order in the quote currency instead of shares or units (forex).
     ///
-    /// With a cash quantity, the order quantity may be `0`.
+    /// With a cash quantity, the order quantity may be `0`. Whether TWS accepts it depends on the
+    /// contract and account, not the order type or side: EUR.USD took it on market and limit
+    /// orders, buy and sell, while AAPL orders of every type drew error 10244 "Cash Quantity cannot
+    /// be used for this order" (live: 2026-11-23, paper). See
+    /// `docs/wire-facts/orders.md#cash-quantity`.
     ///
     /// # Examples
     ///

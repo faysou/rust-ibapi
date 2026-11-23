@@ -1688,7 +1688,10 @@ pub struct OrderStatus {
     pub last_fill_price: Option<f64>,
     /// API client which submitted the order.
     pub client_id: i32,
-    /// This field is used to identify an order held when TWS is trying to locate shares for a short sell. The value used to indicate this is 'locate'.
+    /// Why TWS holds the order, or empty. IB documents `locate` for a short sale waiting for shares
+    /// to borrow. A simulated trailing stop waiting for its trigger reports `trigger` with status
+    /// `PreSubmitted` (live: 2026-11-23, paper EUR.USD TRAIL; see
+    /// `docs/wire-facts/orders.md#why_held-values`).
     pub why_held: String,
     /// If an order has been capped, this indicates the current capped price. Requires TWS 967+ and API v973.04+. Python API specifically requires API v973.06+. `None` when IBKR did not send a value.
     pub market_cap_price: Option<f64>,
