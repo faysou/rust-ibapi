@@ -2075,6 +2075,71 @@ async fn reconnect_refreshes_handshake_state() {
     assert_eq!(server_version.get(), new_version, "server version should be the reconnect handshake's");
 }
 
+/// Listing another client's open order makes TWS raise this client's next
+/// valid order id past it without saying so; the dispatcher raises the local
+/// floor to match. Only another client's `OpenOrder` does: this client's own
+/// order and a completed order leave it.
+#[tokio::test]
+async fn foreign_open_order_raises_order_id_floor() {
+    use crate::client::id_generator::ClientIdManager;
+    use crate::testdata::builders::orders::{completed_order, open_order};
+
+    let cases = [
+        (
+            "another client's open order",
+            helpers::binary_proto(
+                IncomingMessages::OpenOrder as i32,
+                &open_order().order_id(500001).client_id(9420).to_proto(),
+            ),
+            500002,
+        ),
+        (
+            "this client's open order",
+            helpers::binary_proto(
+                IncomingMessages::OpenOrder as i32,
+                &open_order().order_id(500001).client_id(CLIENT_ID).to_proto(),
+            ),
+            100,
+        ),
+        (
+            "another client's completed order",
+            helpers::binary_proto(
+                IncomingMessages::CompletedOrder as i32,
+                &completed_order().order_id(500001).client_id(9420).to_proto(),
+            ),
+            100,
+        ),
+    ];
+    for (name, frame, expected) in cases {
+        let (stream, bus) = make_bus();
+        let order_ids = Arc::new(ClientIdManager::new(100).unwrap());
+        bus.set_handshake_state(HandshakeState {
+            order_ids: order_ids.clone(),
+            server_version: Arc::new(ServerVersion::new(server_versions::PROTOBUF_REST_MESSAGES_3)),
+        });
+        // Read last: once it routes, the frame before it has been dispatched.
+        let mut end = bus.send_shared_request(OutgoingMessages::RequestAllOpenOrders, vec![]).await.unwrap();
+
+        stream.push_inbound(frame);
+        stream.push_inbound(helpers::binary_proto(
+            IncomingMessages::OpenOrderEnd as i32,
+            &crate::testdata::builders::orders::open_order_end().to_proto(),
+        ));
+        bus.clone().process_messages().expect("process_messages");
+        loop {
+            let item = tokio::time::timeout(Duration::from_secs(2), end.next_routed())
+                .await
+                .expect("open orders reply never ended")
+                .expect("channel closed");
+            if matches!(&item, RoutedItem::Response(m) if m.message_type() == IncomingMessages::OpenOrderEnd) {
+                break;
+            }
+        }
+
+        assert_eq!(order_ids.next_order_id(), OrderId::new(expected), "{name}");
+    }
+}
+
 #[tokio::test]
 async fn send_shared_request_unsupported_returns_error() {
     let (_, bus) = make_bus();
