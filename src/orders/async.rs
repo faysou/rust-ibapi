@@ -894,7 +894,9 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Error::Timeout`] if a reply does not end in time,
+    /// [`Error::InvalidArgument`] if `perm_id` is `0` or below (TWS assigns
+    /// positive perm ids; a record without one carries `0`), with nothing
+    /// sent; [`Error::Timeout`] if a reply does not end in time,
     /// [`Error::ConnectionReset`] if the connection is down or drops during
     /// the lookup, [`Error::UnexpectedEndOfStream`] if a reply ends without
     /// its end marker.
@@ -919,8 +921,9 @@ impl Client {
     /// }
     /// ```
     pub async fn find_order_by_perm_id(&self, perm_id: i64, within: Duration) -> Result<OrderLookup, Error> {
+        let key = OrderKey::perm_id(perm_id)?;
         let reply_wait = self.one_shot_timeout().unwrap_or(ONE_SHOT_TIMEOUT);
-        self.look_up_order(OrderKey::PermId(perm_id), within, || Some(reply_wait)).await
+        self.look_up_order(key, within, || Some(reply_wait)).await
     }
 
     /// Reads open orders once, then completed orders until they list the

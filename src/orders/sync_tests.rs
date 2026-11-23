@@ -1489,6 +1489,23 @@ fn find_order_reports_each_outcome() {
     }
 }
 
+/// A perm id of 0 or below would match records that carry none, so it is
+/// refused before anything is sent.
+#[test]
+fn find_order_by_perm_id_rejects_a_perm_id_below_one() {
+    let (client, message_bus) = create_blocking_test_client();
+
+    for perm_id in [0, -1] {
+        let result = client.find_order_by_perm_id(perm_id, std::time::Duration::ZERO);
+
+        assert!(
+            matches!(&result, Err(Error::InvalidArgument(message)) if message.contains(&perm_id.to_string())),
+            "{perm_id}: {result:?}"
+        );
+    }
+    assert_eq!(request_message_count(&message_bus), 0, "nothing reaches the wire");
+}
+
 /// The bound is a deadline from the call: completed orders are re-read on a
 /// fixed interval until it passes, then the answer is `NotFound`.
 #[test]
