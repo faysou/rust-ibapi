@@ -578,6 +578,7 @@ impl Client {
     /// use ibapi::client::blocking::Client;
     /// use ibapi::orders::OrderUpdate;
     /// use ibapi::subscriptions::SubscriptionItem;
+    /// use ibapi::TRANSPORT_RECONNECT_CODE;
     ///
     /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
     ///
@@ -592,6 +593,9 @@ impl Client {
     ///                 status.order_id, status.status, status.filled, status.remaining);
     ///         }
     ///         SubscriptionItem::Data(update) => println!("update: {update:?}"),
+    ///         SubscriptionItem::Notice(notice) if notice.code == TRANSPORT_RECONNECT_CODE => {
+    ///             println!("reconnected: rebuild order state from snapshots");
+    ///         }
     ///         SubscriptionItem::Notice(notice) if notice.is_error() => {
     ///             eprintln!("order {:?} rejected: {}", notice.request_id, notice.message);
     ///         }
@@ -618,8 +622,12 @@ impl Client {
     ///
     /// - **Reconnect.** The stream survives the client's automatic reconnects:
     ///   the same subscription keeps delivering once the connection returns,
-    ///   but updates TWS emitted during the outage are lost and no marker
-    ///   appears in the stream. Watch [`Self::notice_stream`] for the
+    ///   but updates TWS emitted during the outage are lost. Once the new
+    ///   session is live, the stream yields one
+    ///   [`SubscriptionItem::Notice`]
+    ///   with code [`TRANSPORT_RECONNECT_CODE`](crate::TRANSPORT_RECONNECT_CODE)
+    ///   to mark the gap. It classifies as an error, so match its code before
+    ///   treating error notices as rejections. Watch [`Self::notice_stream`] for the
     ///   connectivity notices (codes 1100 connectivity lost, 1101 restored
     ///   with data lost, 1102 restored with data maintained, 1300 socket reset).
     /// - **Error.** An `Err` item ends the stream; every later call returns
@@ -636,7 +644,10 @@ impl Client {
     /// After a reconnect, the existing subscription is still live. In both
     /// cases, rebuild state from snapshots:
     ///
-    /// 1. [`Self::all_open_orders`]: every open order and its status.
+    /// 1. [`Self::open_orders`]: this client's open orders and their statuses.
+    ///    Not [`Self::all_open_orders`]: it also lists other clients' orders,
+    ///    and TWS then raises this client's next valid order id past the
+    ///    highest order id listed, which `open_orders` does not.
     /// 2. [`Self::completed_orders`]`(ApiOnly::No)`: orders that filled or were
     ///    cancelled during the gap.
     /// 3. [`Self::executions`] with a default [`ExecutionFilter`]: fills and
@@ -644,12 +655,13 @@ impl Client {
     ///    `last_n_days` when the gap may span midnight, as the daily gateway
     ///    reset does.
     ///
-    /// The snapshots cover every client's orders, while this stream reports
-    /// only this client's. Keep the entries whose `order.client_id` /
+    /// `completed_orders` and `executions` cover every client's orders, while
+    /// this stream reports only this client's. Keep the entries whose `order.client_id` /
     /// `execution.client_id` matches, or state will hold orders the stream
     /// never updates.
     ///
-    /// Take the snapshots after the stream is live again, so no event falls
+    /// Take the snapshots once the stream is live again (on the reconnect
+    /// notice, or once the new subscription exists), so no event falls
     /// between the two. An event can then arrive both ways; apply updates
     /// idempotently, keyed by `perm_id` for orders and `execution_id` for fills.
     pub fn order_update_stream(&self) -> Result<Subscription<OrderUpdate>, Error> {
