@@ -564,34 +564,55 @@ for notice in notices.iter() {
 
 ### Correlating Commissions with Executions
 
-`CommissionAndFeesReport` joins to its `ExecutionData` by `execution_id` — the same value
+`CommissionAndFeesReport` joins to its `ExecutionData` by `execution_id`, the same value
 carried on `Execution::execution_id`. TWS sends the execution first and the commission
-shortly after, but order-status and open-order frames can land between them, so index
-commissions by `execution_id` rather than assuming the two are adjacent. Both arrive on
+shortly after, but order-status and open-order frames can land between them. Both arrive on
 the same streams (`executions`, `place_order`, `order_update_stream`).
 
+`orders::FillMatcher` does the join on a stream and yields a `Fill`: the execution with
+`Option` of its report. It pairs in either arrival order. `take_expired` hands back the
+executions whose report has not come within a wait you choose. TWS sends no report for an
+option exercise, so the matcher returns that fill at once with no commission.
+
 ```rust
-use ibapi::orders::{ExecutionData, OrderUpdate};
-use std::collections::HashMap;
+use ibapi::orders::{FillMatcher, OrderUpdate, ReportMatch};
+use ibapi::subscriptions::SubscriptionItem;
+use std::time::Duration;
 
-let mut executions: HashMap<String, ExecutionData> = HashMap::new();
-
+let mut matcher = FillMatcher::new();
 let updates = client.order_update_stream()?;
-for update in updates.iter_data() {
-    match update? {
-        OrderUpdate::ExecutionData(exec) => {
-            // The execution arrives first: index it by execution_id.
-            executions.insert(exec.execution.execution_id.clone(), exec);
+loop {
+    let Some(item) = updates.next_timeout(Duration::from_secs(1)) else {
+        if updates.is_terminated() {
+            break;
         }
-        OrderUpdate::CommissionAndFeesReport(report) => {
-            // The commission follows: join it to the execution it belongs to.
-            if let Some(exec) = executions.remove(&report.execution_id) {
-                println!("{} x {} commission {}", exec.execution.shares, exec.contract.symbol, report.commission_and_fees);
+        for execution in matcher.take_expired(Duration::from_secs(5)).executions {
+            println!("fill without commission: {execution:?}");
+        }
+        continue;
+    };
+    match item? {
+        SubscriptionItem::Data(OrderUpdate::ExecutionData(execution)) => {
+            if let Some(fill) = matcher.push_execution(execution) {
+                println!("fill: {fill:?}");
             }
         }
+        SubscriptionItem::Data(OrderUpdate::CommissionAndFeesReport(report)) => match matcher.push_report(report) {
+            ReportMatch::Paired(fill) => println!("fill: {fill:?}"),
+            ReportMatch::Waiting => {}
+            ReportMatch::Late(report) => println!("late commission: {report:?}"),
+        },
         _ => {}
     }
 }
+```
+
+For a whole `executions` reply, `orders::pair_executions` returns the fills and the
+executions and reports that found no partner:
+
+```rust
+let rows = client.executions(ExecutionFilter::default())?.collect_to_end_within(Duration::from_secs(10))?;
+let (fills, unpaired) = ibapi::orders::pair_executions(rows);
 ```
 
 ### Concurrent Subscriptions
