@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -18,10 +19,11 @@ use crate::transport::{InternalSubscription, MessageBus};
 use crate::{client::sync::Client, Error};
 
 use super::common::tick::{classify, TickAction};
+use super::common::tick_pages::{PagedTick, TickPages};
 use super::common::{self, encoders};
 use super::{
     BarRequest, BarSize, Duration, HeadTimestampRequest, HistogramEntry, HistogramRequest, HistoricalBarUpdate, HistoricalData, HistoricalDataFrame,
-    Schedule, ScheduleRequest, TickDecoder, WhatToShow,
+    Schedule, ScheduleRequest, TickDecoder, TicksBetween, TicksBetweenError, WhatToShow,
 };
 use crate::market_data::TradingHours;
 
@@ -337,6 +339,45 @@ pub(crate) fn historical_ticks<T: TickDecoder<T>>(
     let subscription = builder.send_raw(request)?;
 
     Ok(TickSubscription::new(subscription, request_id, Arc::clone(&client.message_bus)))
+}
+
+// Pages `historical_ticks` backward over `[start, end]`; see `TickPages` for the rules. Same
+// builder-to-encoder seam as `historical_ticks`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn historical_ticks_between<T: TickDecoder<T> + PagedTick>(
+    client: &Client,
+    contract: &Contract,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+    number_of_ticks: i32,
+    what_to_show: WhatToShow,
+    trading_hours: TradingHours,
+    ignore_size: bool,
+) -> Result<TicksBetween<T>, TicksBetweenError<T>> {
+    let mut pages = TickPages::new(start, end)?;
+
+    loop {
+        let page = historical_ticks::<T>(
+            client,
+            contract,
+            None,
+            Some(pages.request_end()),
+            number_of_ticks,
+            what_to_show,
+            trading_hours,
+            ignore_size,
+        )
+        .and_then(|subscription| subscription.iter_data().collect::<Result<Vec<T>, Error>>());
+
+        match page {
+            Ok(page) => {
+                if let ControlFlow::Break(stop) = pages.push(page) {
+                    return Ok(pages.finish(stop));
+                }
+            }
+            Err(error) => return Err(pages.fail(error)),
+        }
+    }
 }
 
 pub(crate) fn historical_schedule(
