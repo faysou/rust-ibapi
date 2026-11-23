@@ -260,7 +260,7 @@ const ORDER_CODE_CATEGORIES: &[(i32, NoticeCategory)] = &[
     (10244, NoticeCategory::OrderRejection),
     // docs/wire-facts/orders.md#order-rejections-outside-the-200-399-band
     (10317, NoticeCategory::OrderRejection),
-    // docs/wire-facts/orders.md#order-rejections-outside-the-200-399-band
+    // docs/wire-facts/orders.md#refused-modifies-leave-the-order-working
     (104, NoticeCategory::OrderChangeRejection),
     // docs/wire-facts/orders.md#refused-modifies-leave-the-order-working
     (105, NoticeCategory::OrderChangeRejection),
