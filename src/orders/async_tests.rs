@@ -8,6 +8,7 @@ use crate::contracts::{Contract, SecurityIdType, SecurityType};
 use crate::contracts::{Currency, Exchange, OptionRight, Symbol};
 use crate::messages::IncomingMessages;
 use crate::orders::builder::{BracketPrices, TrailBy, ValidationError};
+use crate::orders::common::test_tables;
 use crate::orders::{OcaType, OrderStatusKind, OrderType, TimeInForce};
 use crate::proto;
 use crate::stubs::MessageBusStub;
@@ -1445,4 +1446,126 @@ async fn next_valid_order_id_then_submit_order_does_not_reissue_the_id() {
     client.submit_order(order_id, &contract, &order).await.expect("submit_order");
 
     assert_eq!(client.next_order_id(), order_id + 1);
+}
+
+fn assert_linked_places(bus: &MessageBusStub, orders: &[(Contract, Order)], count: usize) {
+    for (i, (contract, order)) in test_tables::linked_orders_as_sent(orders).iter().take(count).enumerate() {
+        assert_request(bus, i, &place_order_request().order_id(order.order_id).contract(contract).order(order));
+    }
+}
+
+#[tokio::test]
+async fn submit_linked_orders_transmits_only_the_last_order() {
+    let (client, bus) = create_test_client();
+    let orders = test_tables::linked_orders();
+
+    client.submit_linked_orders(orders.clone()).await.expect("all sends succeed");
+
+    assert_eq!(request_message_count(&bus), 3);
+    assert_linked_places(&bus, &orders, 3);
+    assert_eq!(client.next_order_id(), 9403, "the caller's ids are reserved");
+}
+
+#[tokio::test]
+async fn submit_linked_orders_first_send_failure_leaves_nothing_to_cancel() {
+    let bus = Arc::new(MessageBusStub::default().with_sends_failing_after(0));
+    let client = Client::stubbed(bus.clone(), server_versions::SIZE_RULES);
+
+    let err = client
+        .submit_linked_orders(test_tables::linked_orders())
+        .await
+        .expect_err("the first send fails");
+
+    assert!(matches!(err.error, Error::ConnectionReset), "got {:?}", err.error);
+    assert_eq!(err.sent, vec![]);
+    assert_eq!(err.cancelled, vec![]);
+    assert!(err.cancel_failures.is_empty(), "got {:?}", err.cancel_failures);
+    assert_eq!(request_message_count(&bus), 1, "only the failed send");
+}
+
+#[tokio::test]
+async fn submit_linked_orders_later_send_failure_cancels_the_held_orders() {
+    let bus = Arc::new(MessageBusStub::default().with_sends_failing_after(2));
+    let client = Client::stubbed(bus.clone(), server_versions::SIZE_RULES);
+    let orders = test_tables::linked_orders();
+    let [parent, take_profit, _] = test_tables::LINKED_ORDER_IDS;
+
+    let err = client.submit_linked_orders(orders.clone()).await.expect_err("the last send fails");
+
+    assert!(matches!(err.error, Error::ConnectionReset), "got {:?}", err.error);
+    assert_eq!(err.sent, vec![OrderId(parent), OrderId(take_profit)]);
+    assert_eq!(err.cancelled, vec![OrderId(take_profit), OrderId(parent)]);
+    assert!(err.cancel_failures.is_empty(), "got {:?}", err.cancel_failures);
+    assert_eq!(request_message_count(&bus), 5);
+    assert_linked_places(&bus, &orders, 3);
+    assert_request(&bus, 3, &cancel_order_request().order_id(take_profit));
+    assert_request(&bus, 4, &cancel_order_request().order_id(parent));
+}
+
+#[tokio::test]
+async fn submit_linked_orders_reports_a_failed_cancel() {
+    let bus = Arc::new(MessageBusStub::default().with_sends_failing_after(1).with_failing_order_requests());
+    let client = Client::stubbed(bus.clone(), server_versions::SIZE_RULES);
+    let [parent, ..] = test_tables::LINKED_ORDER_IDS;
+
+    let err = client
+        .submit_linked_orders(test_tables::linked_orders())
+        .await
+        .expect_err("the second send fails");
+
+    assert!(matches!(err.error, Error::ConnectionReset), "got {:?}", err.error);
+    assert_eq!(err.sent, vec![OrderId(parent)]);
+    assert_eq!(err.cancelled, vec![]);
+    assert!(
+        matches!(err.cancel_failures.as_slice(), [(id, Error::ConnectionReset)] if *id == OrderId(parent)),
+        "got {:?}",
+        err.cancel_failures
+    );
+    assert_eq!(request_message_count(&bus), 3, "two places and the failed cancel");
+    assert_request(&bus, 2, &cancel_order_request().order_id(parent));
+}
+
+#[tokio::test]
+async fn submit_linked_orders_checks_every_order_before_sending() {
+    let (client, bus) = create_test_client();
+    let mut orders = test_tables::linked_orders();
+    orders[2].1.order_id = REQUEST_ID_FLOOR;
+
+    let err = client
+        .submit_linked_orders(orders)
+        .await
+        .expect_err("the last id is in the request range");
+
+    assert!(
+        matches!(err.error, Error::OrderIdInRequestRange { order_id } if order_id == REQUEST_ID_FLOOR),
+        "got {:?}",
+        err.error
+    );
+    assert_eq!(err.sent, vec![]);
+    assert_eq!(request_message_count(&bus), 0, "nothing reaches the wire");
+}
+
+#[tokio::test]
+async fn submit_all_cancels_the_held_bracket_orders_when_a_send_fails() {
+    let bus = Arc::new(MessageBusStub::default().with_sends_failing_after(2));
+    let client = Client::stubbed(bus.clone(), server_versions::SIZE_RULES);
+    client.id_manager().raise_order_id(OrderId::from(9500));
+    let contract = Contract::stock("AAPL").build();
+
+    let err = client
+        .order(&contract)
+        .buy(100)
+        .bracket()
+        .entry_limit(50.0)
+        .take_profit(55.0)
+        .stop_loss(45.0)
+        .submit_all()
+        .await
+        .expect_err("the stop-loss send fails");
+
+    assert!(matches!(err.error, Error::ConnectionReset), "got {:?}", err.error);
+    assert_eq!(err.sent, vec![OrderId(9500), OrderId(9501)]);
+    assert_eq!(err.cancelled, vec![OrderId(9501), OrderId(9500)]);
+    assert_request(&bus, 3, &cancel_order_request().order_id(9501));
+    assert_request(&bus, 4, &cancel_order_request().order_id(9500));
 }

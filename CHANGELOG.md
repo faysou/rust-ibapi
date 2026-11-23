@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `submit_linked_orders` (sync and async) submits orders TWS must release together, such as a parent and its children: it checks every order before sending any, transmits only the last, and when a send fails part-way cancels the held orders already sent. The `orders::LinkedOrdersError` it returns lists the orders sent, the ones cancelled and any cancel that failed, so the caller can recover (#PR).
 
 - `ExpirationDate` and `ContractMonth` implement `Copy` (#1260).
 - `ContractDetails::event_contract_topic`, `event_contract_description` and `event_contract_question`: a ForecastEx event contract's topic (`"US Fed Funds Target Rate"`), description (strike, expiry and right, `"FF Jan28'27 3.125"`) and full question. TWS sent them, and the client dropped them. Empty for other contracts. A struct literal or pattern naming every field must add them; see `docs/migration-6.0.md` §35 (#1251).
@@ -26,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ExerciseOptionsBuilder::customer_account` and `ExerciseOptionsBuilder::professional_customer` send a customer account and the professional-customer flag with an exercise request, the `customerAccount` and `professionalCustomer` parameters of IBKR's `exerciseOptions`. Previously neither was sent (#1226).
 
 ### Changed
+- Bracket `submit_all` (sync and async) returns `Result<BracketOrderIds, LinkedOrdersError>` instead of `Result<_, Error>`, so a failure says which orders reached TWS and whether their cancels were sent. `?` into `Error` still works. See `docs/migration-6.0.md` §44 (#PR).
 
 - `ContractDetails::under_security_type` is `Option<SecurityType>` instead of `String`, `None` where TWS sends nothing. JSON written by 5.x (`"STK"`, `""`) no longer deserializes. See `docs/migration-6.0.md` §41 (#1254).
 - `OptionChain::expirations` is `Vec<Expiry>` instead of `Vec<String>`. TWS sends each expiration as a `YYYYMMDD` date, now an `Expiry::Date(ExpirationDate)` that goes straight into `Contract::option`; a `YYYYMM` entry is an `Expiry::Month`, other text is kept as `Expiry::Unknown`, and an empty entry is dropped. `Expiry` has no order; the new `Expiry::date()` and `Expiry::month()` return the inner date or month by value, which do. See `docs/migration-6.0.md` §40 (#1253).
@@ -76,6 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `OrderType::ComboLimit`, `ComboMarket`, `MarketOnOpen`, `LimitOnOpen` and `AtAuction` are removed; they shared a wire code with `Limit`, `Market` or `MarketToLimit`. `market_on_open()`, `limit_on_open(..)` and `at_auction(..)` set the type and time in force; `.order_type(..)` sets no time in force. See `docs/migration-6.0.md` §32 (#1220).
 
 ### Fixed
+- A bracket `submit_all` whose second or third send fails no longer leaves the orders already sent parked at TWS. They were sent with `transmit` off, so TWS held them, listed in no `open_orders` or `completed_orders` reply, until something cancelled them; `submit_all` now cancels them before returning the error (#PR).
 
 - `historical_data(..).between(start, end)` works for a continuous future (`SecurityType::ContinuousFuture`). TWS rejects any end date for one with error 10339, and `between` always sent `end`, so every such request failed. For a continuous future it now sends no end date and a duration covering `[start, now)`, then drops the bars after `end` as before; a `start` that is not before now is `Error::InvalidArgument`. `.ending()` on a continuous future, for `historical_data` and `historical_schedules`, is `Error::InvalidArgument` too, with nothing sent, rather than TWS's 10339 (#1252).
 - Orders TWS sends back (open and completed) fill `Order::order_combo_legs` from the per-leg prices TWS sends on the contract's combo legs, one entry per leg. The list was always empty, so modifying an open combo order by re-sending what `open_orders()` returned dropped its per-leg prices (#1243).
