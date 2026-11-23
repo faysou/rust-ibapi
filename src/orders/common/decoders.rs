@@ -102,9 +102,8 @@ pub(crate) fn decode_completed_order_proto(p: crate::proto::CompletedOrder) -> R
     let order_state = decode_order_state(required(p.order_state.as_ref(), "order_state", "CompletedOrder")?)?;
 
     Ok(OrderData {
-        // Completed orders carry no live order_id; preserve the legacy text-decoder
-        // sentinel so v2 → v3 consumers see the same value.
-        order_id: -1,
+        // CompletedOrder has no top-level order id, unlike OpenOrder; the order carries it.
+        order_id: order.order_id,
         contract,
         order,
         order_state,

@@ -185,6 +185,9 @@ impl Client {
     ///
     /// A completed order's `total_quantity` is the quantity left unfilled, not the size
     /// ordered: `0` for a filled order. The size ordered is `total_quantity + filled_quantity`.
+    /// [`OrderData::completed_order_status`](crate::orders::OrderData::completed_order_status)
+    /// gives the record's status with `filled` and `remaining` set this way.
+    /// `OrderData::order_id` is the order's id, the same as `order.order_id`.
     ///
     /// # Arguments
     /// * `api_only` - request only orders placed by the API.
