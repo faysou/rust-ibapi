@@ -174,6 +174,19 @@ impl MessageBusStub {
         self
     }
 
+    /// Deliver `item` to every subscription kept open by
+    /// [`Self::keeping_channels_open`], as a frame arriving after the scripted ones.
+    pub(crate) fn send_to_open_subscriptions(&self, item: RoutedItem) {
+        #[cfg(feature = "sync")]
+        for sender in self.open_sync_senders.lock().unwrap().iter() {
+            let _ = sender.send(item.clone());
+        }
+        #[cfg(feature = "async")]
+        for sender in self.open_async_senders.lock().unwrap().iter() {
+            let _ = sender.send(item.clone());
+        }
+    }
+
     /// Make each `wait_connected` take `delay`, as a reconnect does; with
     /// [`Self::with_connection_resets`], a retry resumes only after it.
     pub fn with_reconnect_delay(mut self, delay: Duration) -> Self {
