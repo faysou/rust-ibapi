@@ -1263,6 +1263,7 @@ async fn order_entry_points_reject_request_range_ids() {
     rejected(client.cancel_order(floor).await.map(|_| ()), "cancel_order");
     rejected(client.order_status_stream(floor).await.map(|_| ()), "order_status_stream");
     rejected(client.wait_for_fill(floor, std::time::Duration::ZERO).await.map(|_| ()), "wait_for_fill");
+    rejected(client.find_order(floor, std::time::Duration::ZERO).await.map(|_| ()), "find_order");
 
     client.id_manager().raise_order_id(OrderId::from(floor));
     rejected(
@@ -1384,6 +1385,49 @@ async fn wait_for_fill_fails_on_connection_reset() {
     let result = client.wait_for_fill(13, Duration::from_secs(5)).await;
 
     assert!(matches!(result, Err(Error::ConnectionReset)), "{result:?}");
+}
+
+#[tokio::test]
+async fn find_order_reports_each_outcome() {
+    for case in crate::orders::common::test_tables::lookup_cases() {
+        let message_bus = Arc::new(MessageBusStub::with_replies(case.replies));
+        let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+
+        let result = match case.perm_id {
+            Some(perm_id) => client.find_order_by_perm_id(perm_id, case.within).await,
+            None => client.find_order(13, case.within).await,
+        };
+
+        case.expected.check(case.name, result);
+        assert_eq!(request_message_count(&message_bus), case.requests, "{}", case.name);
+        assert_request(&message_bus, 0, &open_orders_request());
+        for index in 1..case.requests {
+            assert_request(&message_bus, index, &completed_orders_request().api_only(false));
+        }
+    }
+}
+
+/// The bound is a deadline from the call: completed orders are re-read on a
+/// fixed interval until it passes, then the answer is `NotFound`.
+#[tokio::test]
+async fn find_order_rechecks_completed_orders_until_the_bound() {
+    let open = proto_response(IncomingMessages::OpenOrderEnd, open_order_end().encode_proto());
+    let none = proto_response(IncomingMessages::CompletedOrdersEnd, completed_orders_end().encode_proto());
+    let message_bus = Arc::new(MessageBusStub::with_replies(
+        std::iter::once(vec![open]).chain(std::iter::repeat_n(vec![none], 20)).collect(),
+    ));
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+
+    let started = std::time::Instant::now();
+    let result = client.find_order(13, Duration::from_millis(250)).await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(result, OrderLookup::NotFound);
+    assert!(elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(2), "{elapsed:?}");
+    // Completed orders read at 0, 100, 200 and 250 ms; a late wake-up on a
+    // busy machine can merge the last two.
+    let completed_reads = request_message_count(&message_bus) - 1;
+    assert!((3..=4).contains(&completed_reads), "{completed_reads} completed-orders reads");
 }
 
 #[tokio::test]
