@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `submit_linked_orders` (sync and async) submits orders TWS must release together, such as a parent and its children: it checks every order before sending any, transmits only the last, and when a send fails part-way cancels the held orders already sent. The `orders::LinkedOrdersError` it returns lists the orders sent, the ones cancelled and any cancel that failed, so the caller can recover (#PR).
+- `submit_linked_orders` (sync and async) submits orders TWS must release together, such as a parent and its children: it checks every order before sending any, transmits only the last, and when a send fails part-way cancels the held orders already sent. The `orders::LinkedOrdersError` it returns lists the orders sent, the ones cancelled and any cancel that failed, so the caller can recover (#1272).
 
 - `ExpirationDate` and `ContractMonth` implement `Copy` (#1260).
 - `ContractDetails::event_contract_topic`, `event_contract_description` and `event_contract_question`: a ForecastEx event contract's topic (`"US Fed Funds Target Rate"`), description (strike, expiry and right, `"FF Jan28'27 3.125"`) and full question. TWS sent them, and the client dropped them. Empty for other contracts. A struct literal or pattern naming every field must add them; see `docs/migration-6.0.md` §35 (#1251).
@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ExerciseOptionsBuilder::customer_account` and `ExerciseOptionsBuilder::professional_customer` send a customer account and the professional-customer flag with an exercise request, the `customerAccount` and `professionalCustomer` parameters of IBKR's `exerciseOptions`. Previously neither was sent (#1226).
 
 ### Changed
-- Bracket `submit_all` (sync and async) returns `Result<BracketOrderIds, LinkedOrdersError>` instead of `Result<_, Error>`, so a failure says which orders reached TWS and whether their cancels were sent. `?` into `Error` still works. See `docs/migration-6.0.md` §48 (#PR).
+- Bracket `submit_all` (sync and async) returns `Result<BracketOrderIds, LinkedOrdersError>` instead of `Result<_, Error>`, so a failure says which orders reached TWS and whether their cancels were sent. `?` into `Error` still works. See `docs/migration-6.0.md` §48 (#1272).
 
 - The `utoipa` schema of each closed wire enum lists its wire codes as `enum`: `Action`, `LegAction`, `OptionRight`, `ExecutionFilterSide`, `ExecutionSide`, historical and realtime `WhatToShow`, and `BarSize` as strings (`["BUY", "SELL", "SSHORT", "SLONG"]`), and `FaDataType` and `ServerLogLevel` as integers. Since #1245 they were an unconstrained `string` or `integer`. The schema describes the serialized form, so it doesn't cover the 5.x variant names `BarSize` still parses. The historical and realtime `WhatToShow` schemas are named `HistoricalWhatToShow` and `RealtimeWhatToShow`, where both were `WhatToShow`. Open enums, which keep unlisted codes as `Unknown`, stay unconstrained (#1303).
 - `BarSize` serializes as its wire text (`"5 mins"`) instead of the variant name (`"Min5"`), and `FromStr` now accepts that text, so `"5 mins".parse::<BarSize>()` round-trips `to_string()`; the variant names still parse, so 5.x JSON loads. Realtime `WhatToShow` gains `FromStr` (exact match), `ToField`, `PartialEq`, `Eq` and wire-string serde, and its `utoipa` schema is a string; historical `WhatToShow` and `BarSize` gain `Eq`. See `docs/migration-6.0.md` §47 (#1302).
@@ -84,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `OrderType::ComboLimit`, `ComboMarket`, `MarketOnOpen`, `LimitOnOpen` and `AtAuction` are removed; they shared a wire code with `Limit`, `Market` or `MarketToLimit`. `market_on_open()`, `limit_on_open(..)` and `at_auction(..)` set the type and time in force; `.order_type(..)` sets no time in force. See `docs/migration-6.0.md` §32 (#1220).
 
 ### Fixed
-- A bracket `submit_all` whose second or third send fails no longer leaves the orders already sent parked at TWS. They were sent with `transmit` off, so TWS held them, listed in no `open_orders` or `completed_orders` reply, until something cancelled them; `submit_all` now cancels them before returning the error (#PR).
+- A bracket `submit_all` whose second or third send fails no longer leaves the orders already sent parked at TWS. They were sent with `transmit` off, so TWS held them, listed in no `open_orders` or `completed_orders` reply, until something cancelled them; `submit_all` now cancels them before returning the error (#1272).
 
 - `Client::resubscribing` (sync and async) ends after a market data snapshot's `TickTypes::SnapshotEnd`, as its docs said. Previously it kept waiting on a snapshot TWS had finished, and a later reconnect sent the snapshot request again. The same holds for `historical_data(..).subscribe()`, which it now accepts, after `End` (#1246).
 - Code 10349 "Order TIF was set to DAY based on order preset" is a `NoticeCategory::Warning` on any order. TWS goes on with the order after it. It arrives on every `exercise_options` request, where it ended the subscription with an error before the exercise's open order and executions arrived. It now arrives as a notice and the subscription keeps reading (#1210).
