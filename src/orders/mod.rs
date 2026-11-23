@@ -1986,4 +1986,5 @@ mod sync;
 mod r#async;
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod tests;
