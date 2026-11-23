@@ -1072,3 +1072,29 @@ SubscriptionItem::Notice(n) if n.is_error() => order_rejected(n),
 
 `iter_data()` and `filter_data()` drop notices, this one included. To rebuild order state, follow
 the recovery steps in the `order_update_stream` docs.
+
+### 46. Bracket `submit_all` returns `LinkedOrdersError`
+
+`BracketOrderBuilder::submit_all` (sync and async) now returns
+`Result<BracketOrderIds, ibapi::orders::LinkedOrdersError>`. 5.x returned `ibapi::Error` and gave
+no ids on failure, so a caller could not tell which of the three orders had reached TWS. The new
+error holds the original `Error` in `error`, plus `sent`, `cancelled` and `cancel_failures`: when
+a send fails part-way, `submit_all` cancels the held orders already sent and reports the outcome.
+
+`?` in a function returning `Result<_, ibapi::Error>` still compiles, through
+`From<LinkedOrdersError> for Error`, and so do `.expect(..)` and `.unwrap()`. Code that matches
+on the error must match on its `error` field:
+
+```rust
+// 5.x
+match client.order(&contract).buy(100).bracket().entry_limit(50.0).take_profit(55.0).stop_loss(45.0).submit_all() {
+    Err(ibapi::Error::Validation(e)) => eprintln!("invalid bracket: {e}"),
+    other => println!("{other:?}"),
+}
+
+// 6.0
+match client.order(&contract).buy(100).bracket().entry_limit(50.0).take_profit(55.0).stop_loss(45.0).submit_all() {
+    Err(e) if matches!(e.error, ibapi::Error::Validation(_)) => eprintln!("invalid bracket: {e}"),
+    other => println!("{other:?}"),
+}
+```
