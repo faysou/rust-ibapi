@@ -451,6 +451,9 @@ change arrived for any of them.
 | `cash_qty` 100 added | 10241 "Order Quantity is expressed in monetary terms. Modification is not supported via API. ..." |
 | TRAIL `trail_stop_price` changed, trailing amount kept | 10067 "Stop price must be changed together with the trailing amount for a trailing order" |
 
+- A modify sent with the id of a cancelled order (AAPL BUY 1 LMT 1.00, cancelled 5 s earlier) drew
+  104 "Cannot modify a filled order." with no status; the order stayed Cancelled and
+  `open_orders` stayed empty.
 - The 201 and 321 codes are in the order-rejection band, yet here they reject the modification
   only. The order goes on working with its previous terms.
 - For the TRAIL order, a modify of stop price and amount together, and of the amount alone, was
