@@ -862,6 +862,53 @@ impl ContractDetails {
     pub fn liquid_sessions(&self) -> Result<Vec<TradingSession>, Error> {
         parse_sessions(&self.liquid_hours)
     }
+
+    /// The last trading day at [`last_trade_time`](Self::last_trade_time): the date of the
+    /// contract's [`last_trade_date_or_contract_month`](Contract::last_trade_date_or_contract_month)
+    /// with the time TWS sent beside it, as wall clock with no zone applied.
+    ///
+    /// `None` when TWS sent the date alone, as it does for standard monthly US equity options
+    /// (AAPL `20261218`; weeklies carry a time), or when the expiry is not a date. The trading
+    /// sessions don't fill that gap: they cover only the coming week, and a session's close is
+    /// not the last trade time (ES's last trading day ends at 08:30 Chicago time, its session
+    /// at 16:00).
+    ///
+    /// TWS labels the time with [`time_zone_id`](Self::time_zone_id), the requested exchange's
+    /// zone, but the clock belongs to the contract. A US equity option requested on CBOE gets
+    /// its New York last trade time under `US/Central`
+    /// (`docs/wire-facts/contracts.md#last-trade-time-and-the-expiry-session`). Resolving the
+    /// zone is the caller's step.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Parse`] when `last_trade_time` is not `HH:MM:SS`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::ContractDetails;
+    /// use time::macros::datetime;
+    ///
+    /// // ESZ6 as TWS sends it: tag 4 `20261218 08:30:00 US/Central`.
+    /// let mut details = ContractDetails::default();
+    /// details.contract.last_trade_date_or_contract_month = Some("20261218".parse()?);
+    /// details.last_trade_time = "08:30:00".into();
+    /// details.time_zone_id = "US/Central".into();
+    /// assert_eq!(details.last_trade_date_time()?, Some(datetime!(2026-12-18 08:30)));
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    pub fn last_trade_date_time(&self) -> Result<Option<time::PrimitiveDateTime>, Error> {
+        let Some(date) = self.contract.last_trade_date_or_contract_month.as_ref().and_then(Expiry::date) else {
+            return Ok(None);
+        };
+        if self.last_trade_time.is_empty() {
+            return Ok(None);
+        }
+        let text = format!("{date} {}", self.last_trade_time);
+        time::PrimitiveDateTime::parse(&text, time::macros::format_description!("[year][month][day] [hour]:[minute]:[second]"))
+            .map(Some)
+            .map_err(|_| Error::parse_field(&self.last_trade_time, "expected last trade time HH:MM:SS"))
+    }
 }
 
 /// Parses `trading_hours` / `liquid_hours` entries, skipping empty ones.
