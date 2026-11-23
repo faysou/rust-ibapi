@@ -96,6 +96,20 @@ Contract details and option chains. Format: [README](README.md).
 - **Not probed:** futures options, bonds, and products whose `timeZoneId` differs from the
   exchange's.
 
+### No contract details for a BAG; futures spreads are BAGs
+
+*Live 2026-11-23 17:26 ET off-hours, paper TWS, server 223.*
+
+- `reqContractDetails` with `secType` `BAG` draws 321 "'BAG' isn't supported for contract data
+  request", with or without legs, for an AAPL vertical and an ES calendar on CME or SMART, and
+  with the combo placeholder con id. That con id alone (no `secType`) draws 200.
+- IB lists no futures calendar as a contract of its own: `FUT` with local symbol `ESZ6-ESH7`
+  draws 200, and none of the 134 CL rows on NYMEX has a spread local symbol. `matching_symbols`
+  reports `BAG` among the ES index's derivative types. A calendar is a BAG of the two futures'
+  con ids; see [orders](orders.md#combo-bag-shape-and-identity).
+- **Not probed:** other futures exchanges (ICE, EUREX), and products IB might list as
+  exchange spreads.
+
 ### Option chain `exchange` is a futures-options filter
 
 *Live 2026-09-03, paper Gateway, server 220, `reqSecDefOptParams`; #792.*
