@@ -218,7 +218,7 @@ impl Client {
     /// to reach earlier days.
     /// Along with the [`crate::orders::ExecutionData`], the [`crate::orders::CommissionAndFeesReport`] will also be returned.
     /// To join each commission to its execution, read the reply with
-    /// `collect_to_end_within` and pass it to [`pair_executions`](crate::orders::pair_executions).
+    /// `collect_to_end_within` and pass it to [`FillMatcher::pair_executions`](crate::orders::FillMatcher::pair_executions).
     /// When requesting executions, a filter can be specified to receive only a subset of them
     ///
     /// # Arguments

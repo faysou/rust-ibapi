@@ -1,4 +1,5 @@
 use super::*;
+use crate::contracts::SecurityType;
 use crate::orders::{Execution, OptionExerciseType};
 
 const MAX_WAIT: Duration = Duration::from_secs(5);
@@ -20,6 +21,16 @@ fn exercise(execution_id: &str) -> ExecutionData {
     let mut data = execution(execution_id);
     data.execution.option_exercise_type = OptionExerciseType::Exercise;
     data
+}
+
+fn combo(execution_id: &str) -> ExecutionData {
+    let mut data = execution(execution_id);
+    data.contract.security_type = SecurityType::Spread;
+    data
+}
+
+fn no_report_for_combos(data: &ExecutionData) -> bool {
+    data.contract.security_type != SecurityType::Spread
 }
 
 fn report(execution_id: &str, commission_and_fees: f64) -> CommissionAndFeesReport {
@@ -54,10 +65,38 @@ fn report_ids(reports: &[CommissionAndFeesReport]) -> Vec<&str> {
     reports.iter().map(|report| report.execution_id.as_str()).collect()
 }
 
-fn assert_empty(matcher: &FillMatcher) {
+fn fill_ids(fills: &[Fill]) -> Vec<(&str, Option<f64>)> {
+    fills
+        .iter()
+        .map(|fill| {
+            (
+                fill.execution.execution.execution_id.as_str(),
+                fill.commission.as_ref().map(|report| report.commission_and_fees),
+            )
+        })
+        .collect()
+}
+
+fn assert_nothing_waits(matcher: &FillMatcher) {
     assert!(matcher.executions.is_empty(), "executions held: {:?}", matcher.executions);
     assert!(matcher.reports.is_empty(), "reports held: {:?}", matcher.reports);
-    assert!(matcher.taken.is_empty(), "taken ids held: {:?}", matcher.taken);
+}
+
+fn assert_late(result: ReportMatch, execution_id: &str, commission_and_fees: f64) {
+    match result {
+        ReportMatch::Late(report) => {
+            assert_eq!(report.execution_id, execution_id);
+            assert_eq!(report.commission_and_fees, commission_and_fees);
+        }
+        other => panic!("expected Late, got {other:?}"),
+    }
+}
+
+fn assert_duplicate(result: ReportMatch, execution_id: &str) {
+    match result {
+        ReportMatch::Duplicate(report) => assert_eq!(report.execution_id, execution_id),
+        other => panic!("expected Duplicate, got {other:?}"),
+    }
 }
 
 #[test]
@@ -73,7 +112,7 @@ fn execution_then_report_pairs() {
         ReportMatch::Paired(fill) => assert_fill(&fill, "e1", Some(1.25)),
         other => panic!("expected Paired, got {other:?}"),
     }
-    assert_empty(&matcher);
+    assert_nothing_waits(&matcher);
 }
 
 #[test]
@@ -86,7 +125,7 @@ fn report_then_execution_pairs() {
 
     assert!(matches!(pushed, ReportMatch::Waiting), "report alone must wait, got {pushed:?}");
     assert_fill(&fill, "e1", Some(1.25));
-    assert_empty(&matcher);
+    assert_nothing_waits(&matcher);
 }
 
 #[test]
@@ -106,7 +145,7 @@ fn interleaved_ids_pair_by_execution_id() {
         }
         other => panic!("expected two Paired, got {other:?}"),
     }
-    assert_empty(&matcher);
+    assert_nothing_waits(&matcher);
 }
 
 #[test]
@@ -129,73 +168,6 @@ fn take_expired_waits_for_max_wait() {
 }
 
 #[test]
-fn report_after_take_is_late() {
-    let start = Instant::now();
-    let mut matcher = FillMatcher::new();
-    assert!(matcher.push_execution_at(execution("e1"), start).is_none());
-    let taken = matcher.take_expired_at(MAX_WAIT, start + MAX_WAIT);
-
-    let late = matcher.push_report_at(report("e1", 1.25), start + MAX_WAIT + Duration::from_secs(1));
-    let again = matcher.push_report_at(report("e1", 1.25), start + MAX_WAIT + Duration::from_secs(2));
-
-    assert_eq!(ids(&taken.executions), vec!["e1"]);
-    match late {
-        ReportMatch::Late(report) => {
-            assert_eq!(report.execution_id, "e1");
-            assert_eq!(report.commission_and_fees, 1.25);
-        }
-        other => panic!("expected Late, got {other:?}"),
-    }
-    assert!(
-        matches!(again, ReportMatch::Waiting),
-        "a taken id answers Late once, then is forgotten: {again:?}"
-    );
-}
-
-#[test]
-fn taken_id_is_forgotten_after_another_max_wait() {
-    let start = Instant::now();
-    let taken_at = start + MAX_WAIT;
-    let mut matcher = FillMatcher::new();
-    assert!(matcher.push_execution_at(execution("e1"), start).is_none());
-    matcher.take_expired_at(MAX_WAIT, taken_at);
-
-    let still_held = matcher.take_expired_at(MAX_WAIT, taken_at + MAX_WAIT - Duration::from_millis(1));
-    let held_ids = matcher.taken.len();
-    matcher.take_expired_at(MAX_WAIT, taken_at + MAX_WAIT);
-    let after = matcher.push_report_at(report("e1", 1.25), taken_at + MAX_WAIT);
-
-    assert!(still_held.executions.is_empty() && still_held.reports.is_empty());
-    assert_eq!(held_ids, 1, "the taken id is kept until it is max_wait old");
-    assert!(
-        matches!(after, ReportMatch::Waiting),
-        "a forgotten id pairs like any early report: {after:?}"
-    );
-}
-
-#[test]
-fn take_expired_bounds_every_store() {
-    let start = Instant::now();
-    let mut matcher = FillMatcher::new();
-    for i in 0..100 {
-        let at = start + Duration::from_millis(i);
-        assert!(matcher.push_execution_at(execution(&format!("e{i}")), at).is_none());
-        assert!(matches!(matcher.push_report_at(report(&format!("r{i}"), 0.5), at), ReportMatch::Waiting));
-    }
-    assert!(matcher.push_execution_at(exercise("x1"), start).is_some());
-
-    let first = matcher.take_expired_at(MAX_WAIT, start + Duration::from_secs(10));
-    let held_after_first = (matcher.executions.len(), matcher.reports.len(), matcher.taken.len());
-    matcher.take_expired_at(MAX_WAIT, start + Duration::from_secs(20));
-
-    assert_eq!(first.executions.len(), 100);
-    assert_eq!(first.reports.len(), 100);
-    assert_eq!(ids(&first.executions)[..3], ["e0", "e1", "e2"], "arrival order");
-    assert_eq!(held_after_first, (0, 0, 100), "the exercise id is forgotten; the 100 taken ids are kept");
-    assert_empty(&matcher);
-}
-
-#[test]
 fn take_expired_zero_returns_everything() {
     let now = Instant::now();
     let mut matcher = FillMatcher::new();
@@ -206,7 +178,172 @@ fn take_expired_zero_returns_everything() {
 
     assert_eq!(ids(&unpaired.executions), vec!["e1"]);
     assert_eq!(report_ids(&unpaired.reports), vec!["r1"]);
-    assert!(matcher.executions.is_empty() && matcher.reports.is_empty());
+    assert_nothing_waits(&matcher);
+}
+
+#[test]
+fn report_after_take_is_late_then_duplicate_however_late() {
+    let start = Instant::now();
+    let mut matcher = FillMatcher::new();
+    assert!(matcher.push_execution_at(execution("e1"), start).is_none());
+    let taken = matcher.take_expired_at(MAX_WAIT, start + MAX_WAIT);
+    let much_later = start + Duration::from_secs(3600);
+    matcher.take_expired_at(MAX_WAIT, much_later);
+
+    let late = matcher.push_report_at(report("e1", 1.25), much_later);
+    let again = matcher.push_report_at(report("e1", 1.25), much_later);
+    let third = matcher.push_report_at(report("e1", 1.25), much_later + MAX_WAIT);
+
+    assert_eq!(ids(&taken.executions), vec!["e1"]);
+    assert_late(late, "e1", 1.25);
+    assert_duplicate(again, "e1");
+    assert_duplicate(third, "e1");
+    assert_nothing_waits(&matcher);
+}
+
+#[test]
+fn repeated_report_for_paired_execution_is_duplicate_and_never_held() {
+    let now = Instant::now();
+    let mut matcher = FillMatcher::new();
+    assert!(matcher.push_execution_at(execution("e1"), now).is_none());
+    assert!(matches!(matcher.push_report_at(report("e1", 1.25), now), ReportMatch::Paired(_)));
+
+    let repeated = matcher.push_report_at(report("e1", 1.25), now);
+    let leftover = matcher.take_expired_at(Duration::ZERO, now);
+
+    assert_duplicate(repeated, "e1");
+    assert!(
+        leftover.reports.is_empty(),
+        "a repeated report is never handed out: {:?}",
+        leftover.reports
+    );
+    assert!(leftover.executions.is_empty());
+}
+
+#[test]
+fn second_copy_of_a_waiting_report_is_duplicate() {
+    let now = Instant::now();
+    let mut matcher = FillMatcher::new();
+
+    let first = matcher.push_report_at(report("e1", 1.25), now);
+    let second = matcher.push_report_at(report("e1", 1.25), now);
+    let fill = matcher.push_execution_at(execution("e1"), now).expect("report was waiting");
+
+    assert!(matches!(first, ReportMatch::Waiting), "{first:?}");
+    assert_duplicate(second, "e1");
+    assert_fill(&fill, "e1", Some(1.25));
+    assert_nothing_waits(&matcher);
+}
+
+#[test]
+fn memory_drops_the_oldest_handout_first() {
+    let now = Instant::now();
+    let mut matcher = FillMatcher::new().memory(2);
+    for execution_id in ["e1", "e2", "e3"] {
+        assert!(matcher.push_execution_at(execution(execution_id), now).is_none());
+        assert!(matches!(matcher.push_report_at(report(execution_id, 1.0), now), ReportMatch::Paired(_)));
+    }
+
+    let forgotten = matcher.push_report_at(report("e1", 1.0), now);
+    let remembered = matcher.push_report_at(report("e2", 1.0), now);
+
+    assert!(matches!(forgotten, ReportMatch::Waiting), "e1 was dropped from memory: {forgotten:?}");
+    assert_duplicate(remembered, "e2");
+    assert_eq!(matcher.handouts.len(), 2, "memory holds at most 2 ids");
+}
+
+#[test]
+fn memory_zero_remembers_nothing() {
+    let now = Instant::now();
+    let mut matcher = FillMatcher::new().memory(0);
+    assert!(matcher.push_execution_at(execution("e1"), now).is_none());
+    matcher.take_expired_at(Duration::ZERO, now);
+
+    let report = matcher.push_report_at(report("e1", 1.25), now);
+
+    assert!(matches!(report, ReportMatch::Waiting), "{report:?}");
+    assert!(matcher.handouts.is_empty() && matcher.handout_order.is_empty());
+}
+
+#[test]
+fn shrinking_memory_drops_the_oldest_at_once() {
+    let now = Instant::now();
+    let mut matcher = FillMatcher::new();
+    for execution_id in ["e1", "e2", "e3"] {
+        assert!(matcher.push_execution_at(execution(execution_id), now).is_none());
+    }
+    matcher.take_expired_at(Duration::ZERO, now);
+
+    let mut matcher = matcher.memory(1);
+
+    assert!(matches!(matcher.push_report_at(report("e2", 1.0), now), ReportMatch::Waiting));
+    assert_late(matcher.push_report_at(report("e3", 1.0), now), "e3", 1.0);
+}
+
+#[test]
+fn handout_order_stays_bounded_through_put_back_cycles() {
+    let start = Instant::now();
+    let mut matcher = FillMatcher::new().memory(4);
+    assert!(matcher.push_execution_at(execution("e1"), start).is_none());
+
+    for _ in 0..100 {
+        let taken = matcher.take_expired_at(Duration::ZERO, start);
+        let execution = taken.executions.into_iter().next().expect("e1 is due");
+        assert!(matcher.put_back(execution).is_none());
+    }
+
+    assert!(matcher.handout_order.len() <= 9, "queue length {}", matcher.handout_order.len());
+    assert!(matcher.handouts.is_empty(), "e1 waits again, so it is not a handout");
+}
+
+#[test]
+fn put_back_keeps_the_original_arrival_time() {
+    let start = Instant::now();
+    let mut matcher = FillMatcher::new();
+    assert!(matcher.push_execution_at(execution("e1"), start).is_none());
+    assert!(matcher.push_execution_at(execution("e2"), start + Duration::from_secs(1)).is_none());
+    let taken = matcher.take_expired_at(MAX_WAIT, start + MAX_WAIT);
+
+    let put_back = matcher.put_back(taken.executions.into_iter().next().expect("e1 is due"));
+    let order: Vec<String> = matcher.executions.iter().map(|(data, _)| data.execution.execution_id.clone()).collect();
+    let again = matcher.take_expired_at(MAX_WAIT, start + MAX_WAIT);
+
+    assert!(put_back.is_none());
+    assert_eq!(order, vec!["e1", "e2"], "put back in arrival order");
+    assert_eq!(ids(&again.executions), vec!["e1"], "its wait did not restart");
+}
+
+#[test]
+fn put_back_execution_pairs_with_its_report() {
+    let start = Instant::now();
+    let mut matcher = FillMatcher::new();
+    assert!(matcher.push_execution_at(execution("e1"), start).is_none());
+    let taken = matcher.take_expired_at(MAX_WAIT, start + MAX_WAIT);
+    assert!(matcher.put_back(taken.executions.into_iter().next().expect("e1 is due")).is_none());
+
+    let paired = matcher.push_report_at(report("e1", 1.25), start + MAX_WAIT);
+
+    match paired {
+        ReportMatch::Paired(fill) => assert_fill(&fill, "e1", Some(1.25)),
+        other => panic!("expected Paired, got {other:?}"),
+    }
+    assert_nothing_waits(&matcher);
+}
+
+#[test]
+fn put_back_gives_back_what_it_cannot_restore() {
+    let now = Instant::now();
+    let mut matcher = FillMatcher::new();
+    assert!(matcher.push_execution_at(execution("e1"), now).is_none());
+    let taken = matcher.take_expired_at(Duration::ZERO, now).executions;
+    assert_late(matcher.push_report_at(report("e1", 1.25), now), "e1", 1.25);
+
+    let reported = matcher.put_back(taken.into_iter().next().expect("e1 is due"));
+    let never_taken = matcher.put_back(execution("e9"));
+
+    assert_eq!(reported.map(|data| data.execution.execution_id), Some("e1".to_string()));
+    assert_eq!(never_taken.map(|data| data.execution.execution_id), Some("e9".to_string()));
+    assert_nothing_waits(&matcher);
 }
 
 #[test]
@@ -219,7 +356,7 @@ fn exercise_is_a_fill_without_commission_at_once() {
 
     assert_fill(&fill, "x1", None);
     assert_eq!(fill.execution.execution.option_exercise_type, OptionExerciseType::Exercise);
-    assert!(matches!(late, ReportMatch::Late(_)), "a report for an exercise is late: {late:?}");
+    assert_late(late, "x1", 0.0);
 }
 
 #[test]
@@ -231,7 +368,25 @@ fn exercise_pairs_with_a_report_that_came_first() {
     let fill = matcher.push_execution_at(exercise("x1"), now).expect("report was waiting");
 
     assert_fill(&fill, "x1", Some(0.75));
-    assert_empty(&matcher);
+    assert_nothing_waits(&matcher);
+}
+
+#[test]
+fn caller_rule_returns_the_fill_at_once_and_remembers_it() {
+    let now = Instant::now();
+    let mut matcher = FillMatcher::new().expects_report(no_report_for_combos);
+
+    let fill = matcher.push_execution_at(combo("b1"), now).expect("the rule expects no report");
+    let normal = matcher.push_execution_at(execution("e1"), now);
+    let exercise_waits = matcher.push_execution_at(exercise("x1"), now);
+    let late = matcher.push_report_at(report("b1", 0.5), now);
+    let repeated = matcher.push_report_at(report("b1", 0.5), now);
+
+    assert_fill(&fill, "b1", None);
+    assert!(normal.is_none(), "{normal:?}");
+    assert!(exercise_waits.is_none(), "the caller's rule replaces the default: {exercise_waits:?}");
+    assert_late(late, "b1", 0.5);
+    assert_duplicate(repeated, "b1");
 }
 
 #[test]
@@ -258,31 +413,95 @@ fn expects_commission_report_is_false_only_for_exercise() {
 }
 
 #[test]
-fn pair_executions_splits_fills_and_leftovers() {
+fn pair_executions_returns_fills_in_execution_order_and_leftovers() {
     let rows = vec![
         Executions::CommissionAndFeesReport(report("e2", 2.5)),
         Executions::ExecutionData(execution("e1")),
         Executions::ExecutionData(execution("e2")),
         Executions::ExecutionData(execution("e3")),
         Executions::CommissionAndFeesReport(report("e1", 1.25)),
+        Executions::CommissionAndFeesReport(report("e1", 1.25)),
         Executions::ExecutionData(exercise("x1")),
         Executions::CommissionAndFeesReport(report("r9", 0.5)),
-        Executions::CommissionAndFeesReport(report("x1", 0.0)),
+        Executions::CommissionAndFeesReport(report("x1", 0.25)),
+    ];
+    let mut matcher = FillMatcher::new();
+
+    let (fills, unpaired) = matcher.pair_executions(rows);
+
+    assert_eq!(
+        fill_ids(&fills),
+        vec![("e1", Some(1.25)), ("e2", Some(2.5)), ("x1", Some(0.25))],
+        "execution order; the exercise's report fills in its commission; the repeated e1 report is dropped"
+    );
+    assert_eq!(ids(&unpaired.executions), vec!["e3"]);
+    assert_eq!(report_ids(&unpaired.reports), vec!["r9"]);
+    assert_nothing_waits(&matcher);
+}
+
+#[test]
+fn pair_executions_applies_the_caller_rule() {
+    let rows = vec![
+        Executions::ExecutionData(combo("b1")),
+        Executions::ExecutionData(execution("e1")),
+        Executions::CommissionAndFeesReport(report("e1", 1.25)),
+    ];
+    let mut matcher = FillMatcher::new().expects_report(no_report_for_combos);
+
+    let (fills, unpaired) = matcher.pair_executions(rows);
+
+    assert_eq!(fill_ids(&fills), vec![("b1", None), ("e1", Some(1.25))]);
+    assert!(unpaired.executions.is_empty() && unpaired.reports.is_empty());
+}
+
+#[test]
+fn stream_copies_after_pair_executions_are_recognized() {
+    let rows = vec![
+        Executions::ExecutionData(execution("e1")),
+        Executions::CommissionAndFeesReport(report("e1", 1.25)),
+        Executions::ExecutionData(execution("e2")),
+    ];
+    let mut matcher = FillMatcher::new();
+    let (_fills, unpaired) = matcher.pair_executions(rows);
+    let now = Instant::now();
+
+    let copy = matcher.push_report_at(report("e1", 1.25), now);
+    let late = matcher.push_report_at(report("e2", 2.5), now);
+
+    assert_eq!(ids(&unpaired.executions), vec!["e2"]);
+    assert_duplicate(copy, "e1");
+    assert_late(late, "e2", 2.5);
+    assert_nothing_waits(&matcher);
+}
+
+#[test]
+fn pair_executions_leaves_earlier_holdings_alone() {
+    let start = Instant::now();
+    let mut matcher = FillMatcher::new();
+    assert!(matcher.push_execution_at(execution("old"), start).is_none());
+    matcher.take_expired_at(Duration::ZERO, start);
+    assert!(matcher.push_execution_at(execution("live"), start).is_none());
+    let rows = vec![
+        Executions::ExecutionData(execution("e1")),
+        Executions::CommissionAndFeesReport(report("old", 0.5)),
     ];
 
-    let (fills, unpaired) = pair_executions(rows);
+    let (fills, unpaired) = matcher.pair_executions(rows);
 
-    assert_eq!(fills.len(), 3, "fills: {fills:?}");
-    assert_fill(&fills[0], "e2", Some(2.5));
-    assert_fill(&fills[1], "e1", Some(1.25));
-    assert_fill(&fills[2], "x1", None);
-    assert_eq!(ids(&unpaired.executions), vec!["e3"]);
-    assert_eq!(report_ids(&unpaired.reports), vec!["r9", "x1"], "waiting reports, then late ones");
+    assert!(fills.is_empty(), "{fills:?}");
+    assert_eq!(ids(&unpaired.executions), vec!["e1"], "the live execution is not part of the reply");
+    assert_eq!(
+        report_ids(&unpaired.reports),
+        vec!["old"],
+        "first report for an execution handed out before the call"
+    );
+    assert_eq!(matcher.executions.len(), 1);
+    assert_eq!(matcher.executions[0].0.execution.execution_id, "live");
 }
 
 #[test]
 fn pair_executions_of_empty_reply() {
-    let (fills, unpaired) = pair_executions(Vec::new());
+    let (fills, unpaired) = FillMatcher::new().pair_executions(Vec::new());
 
     assert!(fills.is_empty());
     assert!(unpaired.executions.is_empty());
