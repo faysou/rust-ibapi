@@ -603,10 +603,23 @@ loop {
         SubscriptionItem::Data(OrderUpdate::CommissionAndFeesReport(report)) => match matcher.push_report(report) {
             ReportMatch::Paired(fill) => println!("fill: {fill:?}"),
             ReportMatch::Late(report) => println!("late commission: {report:?}"),
-            ReportMatch::Waiting | ReportMatch::Duplicate(_) => {}
+            ReportMatch::Waiting | ReportMatch::ComboPending | ReportMatch::Duplicate(_) => {}
         },
         _ => {}
     }
+}
+```
+
+For a combo (BAG) order, TWS sends each fill as an execution for the combo itself (the combo's
+quantity and net price, no commission report) and one execution per leg, each with its report.
+Pass the order's `perm_id` and legs to `add_combo`, for example from its open-order echo, which
+TWS sends before the first execution, and the matcher returns each fill as one `Fill` whose
+`legs` hold the leg fills. A report that pairs with a leg before the combo fill is complete is
+`ReportMatch::ComboPending`; `take_expired` returns incomplete combo fills in `Unpaired::fills`:
+
+```rust
+SubscriptionItem::Data(OrderUpdate::OpenOrder(order)) if !order.contract.combo_legs.is_empty() => {
+    matcher.add_combo(order.order.perm_id, &order.contract.combo_legs);
 }
 ```
 

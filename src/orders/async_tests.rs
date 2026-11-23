@@ -4,7 +4,7 @@ use crate::common::test_utils::helpers::{
     assert_request, assert_tws_error_message, create_test_client, create_test_client_with_ordered_proto_responses, decode_request_proto,
     order_status_response, proto_error_response, proto_response, request_message_count, TEST_REQ_ID_FIRST,
 };
-use crate::contracts::{Contract, SecurityIdType, SecurityType};
+use crate::contracts::{ComboLeg, Contract, LegAction, SecurityIdType, SecurityType};
 use crate::contracts::{Currency, Exchange, OptionRight, Symbol};
 use crate::messages::IncomingMessages;
 use crate::orders::builder::{BracketPrices, TrailBy, ValidationError};
@@ -466,6 +466,92 @@ async fn executions_pair_to_fills() {
     assert_eq!(fills, vec![("e1", Some(1.25)), ("x1", None)]);
     assert_eq!(unpaired_executions, vec!["e2"]);
     assert_eq!(unpaired_reports, vec!["r9"]);
+}
+
+#[tokio::test]
+async fn executions_pair_combo_fills() {
+    let request_id = crate::common::test_utils::helpers::TEST_REQ_ID_FIRST;
+    let perm_id = 1290491156;
+    let execution = |execution_id: &str, security_type: &str, contract_id: i32| {
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data()
+                .request_id(request_id)
+                .execution_id(execution_id)
+                .security_type(security_type)
+                .contract_id(contract_id)
+                .perm_id(perm_id)
+                .shares(1.0)
+                .encode_proto(),
+        )
+    };
+    let report = |execution_id: &str, commission_and_fees: f64| {
+        proto_response(
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report()
+                .execution_id(execution_id)
+                .commission_and_fees(commission_and_fees)
+                .encode_proto(),
+        )
+    };
+    let responses = vec![
+        execution("0000e1a7.6b0717ad.01.01", "BAG", 16472979),
+        execution("0000e1a7.6b0717ad.02.01", "FUT", 649180684),
+        execution("0000e1a7.6b0717ad.03.01", "FUT", 515416632),
+        report("0000e1a7.6b0717ad.02.01", 2.16),
+        report("0000e1a7.6b0717ad.03.01", 2.17),
+        proto_response(IncomingMessages::ExecutionDataEnd, execution_data_end().encode_proto()),
+    ];
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+    let legs = [
+        ComboLeg {
+            contract_id: 515416632,
+            ratio: 1,
+            action: LegAction::Buy,
+            ..Default::default()
+        },
+        ComboLeg {
+            contract_id: 649180684,
+            ratio: 1,
+            action: LegAction::Sell,
+            ..Default::default()
+        },
+    ];
+
+    let mut subscription = client.executions(ExecutionFilter::default()).await.expect("executions");
+    let rows = subscription
+        .collect_to_end_within(Duration::from_secs(5))
+        .await
+        .expect("reply read to its end");
+    let mut matcher = crate::orders::FillMatcher::new();
+    matcher.add_combo(perm_id, &legs);
+    let (fills, unpaired) = matcher.pair_executions(rows);
+
+    assert_eq!(fills.len(), 1, "{fills:?}");
+    let combo = &fills[0];
+    let legs: Vec<(&str, i32, Option<f64>)> = combo
+        .legs
+        .iter()
+        .map(|leg| {
+            (
+                leg.execution.execution.execution_id.as_str(),
+                leg.execution.contract.contract_id,
+                leg.commission.as_ref().map(|report| report.commission_and_fees),
+            )
+        })
+        .collect();
+    assert_eq!(combo.execution.execution.execution_id, "0000e1a7.6b0717ad.01.01");
+    assert_eq!(combo.execution.contract.security_type, SecurityType::Spread);
+    assert!(combo.commission.is_none());
+    assert_eq!(
+        legs,
+        vec![
+            ("0000e1a7.6b0717ad.02.01", 649180684, Some(2.16)),
+            ("0000e1a7.6b0717ad.03.01", 515416632, Some(2.17)),
+        ]
+    );
+    assert!(unpaired.executions.is_empty() && unpaired.reports.is_empty() && unpaired.fills.is_empty());
 }
 
 #[tokio::test]
