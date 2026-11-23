@@ -2,7 +2,9 @@ use time::OffsetDateTime;
 
 use crate::client::ids::RequestId;
 use crate::contracts::{Contract, SecurityType};
-use crate::market_data::historical::{BarRequest, BarSize, Duration, HistoricalBarUpdate, HistoricalData, HistoricalDataFrame, WhatToShow};
+use crate::market_data::historical::{
+    Bar, BarRequest, BarSize, BarTimestamp, Duration, HistoricalBarUpdate, HistoricalData, HistoricalDataFrame, WhatToShow,
+};
 use crate::market_data::TradingHours;
 use crate::Error;
 
@@ -52,7 +54,8 @@ impl<'a, C> HistoricalDataBuilder<'a, C> {
     /// The request id the terminal will send. Allocated when the builder was
     /// made; nothing has been written yet. A dropped builder skips the id.
     /// `fetch` sends its first attempt under it, and a resend after a
-    /// connection reset under a new one.
+    /// connection reset, or each later request of a split
+    /// [`between`](Self::between) range, under a new one.
     pub fn request_id(&self) -> i32 {
         self.request_id.raw()
     }
@@ -93,12 +96,26 @@ impl<'a, C> HistoricalDataBuilder<'a, C> {
     /// Daily and longer bars carry only a date and compare as midnight UTC: a `start` after
     /// midnight UTC drops that day's bar.
     ///
+    /// TWS rejects a duration under 30 seconds (error 321, live: 2026-11-23), so a shorter range
+    /// asks for 30 seconds.
+    ///
+    /// TWS serves at most 2000 seconds of [`BarSize::Sec`] bars per request: 2001 seconds draws
+    /// error 162 "invalid step: 1" (live: 2026-11-23, server 223). [`fetch`](Self::fetch) splits
+    /// a longer range of 1-second bars into requests of up to 2000 seconds, sent one after another
+    /// from `end` backward, and returns their bars oldest first. Each request ends at the earliest
+    /// bar the one before returned, so no bar is missed or repeated across a session break.
+    /// TWS's historical data pacing limits apply to each request. [`subscribe`](Self::subscribe)
+    /// sends one request, so it rejects such a range with [`Error::InvalidArgument`]. The other
+    /// bar sizes are never split: 5, 10, 15 and 30 seconds each accept 86400 seconds, a one-day
+    /// range, and 2 days (live: 2026-11-23); longer requests for them were not checked.
+    ///
     /// TWS rejects any end date for a [`ContinuousFuture`](SecurityType::ContinuousFuture)
     /// (error 10339), so for one the request has no end date and covers `[start, now)`; the bars
     /// after `end` are then dropped. Such a range must start before now. The request size grows
     /// with `now - start`, not `end - start`: a short range far in the past fetches every bar
-    /// since `start`. TWS still applies its bar-size step limit (error 162), and a large request
-    /// is slow: a month of 1-minute ES bars took over a minute (live: 2026-11-22). Use
+    /// since `start`. It cannot be split, so for 1-second bars a `start` more than 2000 seconds
+    /// before now fails with [`Error::InvalidArgument`] and nothing is sent. A large request is
+    /// slow: a month of 1-minute ES bars took over a minute (live: 2026-11-22). Use
     /// [`duration`](Self::duration) alone for one, or a larger bar size.
     pub fn between(mut self, start: OffsetDateTime, end: OffsetDateTime) -> Self {
         self.between = Some((start, end));
@@ -227,7 +244,7 @@ async fn main() {
                     ));
                 }
                 if self.contract.security_type == SecurityType::ContinuousFuture {
-                    return continuous_future_range(start, OffsetDateTime::now_utc());
+                    return continuous_future_range(start, OffsetDateTime::now_utc(), self.bar_size);
                 }
                 Ok((Some(end), covering_duration(end - start)))
             }
@@ -253,6 +270,32 @@ async fn main() {
         }
     }
 
+    /// The requests `fetch` splits the [`between`](Self::between) range into, when it exceeds
+    /// TWS's request limit for this bar size. A continuous future's range is never split;
+    /// [`continuous_future_range`] rejects one over the limit.
+    fn bar_pages(&self) -> Option<BarPages> {
+        let (start, end) = self.between?;
+        if self.contract.security_type == SecurityType::ContinuousFuture {
+            return None;
+        }
+        let limit = max_request_span(self.bar_size).filter(|limit| end - start > *limit)?;
+        Some(BarPages::new(start, end, limit))
+    }
+
+    /// Resolve the builder for a one-shot [`subscribe`](Self::subscribe), which sends a single
+    /// request and so cannot serve a range `fetch` would split.
+    fn resolve_for_subscribe(&self) -> Result<(Option<OffsetDateTime>, Duration), Error> {
+        let date_spec = self.resolve_date_spec()?;
+        if let Some(pages) = self.bar_pages() {
+            return Err(Error::InvalidArgument(format!(
+                "historical_data().subscribe(): TWS serves at most {} S of {} bars per request (error 162); .fetch() splits a longer .between(..) range",
+                pages.limit.whole_seconds(),
+                self.bar_size
+            )));
+        }
+        Ok(date_spec)
+    }
+
     /// Resolve the builder for a streaming request (`keep_up_to_date = true`).
     /// IBKR requires `end_date = None` for streaming, so `.ending()` / `.between()`
     /// are rejected.
@@ -270,15 +313,31 @@ async fn main() {
 const SECONDS_PER_DAY: u64 = 86_400;
 /// IBKR rejects `S` durations above one day and `D` durations above 365.
 const MAX_DAYS: u64 = 365;
+/// TWS rejects `S` durations under 30 with error 321, for each bar size probed (1 and 5 seconds,
+/// 1 minute, 1 hour; live: 2026-11-23, server 223).
+const MIN_SECONDS: u64 = 30;
+/// TWS's longest request for 1-second bars: 2000 S returns bars, 2001 S draws error 162 "invalid
+/// step: 1" (live: 2026-11-23, server 223).
+const SECOND_BARS_MAX_SECONDS: i64 = 2000;
+
+/// The longest span one request for `bar_size` may ask for, for the bar sizes whose TWS limit is
+/// below what [`covering_duration`] asks for.
+fn max_request_span(bar_size: BarSize) -> Option<time::Duration> {
+    match bar_size {
+        BarSize::Sec => Some(time::Duration::seconds(SECOND_BARS_MAX_SECONDS)),
+        _ => None,
+    }
+}
 
 /// An IBKR duration that covers a wall-clock `span` ending at the request's end date.
 ///
 /// IBKR counts `S` in trading seconds, `D` in whole sessions counted back from the
 /// session containing the end date, and `Y` in calendar years. Trading time never exceeds
 /// wall-clock time, so `S` and `D` over-fetch rather than fall short, provided `D` asks for
-/// one extra session to cover a range that starts partway through one. `span` is positive.
+/// one extra session to cover a range that starts partway through one. A span under
+/// [`MIN_SECONDS`] asks for that minimum. `span` is positive.
 fn covering_duration(span: time::Duration) -> Duration {
-    let seconds = span.whole_seconds().unsigned_abs() + u64::from(span.subsec_nanoseconds() != 0);
+    let seconds = (span.whole_seconds().unsigned_abs() + u64::from(span.subsec_nanoseconds() != 0)).max(MIN_SECONDS);
     if seconds <= SECONDS_PER_DAY {
         return Duration::seconds(seconds as i32);
     }
@@ -291,14 +350,86 @@ fn covering_duration(span: time::Duration) -> Duration {
 
 /// The `(end_date, duration)` of a [`between`](HistoricalDataBuilder::between) request for a
 /// continuous future. TWS rejects any end date for one (error 10339), so the request covers
-/// `[start, now)` and the trim to `[start, end)` drops the bars after `end`.
-fn continuous_future_range(start: OffsetDateTime, now: OffsetDateTime) -> Result<(Option<OffsetDateTime>, Duration), Error> {
+/// `[start, now)` and the trim to `[start, end)` drops the bars after `end`. That one request
+/// cannot be split, so `[start, now)` must be within the bar size's request limit.
+fn continuous_future_range(start: OffsetDateTime, now: OffsetDateTime, bar_size: BarSize) -> Result<(Option<OffsetDateTime>, Duration), Error> {
     if start >= now {
         return Err(Error::InvalidArgument(
             "historical_data: .between(start, end) on a continuous future requires start before now".to_owned(),
         ));
     }
+    if let Some(limit) = max_request_span(bar_size).filter(|limit| now - start > *limit) {
+        let seconds = limit.whole_seconds();
+        return Err(Error::InvalidArgument(format!(
+            "historical_data: .between(start, end) on a continuous future requests [start, now), and TWS serves at most {seconds} S of {bar_size} bars (error 162); start must be within {seconds} s of now"
+        )));
+    }
     Ok((None, covering_duration(now - start)))
+}
+
+/// The requests of a [`between`](HistoricalDataBuilder::between) range that `fetch` splits to
+/// stay within TWS's request limit, sent from `end` backward, and the bars they returned.
+///
+/// TWS counts a duration in trading time back from the end date and serves the bars before it:
+/// a request ending at 09:40 on a Monday also returns the previous Friday's last bars. So each
+/// request ends at the earliest bar the one before returned, which neither skips nor repeats a
+/// bar. After a request that returned no bars, the next ends one limit earlier in wall-clock
+/// time, which that request's trading-time duration covered. The requests stop once one covers
+/// `start`.
+struct BarPages {
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+    limit: time::Duration,
+    /// The end of the next request; `None` once the requests reach `start`.
+    request_end: Option<OffsetDateTime>,
+    pages: Vec<Vec<Bar>>,
+}
+
+impl BarPages {
+    fn new(start: OffsetDateTime, end: OffsetDateTime, limit: time::Duration) -> Self {
+        Self {
+            start,
+            end,
+            limit,
+            request_end: Some(end),
+            pages: Vec::new(),
+        }
+    }
+
+    /// The end date and duration of the next request, or `None` once the requests reach `start`.
+    fn next_request(&self) -> Option<(OffsetDateTime, Duration)> {
+        let end = self.request_end?;
+        Some((end, covering_duration((end - self.start).min(self.limit))))
+    }
+
+    /// Adds the bars the request from [`next_request`](Self::next_request) returned. Bars at or
+    /// after its end belong to the request before and are dropped.
+    fn push(&mut self, bars: Vec<Bar>) {
+        let Some(request_end) = self.request_end else {
+            return;
+        };
+        let before = BarTimestamp::from(request_end);
+        let bars: Vec<Bar> = bars.into_iter().filter(|bar| bar.date < before).collect();
+        let next_end = match bars.iter().map(|bar| bar.date).min() {
+            Some(BarTimestamp::DateTime(earliest)) => earliest,
+            Some(BarTimestamp::Date(earliest)) => earliest.midnight().assume_utc(),
+            None => request_end - self.limit,
+        };
+        let covered_start = request_end - self.start <= self.limit || next_end <= self.start;
+        self.request_end = (!covered_start).then_some(next_end);
+        self.pages.push(bars);
+    }
+
+    /// The bars in `[start, end)`, oldest first.
+    fn finish(self) -> HistoricalData {
+        let bars = self.pages.into_iter().rev().flatten().collect();
+        HistoricalData {
+            start: self.start,
+            end: self.end,
+            bars,
+        }
+        .trim_to(self.start, self.end)
+    }
 }
 
 /// Drop bars outside `[start, end)` when the request came from [`between`](HistoricalDataBuilder::between).
@@ -328,6 +459,10 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::sync::Client> {
     /// Without a `one_shot_timeout`, waits without a time limit. Any error
     /// before the end marker cancels the request at TWS.
     ///
+    /// A [`between`](Self::between) range of 1-second bars longer than 2000 seconds is fetched
+    /// with several requests, one after another. Each has its own `one_shot_timeout`, and an
+    /// error from any of them is returned without the bars fetched before it.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -356,6 +491,16 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::sync::Client> {
     /// ```
     pub fn fetch(self) -> Result<HistoricalData, Error> {
         let (end_date, duration) = self.resolve_for_fetch()?;
+        if let Some(mut pages) = self.bar_pages() {
+            let mut first_id = Some(self.request_id);
+            while let Some((end_date, duration)) = pages.next_request() {
+                let request_id = first_id.take().unwrap_or_else(|| self.client.mint_request_id());
+                let data =
+                    crate::market_data::historical::sync::historical_data(self.client, self.bar_request(Some(end_date), duration), request_id)?;
+                pages.push(data.bars);
+            }
+            return Ok(pages.finish());
+        }
         let data = crate::market_data::historical::sync::historical_data(self.client, self.bar_request(end_date, duration), self.request_id)?;
         Ok(trim_to_range(data, self.between))
     }
@@ -382,6 +527,7 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::sync::Client> {
     ///
     /// # Errors
     /// [`Error::InvalidArgument`], with nothing sent, for an invalid date range,
+    /// a [`between`](Self::between) range one request cannot serve,
     /// [`WhatToShow::AdjustedLast`] with an end date, or a `buffer_limit`
     /// outside `1..=`[`MAX_BUFFER_LIMIT`](crate::subscriptions::MAX_BUFFER_LIMIT).
     ///
@@ -433,7 +579,7 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::sync::Client> {
     /// }
     /// ```
     pub fn subscribe(self) -> Result<crate::subscriptions::sync::Subscription<HistoricalDataFrame>, Error> {
-        let (end_date, duration) = self.resolve_date_spec()?;
+        let (end_date, duration) = self.resolve_for_subscribe()?;
         crate::market_data::historical::sync::historical_data_subscription(
             self.client,
             self.bar_request(end_date, duration),
@@ -497,6 +643,10 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
     /// call, wrap the future in `tokio::time::timeout`. Dropping it, or any
     /// error, before the end marker cancels the request at TWS.
     ///
+    /// A [`between`](Self::between) range of 1-second bars longer than 2000 seconds is fetched
+    /// with several requests, one after another. Each has its own `one_shot_timeout`, and an
+    /// error from any of them is returned without the bars fetched before it.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -528,6 +678,17 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
     /// ```
     pub async fn fetch(self) -> Result<HistoricalData, Error> {
         let (end_date, duration) = self.resolve_for_fetch()?;
+        if let Some(mut pages) = self.bar_pages() {
+            let mut first_id = Some(self.request_id);
+            while let Some((end_date, duration)) = pages.next_request() {
+                let request_id = first_id.take().unwrap_or_else(|| self.client.mint_request_id());
+                let data =
+                    crate::market_data::historical::r#async::historical_data(self.client, self.bar_request(Some(end_date), duration), request_id)
+                        .await?;
+                pages.push(data.bars);
+            }
+            return Ok(pages.finish());
+        }
         let data =
             crate::market_data::historical::r#async::historical_data(self.client, self.bar_request(end_date, duration), self.request_id).await?;
         Ok(trim_to_range(data, self.between))
@@ -555,6 +716,7 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
     ///
     /// # Errors
     /// [`Error::InvalidArgument`], with nothing sent, for an invalid date range,
+    /// a [`between`](Self::between) range one request cannot serve,
     /// [`WhatToShow::AdjustedLast`] with an end date, or a `buffer_limit`
     /// outside `1..=`[`MAX_BUFFER_LIMIT`](crate::subscriptions::MAX_BUFFER_LIMIT).
     ///
@@ -606,7 +768,7 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
     /// }
     /// ```
     pub async fn subscribe(self) -> Result<crate::subscriptions::r#async::Subscription<HistoricalDataFrame>, Error> {
-        let (end_date, duration) = self.resolve_date_spec()?;
+        let (end_date, duration) = self.resolve_for_subscribe()?;
         crate::market_data::historical::r#async::historical_data_subscription(
             self.client,
             self.bar_request(end_date, duration),
