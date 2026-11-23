@@ -569,10 +569,13 @@ carried on `Execution::execution_id`. TWS sends the execution first and the comm
 shortly after, but order-status and open-order frames can land between them. Both arrive on
 the same streams (`executions`, `place_order`, `order_update_stream`).
 
-`orders::FillMatcher` does the join on a stream and yields a `Fill`: the execution with
-`Option` of its report. It pairs in either arrival order. `take_expired` hands back the
-executions whose report has not come within a wait you choose. TWS sends no report for an
-option exercise, so the matcher returns that fill at once with no commission.
+`orders::FillMatcher` does the join and yields a `Fill`: the execution with `Option` of its
+report. It pairs in either arrival order. `take_expired` hands back the executions whose report
+has not come within a wait you choose, and `put_back` returns one you cannot emit yet. An
+execution its rule expects no report for (by default an option exercise; set your own with
+`expects_report`) is a fill at once with no commission. The matcher remembers the executions it
+handed out, so a report that comes after `take_expired` is `ReportMatch::Late` and a repeated
+one is `ReportMatch::Duplicate`.
 
 ```rust
 use ibapi::orders::{FillMatcher, OrderUpdate, ReportMatch};
@@ -599,20 +602,22 @@ loop {
         }
         SubscriptionItem::Data(OrderUpdate::CommissionAndFeesReport(report)) => match matcher.push_report(report) {
             ReportMatch::Paired(fill) => println!("fill: {fill:?}"),
-            ReportMatch::Waiting => {}
             ReportMatch::Late(report) => println!("late commission: {report:?}"),
+            ReportMatch::Waiting | ReportMatch::Duplicate(_) => {}
         },
         _ => {}
     }
 }
 ```
 
-For a whole `executions` reply, `orders::pair_executions` returns the fills and the
-executions and reports that found no partner:
+For a whole `executions` reply, `FillMatcher::pair_executions` returns the fills in execution
+order and the executions and reports that found no partner. Use the same matcher for the stream
+afterwards, and the reply's reports that reach it again come back as `Duplicate`:
 
 ```rust
 let rows = client.executions(ExecutionFilter::default())?.collect_to_end_within(Duration::from_secs(10))?;
-let (fills, unpaired) = ibapi::orders::pair_executions(rows);
+let mut matcher = FillMatcher::new();
+let (fills, unpaired) = matcher.pair_executions(rows);
 ```
 
 ### Concurrent Subscriptions

@@ -535,7 +535,7 @@ fn executions_pair_to_fills() {
     let rows = subscription
         .collect_to_end_within(std::time::Duration::from_secs(5))
         .expect("reply read to its end");
-    let (fills, unpaired) = crate::orders::pair_executions(rows);
+    let (fills, unpaired) = crate::orders::FillMatcher::new().pair_executions(rows);
 
     let fills: Vec<(&str, Option<f64>)> = fills
         .iter()
