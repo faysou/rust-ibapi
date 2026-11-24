@@ -289,3 +289,24 @@ fn rejection_ends_request_only_for_verified_codes() {
         assert!(rejection_ends::<HistoricalDataFrame>(code), "one-shot HistoricalDataFrame: {code}");
     }
 }
+
+#[test]
+fn for_earlier_subscription_turns_only_a_tws_error_into_a_notice() {
+    let notice = Notice {
+        request_id: Some(7),
+        code: 105,
+        message: "Order being modified does not match original order.".to_string(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    };
+
+    let from_error = RoutedItem::Error(Error::Notice(notice.clone())).for_earlier_subscription();
+    let from_notice = RoutedItem::Notice(notice.clone()).for_earlier_subscription();
+    let from_other_error = RoutedItem::Error(Error::Cancelled).for_earlier_subscription();
+    let from_response = RoutedItem::Response(ResponseMessage::from("3\0payload\0")).for_earlier_subscription();
+
+    assert!(matches!(from_error, RoutedItem::Notice(n) if n == notice));
+    assert!(matches!(from_notice, RoutedItem::Notice(n) if n == notice));
+    assert!(matches!(from_other_error, RoutedItem::Error(Error::Cancelled)));
+    assert!(matches!(from_response, RoutedItem::Response(_)));
+}

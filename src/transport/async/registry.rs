@@ -174,16 +174,19 @@ impl<K: Hash + Eq + Display + Debug> SenderHash<K> {
     }
 
     /// Deliver `item` to each of `id`'s routes and run `then` on each, all
-    /// under the read lock.
+    /// under the read lock. Routes older than the newest receive
+    /// [`RoutedItem::for_earlier_subscription`].
     fn deliver_then(&self, id: &K, item: RoutedItem, then: impl Fn(&Route)) -> Result<(), RoutedItem> {
         let routes = self.read();
-        let Some(registered) = routes.get(id).filter(|registered| !registered.is_empty()) else {
+        let Some((newest, earlier)) = routes.get(id).and_then(|registered| registered.split_last()) else {
             return Err(item);
         };
-        for route in registered {
-            route.deliver(id, item.clone());
+        for route in earlier {
+            route.deliver(id, item.for_earlier_subscription());
             then(route);
         }
+        newest.deliver(id, item);
+        then(newest);
         Ok(())
     }
 

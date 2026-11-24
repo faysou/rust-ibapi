@@ -195,6 +195,17 @@ impl RoutedItem {
             RoutedItem::Notice(_) => None,
         }
     }
+
+    /// The item as a subscription receives it when a newer one is registered under the same
+    /// order id. A TWS error frame answers the newest request on the id, such as a refused
+    /// modify or cancel, while the order goes on working, so it ends only that request's
+    /// subscription; the earlier ones receive it as a notice.
+    pub(crate) fn for_earlier_subscription(&self) -> RoutedItem {
+        match self {
+            RoutedItem::Error(Error::Notice(notice)) => RoutedItem::Notice(notice.clone()),
+            item => item.clone(),
+        }
+    }
 }
 
 /// `true` when `message` is not this subscription's to decode.
