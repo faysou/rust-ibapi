@@ -431,8 +431,14 @@ impl Client {
     /// Analyzes `order` for margin and commission (what-if): TWS evaluates it without placing it.
     ///
     /// For an order built elsewhere; [`OrderBuilder::analyze`]
-    /// calls this. Sends a copy of `order` with [`what_if`](crate::orders::Order::what_if) set
-    /// under the client's next order id, so `order` itself is not changed and needs neither.
+    /// calls this with the client's [`next_order_id`](Client::next_order_id). Sends a copy of
+    /// `order` with [`what_if`](crate::orders::Order::what_if) set under `order_id`, so `order`
+    /// itself is not changed and needs neither.
+    ///
+    /// TWS treats `order_id` as used once the what-if is sent: a later order or what-if under the
+    /// same id, or under a lower one, draws 103 "Duplicate order id" (live: 2026-11-24, server
+    /// 223; `docs/wire-facts/orders.md#what-if-order-ids`). Pass an id from the same sequence as
+    /// the ids passed to [`place_order`](Client::place_order).
     ///
     /// Returns the order state that carries the margins and commission. TWS answers some orders
     /// (live: US stock limit orders) with a warning-only frame first; the returned state keeps
@@ -444,7 +450,7 @@ impl Client {
     /// this call can skip them.
     ///
     /// # Errors
-    /// - [`Error::OrderIdInRequestRange`] if the client's next order id, or a `parent_id` or preset attached-order id on `order`, is at or above 1,500,000,000 (reserved for request ids).
+    /// - [`Error::OrderIdInRequestRange`] if `order_id`, or a `parent_id` or preset attached-order id on `order`, is at or above 1,500,000,000 (reserved for request ids).
     /// - [`Error::InvalidArgument`], with nothing sent, for an [`ext_operator`](crate::orders::Order::ext_operator) TWS would reject.
     /// - The error TWS returns if it rejects the what-if order, including the 201 for an order the account's margin cannot carry.
     /// - [`Error::UnexpectedEndOfStream`] if the reply ends without the order's state.
@@ -460,14 +466,14 @@ impl Client {
     /// let contract = Contract::stock("AAPL").build();
     /// let order = order_builder::limit_order(Action::Buy, 100.0, 150.0);
     ///
-    /// let state = client.analyze_order(&contract, &order).expect("analyze failed");
+    /// let state = client.analyze_order(client.next_order_id(), &contract, &order).expect("analyze failed");
     /// println!(
     ///     "initial margin {:?} -> {:?}, commission {:?} {}",
     ///     state.initial_margin_before, state.initial_margin_after, state.commission_and_fees, state.commission_and_fees_currency
     /// );
     /// ```
-    pub fn analyze_order(&self, contract: &Contract, order: &super::Order) -> Result<OrderState, Error> {
-        let order_id = self.next_order_id();
+    pub fn analyze_order(&self, order_id: impl Into<OrderId>, contract: &Contract, order: &super::Order) -> Result<OrderState, Error> {
+        let order_id: OrderId = order_id.into();
         let order = super::Order {
             what_if: true,
             ..order.clone()
@@ -480,7 +486,7 @@ impl Client {
         let mut reply = WhatIfReply::default();
         for response in responses.iter_data() {
             if let PlaceOrder::OpenOrder(order_data) = response? {
-                if order_data.order_id == order_id {
+                if order_data.order_id == order_id.value() {
                     if let Some(state) = reply.observe(order_data.order_state) {
                         return Ok(state);
                     }

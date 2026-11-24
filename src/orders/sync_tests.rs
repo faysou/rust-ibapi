@@ -1075,10 +1075,11 @@ fn analyze_surfaces_the_rejection_after_an_over_margin_frame() {
     assert_tws_error_message(err, 201, "YOUR ORDER IS NOT ACCEPTED");
 }
 
-// `analyze_order` takes an order built elsewhere: it sends a what-if copy under the client's next
-// order id, applies the same frame rules as `analyze`, and leaves the caller's order unchanged.
+// `analyze_order` takes an order built elsewhere: it sends a what-if copy under the caller's order
+// id, moves the client's id generator past it, applies the same frame rules as `analyze`, and
+// leaves the caller's order unchanged.
 #[test]
-fn analyze_order_sends_a_what_if_copy_under_the_next_order_id() {
+fn analyze_order_sends_a_what_if_copy_under_the_given_order_id() {
     let (client, bus) = create_blocking_test_client_with_ordered_proto_responses(vec![
         proto_response(
             IncomingMessages::OpenOrder,
@@ -1099,12 +1100,11 @@ fn analyze_order_sends_a_what_if_copy_under_the_next_order_id() {
                 .encode_proto(),
         ),
     ]);
-    client.id_manager().raise_order_id(OrderId::from(9090));
     let contract = Contract::stock("AAPL").build();
     let mut order = order_builder::limit_order(Action::Buy, 10.0, 100.0);
     order.order_id = 77;
 
-    let state = client.analyze_order(&contract, &order).expect("analyze_order should succeed");
+    let state = client.analyze_order(9090, &contract, &order).expect("analyze_order should succeed");
 
     let request: crate::proto::PlaceOrderRequest = decode_request_proto(&bus, 0);
     assert_eq!(request.order_id, Some(9090));
@@ -1114,6 +1114,7 @@ fn analyze_order_sends_a_what_if_copy_under_the_next_order_id() {
     assert_eq!(state.warning_text, "If your order is not immediately executable");
     assert!(!order.what_if, "the caller's order keeps what_if unset");
     assert_eq!(order.order_id, 77);
+    assert_eq!(client.next_order_id(), 9091, "a later order cannot reuse the what-if's id");
 }
 
 // The `submit` family, against `Client::stubbed` rather than a mock client that
