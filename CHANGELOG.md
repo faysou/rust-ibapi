@@ -83,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `OrderBuilder::analyze` (sync and async) returns the margins and commission of a US stock limit what-if order. TWS answers one with a warning-only frame first, which `analyze` returned, so every margin field was `None` and the commission `0`; the returned state now carries the second frame's figures and the first frame's `warning_text`. A what-if order the account's margin cannot carry returns TWS's 201 rejection instead of `Ok` with the margins of an order TWS refused (#PR).
+- `OrderBuilder::analyze` (sync and async) returns the margins and commission of a US stock limit what-if order. TWS answers one with a warning-only frame first, which `analyze` returned, so every margin field was `None` and the commission `0`; the returned state now carries the second frame's figures and the first frame's `warning_text`. A what-if order the account's margin cannot carry returns TWS's 201 rejection instead of `Ok` with the margins of an order TWS refused (#1289).
 - Code 10349 "Order TIF was set to DAY based on order preset" is a `NoticeCategory::Warning` on any order. TWS goes on with the order after it. It arrives on every `exercise_options` request, where it ended the subscription with an error before the exercise's open order and executions arrived. It now arrives as a notice and the subscription keeps reading (#1210).
 
 ## [5.8.0] - 2026-11-24
