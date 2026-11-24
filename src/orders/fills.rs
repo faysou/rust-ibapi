@@ -69,6 +69,8 @@ impl Fill {
     /// echo's `contract.combo_legs` leg by leg; the exchange does only for a combo routed to
     /// one exchange (live, 14 ES combo fills on `CME` and 2 AAPL option verticals on `SMART`:
     /// 2026-11-24, server 223; `docs/wire-facts/orders.md#combo-bag-executions-and-commissions`).
+    /// [`Contract::spread_from_legs`](crate::contracts::Contract::spread_from_legs) keeps its legs
+    /// in the order given, so sort that contract's `combo_legs` by `contract_id` before comparing.
     ///
     /// # Examples
     ///
