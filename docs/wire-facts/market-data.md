@@ -182,8 +182,15 @@ server 223; delayed data (type 3).*
 - Settles that an option's own open interest is the tick for its right, and the other tick's `0`
   is not a value for the contract. IB's tick type table describes `101` as "currently for
   stocks".
-- **Not probed:** real-time data; US trading hours (whether the value repeats or changes during
-  the session); `OpenInterest` (22), which never arrived; a stock's aggregate values.
+- **US trading hours** (*live 2026-11-24 15:57-16:04 UTC, US market open, paper TWS, server
+  223*): the same shape. Delayed (type 3), `101` on the AAPL Dec 2026 350 call drew 27 `30568`
+  and 28 `0` 0.1 s after the request, the 350 put 27 `0` and 28 `10223`, the ES Dec 2026 7500
+  call 27 `7259` / 28 `0` and the put 27 `0` / 28 `13667`; each pair once in a 30 s window.
+  The AAPL call's value differs from the 09:47 UTC read
+  (30680) of the same day. Real-time (type 1) on the AAPL call and the ES option drew 354
+  and no open interest tick.
+- **Not probed:** real-time data on an account with option data permission; `OpenInterest` (22),
+  which never arrived; a stock's aggregate values.
 
 ### Tick-by-tick sizes and `IgnoreSize`
 
