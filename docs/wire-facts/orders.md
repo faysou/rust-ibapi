@@ -588,13 +588,36 @@ and EUR.USD BUY 20,000 MKT cancelled right after placing.*
 - **Slow acknowledgment**: in one run TWS took 7 s before the OpenOrder of a new order, and in
   another sent none; modifies sent meanwhile drew 103, and the unanswered order's cancel
   drew OrderStatus ApiCancelled with perm id 0.
-- **Subscriptions**: with every subscription on an order id receiving its frames (#1282), the 105 of a
-  refused modify reached the earlier `place_order` subscriptions as an error and ended them, while
-  the order kept working (the next modify was accepted). On 6.0-dev before that, each `place_order`
-  or `cancel_order` on the id ended the earlier subscription at once, and a refused modify then
+- **Subscriptions**: with every subscription on an order id receiving its frames (#1282), a
+  refused modify's error ends the modify's own subscription and reaches the earlier `place_order`
+  subscription as a notice, which keeps receiving the order's frames (201, 104 and 434 on
+  2026-11-24 during US hours, on the build with #1282). An earlier build of #1282 ended the
+  earlier subscriptions with the 105 as an error. On 6.0-dev before #1282, each `place_order` or
+  `cancel_order` on the id ended the earlier subscription at once, and a refused modify then
   ended its own, leaving none.
-- **Not probed:** a partly filled order modified to below its filled quantity (paper EUR.USD
-  filled 20,000 at once, and US stocks were closed); RTH; futures and stock orders; IB Gateway.
+- **Partly filled order** (*live 2026-11-24 16:14-16:21 UTC, US market open, paper TWS, server
+  223; MSFT BUY LMT at or above the ask, modified with `place_order` on the same id after the
+  first partial fill*):
+
+  | Modify sent                                    | Reply                                                                       |
+  | ---------------------------------------------- | --------------------------------------------------------------------------- |
+  | limit to 480 (below the market), filled 100    | OpenOrder with the new price, status `PendingSubmit`, then `Submitted`      |
+  | quantity 2000 -> filled + 100                  | OpenOrder and OrderStatus `PreSubmitted`, then `Submitted`, `remaining` 100 |
+  | quantity below the filled quantity             | 355 "Order size does not conform to market rule." under order id 0          |
+  | quantity equal to the filled quantity          | 434 "The order size cannot be zero." on the order id                        |
+  | limit change while the order was still filling | fills at the old price, status `PendingSubmit`; once `Filled`, 201          |
+
+  - The quantity is the order's total, filled shares included: after 2000 -> 299 with 199
+    filled, the cancel reported `filled` 199 and `remaining` 100.
+  - The 355 frame carried order id 0 (raw capture), so it reached no subscription on the
+    order, only `order_update_stream`; the order kept its quantity. The 434 reached the
+    modify's subscription as an error and the earlier `place_order` subscription as a notice.
+  - Modify overtaken by fills: the OpenOrder that answered the modify echoed the new price with
+    status `PendingSubmit` while seven more fills at the old price (493.45 to 493.47 against a
+    new limit of 480) completed the order; after `Filled` came 201 "Order rejected -
+    reason:Order is already filled" on the order id, and further modifies drew 104.
+- **Not probed:** a modify of a partly filled order's limit back into the market; IB Gateway;
+  futures orders.
 
 ### Weekend cancel of a PreSubmitted ES order wedges in PendingCancel
 
