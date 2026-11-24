@@ -58,13 +58,17 @@ impl Fill {
     ///   [`Sell`](LegAction::Sell) for the other side. That is the leg's action as the combo
     ///   order lists it, whether the combo was bought or sold: a sold calendar whose order buys
     ///   the back month executes a sale of the back month, and that leg comes back as `Buy`.
-    /// - **Exchange**: the leg contract's exchange as the execution reports it.
+    /// - **Exchange**: the leg contract's exchange as the execution reports it: the venue that
+    ///   executed the leg. For a combo routed to one exchange (`CME`) that is the order's
+    ///   exchange; for a `SMART` combo it is the venue of that fill (`PHLX` on one fill, `EDGX`
+    ///   on the next), while the order echo's legs say `SMART`.
     /// - **Contract id**: the leg contract's. Other fields keep their defaults.
     ///
     /// The order echoes TWS sends (`open_orders`, `completed_orders`) list a combo's legs
-    /// sorted by contract id, so the result compares with an echo's `contract.combo_legs`
-    /// leg by leg (live, 14 ES combo fills: 2026-11-24, server 223;
-    /// `docs/wire-facts/orders.md#combo-bag-executions-and-commissions`).
+    /// sorted by contract id, so the contract id, ratio and action of each leg compare with an
+    /// echo's `contract.combo_legs` leg by leg; the exchange does only for a combo routed to
+    /// one exchange (live, 14 ES combo fills on `CME` and 2 AAPL option verticals on `SMART`:
+    /// 2026-11-24, server 223; `docs/wire-facts/orders.md#combo-bag-executions-and-commissions`).
     /// [`Contract::spread_from_legs`](crate::contracts::Contract::spread_from_legs) keeps its legs
     /// in the order given, so sort that contract's `combo_legs` by `contract_id` before comparing.
     ///
