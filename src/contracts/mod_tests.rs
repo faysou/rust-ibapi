@@ -598,3 +598,39 @@ fn last_trade_date_time_joins_expiry_date_and_time() {
     let bad = details(Some("20261218"), "8:30");
     assert!(matches!(bad.last_trade_date_time(), Err(Error::Parse(_, value, _)) if value == "8:30"));
 }
+
+#[test]
+fn last_trade_time_zone_is_new_york_for_us_stock_options() {
+    // Values from contract details, paper TWS, server 223, 2026-11-24.
+    let details = |security_type: SecurityType, under: Option<SecurityType>, zone: &str| ContractDetails {
+        contract: Contract {
+            security_type,
+            ..Default::default()
+        },
+        under_security_type: under,
+        time_zone_id: zone.into(),
+        ..Default::default()
+    };
+    let (option, stock) = (SecurityType::Option, Some(SecurityType::Stock));
+    let cases = [
+        ("AAPL on CBOE", details(option.clone(), stock.clone(), "US/Central"), "US/Eastern"),
+        ("AAPL on PSE", details(option.clone(), stock.clone(), "US/Pacific"), "US/Eastern"),
+        ("AAPL on SMART", details(option.clone(), stock.clone(), "US/Eastern"), "US/Eastern"),
+        ("SAP on EUREX", details(option.clone(), stock.clone(), "MET"), "MET"),
+        (
+            "SPXW on CBOE",
+            details(option.clone(), Some(SecurityType::Index), "US/Central"),
+            "US/Central",
+        ),
+        (
+            "ES FOP on CME",
+            details(SecurityType::FuturesOption, Some(SecurityType::Future), "US/Central"),
+            "US/Central",
+        ),
+        ("ES future", details(SecurityType::Future, None, "US/Central"), "US/Central"),
+        ("expired VIXW sends no zone", details(option, Some(SecurityType::Index), ""), ""),
+    ];
+    for (label, details, expected) in cases {
+        assert_eq!(details.last_trade_time_zone(), expected, "{label}");
+    }
+}

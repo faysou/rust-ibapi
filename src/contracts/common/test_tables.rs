@@ -243,6 +243,48 @@ pub fn contract_details_test_cases() -> Vec<ContractDetailsTestCase> {
             }),
         },
         ContractDetailsTestCase {
+            // AAPL weekly requested on CBOE (paper TWS, server 223, 2026-11-24): the New York
+            // last trade time under CBOE's `US/Central` label.
+            name: "us stock option on cboe",
+            contract: Contract {
+                symbol: Symbol::from("AAPL"),
+                security_type: SecurityType::Option,
+                exchange: Exchange::from("CBOE"),
+                last_trade_date_or_contract_month: Some("20261127".parse().unwrap()),
+                currency: Currency::from("USD"),
+                ..Default::default()
+            },
+            ordered_responses: vec![
+                proto_response(
+                    IncomingMessages::ContractData,
+                    contract_data()
+                        .request_id(9001)
+                        .contract_id(932491851)
+                        .symbol("AAPL")
+                        .security_type("OPT")
+                        .last_trade_date_or_contract_month("20261127 13:15:00 US/Central")
+                        .multiplier("100")
+                        .exchange("CBOE")
+                        .currency("USD")
+                        .trading_class("AAPL")
+                        .time_zone_id("US/Central")
+                        .under_security_type("STK")
+                        .encode_proto(),
+                ),
+                proto_response(IncomingMessages::ContractDataEnd, contract_data_end().request_id(9001).encode_proto()),
+            ],
+            expected_count: 1,
+            validations: Box::new(|contracts| {
+                assert_eq!(contracts[0].under_security_type, Some(SecurityType::Stock));
+                assert_eq!(contracts[0].time_zone_id, "US/Central");
+                assert_eq!(contracts[0].last_trade_time_zone(), "US/Eastern");
+                assert_eq!(
+                    contracts[0].last_trade_date_time().unwrap(),
+                    Some(time::macros::datetime!(2026-11-27 13:15))
+                );
+            }),
+        },
+        ContractDetailsTestCase {
             name: "bond contract details",
             contract: Contract {
                 symbol: Symbol::from("TLT"),
