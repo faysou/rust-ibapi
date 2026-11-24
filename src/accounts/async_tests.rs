@@ -990,6 +990,47 @@ async fn account_summary_snapshots_resubscribing_starts_a_fresh_snapshot_after_r
     assert_request(&message_bus, 2, &cancel_account_summary().request_id(TEST_REQ_ID_FIRST + 1));
 }
 
+/// Opened from an `Arc<Client>`, the stream owns its client handle: it moves into a spawned task
+/// after the first snapshot and resubscribes there.
+#[tokio::test]
+async fn account_summary_snapshots_resubscribing_from_arc_runs_in_a_spawned_task() {
+    let (client, message_bus) = resubscribing_bus(net_liquidation_dump());
+    let client = Arc::new(client);
+    let group = AccountGroup("All".to_string());
+
+    let mut snapshots = AccountSummarySnapshotsResubscribing::subscribe(
+        Arc::clone(&client),
+        &group,
+        &[AccountSummaryTags::NET_LIQUIDATION],
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("request account_summary_snapshots_resubscribing failed");
+    let initial = snapshots.next().await.unwrap().unwrap();
+    let task = tokio::spawn(async move {
+        let gap = snapshots.next().await.unwrap();
+        let fresh = snapshots.next().await.unwrap().unwrap();
+        (gap, fresh)
+    });
+    drop_connection(&message_bus);
+    let (gap, fresh) = task.await.expect("task panicked");
+
+    assert_eq!(values(&initial), vec![("NetLiquidation", "USD", "100.0")]);
+    assert!(
+        matches!(&gap, Err(Error::Notice(n)) if n.code == crate::TRANSPORT_RECONNECT_CODE),
+        "expected the reconnect notice, got {gap:?}"
+    );
+    assert_eq!(values(&fresh), vec![("NetLiquidation", "USD", "100.0")]);
+    let request = |id| {
+        request_account_summary()
+            .request_id(id)
+            .group("All")
+            .tags([AccountSummaryTags::NET_LIQUIDATION])
+    };
+    assert_request(&message_bus, 0, &request(TEST_REQ_ID_FIRST));
+    assert_request(&message_bus, 1, &request(TEST_REQ_ID_FIRST + 1));
+}
+
 #[tokio::test]
 async fn account_summary_snapshots_resubscribing_ends_when_the_reconnect_gives_up() {
     let (client, message_bus) = resubscribing_bus(net_liquidation_dump().with_failed_reconnect());

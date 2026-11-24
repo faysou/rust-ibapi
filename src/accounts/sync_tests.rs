@@ -1,4 +1,4 @@
-use super::{AccountSummarySnapshot, AccountSummarySnapshots, SnapshotBuilder, Subscription};
+use super::{AccountSummarySnapshot, AccountSummarySnapshots, AccountSummarySnapshotsResubscribing, SnapshotBuilder, Subscription};
 use crate::accounts::types::{AccountGroup, AccountId, ContractId, ModelCode};
 use crate::accounts::{AccountSummaryTags, AccountUpdateMulti, LedgerOnly};
 use crate::client::ids::RequestId;
@@ -1007,6 +1007,46 @@ fn account_summary_snapshots_resubscribing_starts_a_fresh_snapshot_after_reconne
     assert_request(&message_bus, 0, &request(TEST_REQ_ID_FIRST));
     assert_request(&message_bus, 1, &request(TEST_REQ_ID_FIRST + 1));
     assert_request(&message_bus, 2, &cancel_account_summary().request_id(TEST_REQ_ID_FIRST + 1));
+}
+
+/// Opened from an `Arc<Client>`, the iterator owns its client handle: it moves into a spawned
+/// thread after the first snapshot and resubscribes there.
+#[test]
+fn account_summary_snapshots_resubscribing_from_arc_runs_in_a_spawned_thread() {
+    let (client, message_bus) = resubscribing_bus(net_liquidation_dump());
+    let client = Arc::new(client);
+    let group = AccountGroup("All".to_string());
+
+    let mut snapshots = AccountSummarySnapshotsResubscribing::subscribe(
+        Arc::clone(&client),
+        &group,
+        &[AccountSummaryTags::NET_LIQUIDATION],
+        Duration::from_millis(50),
+    )
+    .expect("request account_summary_snapshots_resubscribing failed");
+    let initial = snapshots.next().unwrap().unwrap();
+    let thread = std::thread::spawn(move || {
+        let gap = snapshots.next().unwrap();
+        let fresh = snapshots.next().unwrap().unwrap();
+        (gap, fresh)
+    });
+    drop_connection(&message_bus);
+    let (gap, fresh) = thread.join().expect("thread panicked");
+
+    assert_eq!(values(&initial), vec![("NetLiquidation", "USD", "100.0")]);
+    assert!(
+        matches!(&gap, Err(Error::Notice(n)) if n.code == crate::TRANSPORT_RECONNECT_CODE),
+        "expected the reconnect notice, got {gap:?}"
+    );
+    assert_eq!(values(&fresh), vec![("NetLiquidation", "USD", "100.0")]);
+    let request = |id| {
+        request_account_summary()
+            .request_id(id)
+            .group("All")
+            .tags([AccountSummaryTags::NET_LIQUIDATION])
+    };
+    assert_request(&message_bus, 0, &request(TEST_REQ_ID_FIRST));
+    assert_request(&message_bus, 1, &request(TEST_REQ_ID_FIRST + 1));
 }
 
 #[test]
