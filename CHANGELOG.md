@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Client::analyze_order(&contract, &order)` (sync and async): what-if analysis of an order built elsewhere, with the frame rules of `OrderBuilder::analyze`, which now calls it. It sends a copy of the order with `what_if` set under the client's next order id and leaves the caller's order unchanged (#1289).
 - `ExpirationDate` and `ContractMonth` implement `Copy` (#1260).
 - `ContractDetails::event_contract_topic`, `event_contract_description` and `event_contract_question`: a ForecastEx event contract's topic (`"US Fed Funds Target Rate"`), description (strike, expiry and right, `"FF Jan28'27 3.125"`) and full question. TWS sent them, and the client dropped them. Empty for other contracts. A struct literal or pattern naming every field must add them; see `docs/migration-6.0.md` §35 (#1251).
 - Historical and realtime `Bar`, and `TickLast`, `TickBidAsk`, `TickMidpoint`, `TickAttributeLast` and `TickAttributeBidAsk`, implement `Default`: zero values, empty strings and a Unix-epoch timestamp, with `count` `-1` on a historical `Bar` (what TWS sends for non-TRADES bars) and no `volume` or `wap` on a realtime `Bar` (#1232, #1244).
