@@ -88,7 +88,8 @@ sequenceDiagram
 3. **Order-based requests**: Routed by order id. Every subscription opened on an order id
    (`place_order`, a modify, `cancel_order`) receives each of that order's frames once and yields
    the types its decoder declares, so a cancel or modify takes nothing from the subscription
-   that placed the order.
+   that placed the order. A TWS error on the order id ends only the newest subscription, whose
+   request drew it; the others receive it as a notice.
 
 ## Module Structure
 

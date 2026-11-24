@@ -83,6 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A refused modify or cancel (105, 104, 103, 329, 10147, 10148 and other errors on an order id) ends only the subscription of the request that drew it. The order's other `place_order` subscriptions receive the error as a notice and keep receiving the order's events, since the order is still working. Before, every subscription on the order id ended on it. `place_order` documents how to modify an order and what TWS refuses (#PR).
 - A `place_order` subscription keeps receiving its order's statuses, fills and commission reports after `cancel_order` or a modify (another `place_order` with the same ID), on both clients. The later subscription took over the order ID: the first one ended at once, and a fill that raced the cancel reached only `order_update_stream`, since the `cancel_order` subscription has no variant for fills. Every subscription on an order ID now receives each of the order's frames once; both the `place_order` and the `cancel_order` subscription yield the `Cancelled` status and the 202 notice. See `docs/migration-6.0.md` §48 (#1282).
 - Code 10349 "Order TIF was set to DAY based on order preset" is a `NoticeCategory::Warning` on any order. TWS goes on with the order after it. It arrives on every `exercise_options` request, where it ended the subscription with an error before the exercise's open order and executions arrived. It now arrives as a notice and the subscription keeps reading (#1210).
 
