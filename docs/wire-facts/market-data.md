@@ -116,17 +116,18 @@ option (OZC), the IBUS500 index CFD, XAUUSD, BTC on PAXOS.*
 
 Accepted trade-price `whatToShow`, or the error a rejected one drew:
 
-| Security type      | Historical bars         | Realtime bars       | Historical ticks   |
-| ------------------ | ----------------------- | ------------------- | ------------------ |
-| STK, FUT, OPT, FOP | TRADES                  | not probed          | TRADES             |
-| IND (SPX)          | TRADES (volume `0`)     | not probed          | TRADES             |
-| CASH (EUR.USD)     | none: TRADES 162        | none: TRADES 420    | none: see below    |
-| CMDTY (XAUUSD)     | none: TRADES 162        | none: TRADES 420    | none: no answer    |
-| CFD (IBUS500)      | none: TRADES 162        | not probed          | none: no answer    |
-| CRYPTO (BTC)       | AGGTRADES; TRADES 10299 | AGGTRADES or TRADES | none: TRADES 10299 |
+| Security type      | Historical bars                      | Realtime bars       | Historical ticks   |
+| ------------------ | ------------------------------------ | ------------------- | ------------------ |
+| STK, FUT, OPT, FOP | TRADES                               | not probed          | TRADES             |
+| IND (SPX)          | TRADES (volume `0`)                  | not probed          | TRADES             |
+| CASH (EUR.USD)     | none: TRADES 162                     | none: TRADES 420    | none: see below    |
+| CMDTY (XAUUSD)     | none: TRADES 162                     | none: TRADES 420    | none: no answer    |
+| CFD (IBUS500)      | none: TRADES 162                     | not probed          | none: no answer    |
+| CRYPTO (BTC)       | AGGTRADES; TRADES after notice 10299 | AGGTRADES or TRADES | none: TRADES 10299 |
 
 - AGGTRADES drew 10299 on historical bars for every type except crypto, and 420 on realtime bars
-  for EUR.USD and XAUUSD. "Not probed" realtime cells drew 10089, 354 or 420 for missing
+  for EUR.USD and XAUUSD. After that 10299, AAPL and ES historical bars arrive anyway as the
+  TRADES series; EUR.USD draws 162 (2026-11-24, #1298). "Not probed" realtime cells drew 10089, 354 or 420 for missing
   real-time permission. SPX drew 10187 for BID_ASK and MIDPOINT historical ticks.
 - MIDPOINT, BID and ASK bars worked for every type except IND (162). ADJUSTED_LAST follows TRADES.
   HISTORICAL_VOLATILITY and OPTION_IMPLIED_VOLATILITY drew 162 except OPTION_IMPLIED_VOLATILITY
@@ -137,8 +138,14 @@ Accepted trade-price `whatToShow`, or the error a rejected one drew:
 - Realtime TRADES and AGGTRADES on BTC sent identical bars for five 5-second intervals in a row,
   so the realtime 10299 for crypto TRADES that the `AggTrades` rustdoc stated is not what this
   server does.
-- With `keepUpToDate`, BTC draws 10299 for TRADES and 321 "Source price not supported with live
-  updates" for AGGTRADES: TWS streams no crypto trade bars.
+- 10299 on crypto TRADES bars is a substitution notice, not a rejection: TWS then sends the bars
+  and `HistoricalDataEnd`, identical to an AGGTRADES request (BTC and ETH, 2026-11-24). It is a
+  rejection only for historical ticks, where nothing follows it. Clients before #1298 ended the
+  request on the notice and dropped the bars, which is what the first run here recorded.
+- With `keepUpToDate`, BTC and ETH TRADES draw 10299, then the bars, `HistoricalDataEnd` and live
+  updates; a later cancel draws 162. AGGTRADES draws 321 "Source price not supported with live
+  updates" and nothing else, so TRADES is the only way to stream crypto trade bars. AAPL, ES and
+  EUR.USD AGGTRADES with `keepUpToDate` draw 10299, then 321 (2026-11-24, #1298).
 - Historical ticks TRADES on EUR.USD: TWS answers with one `HistoricalTicks` frame (midpoint
   ticks, size `"0"`, `done`), not `HistoricalTicksLast`. `historical_ticks(..).last()` does not
   read it and waits until its deadline. XAUUSD and IBUS500 drew no ticks and no error in 30 s, and were not

@@ -193,9 +193,9 @@ pub enum WhatToShow {
     /// Aggregated trade data (wire value `AGGTRADES`).
     ///
     /// For crypto. TWS also accepts [`Trades`](Self::Trades) for crypto on
-    /// `reqRealTimeBars` and sends the same bars; historical requests accept
-    /// only `AGGTRADES` (see [`trades_for`](Self::trades_for)). Other security
-    /// types reject it.
+    /// `reqRealTimeBars` and sends the same bars, as historical bar requests do
+    /// after a 10299 notice (see [`trades_for`](Self::trades_for)). Other
+    /// security types reject it.
     AggTrades,
 }
 
@@ -203,7 +203,7 @@ impl WhatToShow {
     /// The `whatToShow` that requests trade-price bars for `security_type`, or `None` where TWS
     /// has no trade data for it.
     ///
-    /// - Crypto: [`AggTrades`](Self::AggTrades), the value historical bars require. TWS also
+    /// - Crypto: [`AggTrades`](Self::AggTrades), the value historical bars expect. TWS also
     ///   accepts `TRADES` here and sends the same bars.
     /// - Forex pairs, commodities (`XAUUSD`) and CFDs: `None`. TWS answers `TRADES` on a forex
     ///   pair or commodity with error 420; request [`MidPoint`](Self::MidPoint),
