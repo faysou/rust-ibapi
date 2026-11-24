@@ -1627,6 +1627,39 @@ async fn stale_cleanup_keeps_newer_execution_aliases() {
     assert!(bus.executions.is_empty());
 }
 
+/// `cancel_order` registers its own subscription under the order id. The
+/// `place_order` subscription keeps the order's frames that follow, the fill
+/// a cancel races included, and each subscription gets each frame once.
+#[tokio::test]
+async fn order_subscription_keeps_frames_after_a_cancel_subscription_opens() {
+    let (stream, bus) = make_bus();
+    let mut place = bus.send_order_request(OrderId::from(7), vec![]).await.unwrap();
+    let mut cancel = bus.send_order_request(OrderId::from(7), vec![]).await.unwrap();
+
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::PendingCancel));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-1"));
+    stream.push_inbound(commission_frame("exec-1"));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Cancelled));
+    stream.push_inbound(error_frame(7, 202, "Order Canceled - reason:"));
+    for _ in 0..5 {
+        bus.read_and_route_message().await.unwrap();
+    }
+
+    let expected = ["OrderStatus", "ExecutionData", "CommissionsAndFeesReport", "OrderStatus", "notice 202"];
+    for (name, sub) in [("place", &mut place), ("cancel", &mut cancel)] {
+        let items: Vec<String> = std::iter::from_fn(|| sub.try_next_routed()).map(routed_label).collect();
+        assert_eq!(items, expected, "{name}");
+    }
+}
+
+fn routed_label(item: RoutedItem) -> String {
+    match item {
+        RoutedItem::Response(message) => format!("{:?}", message.message_type()),
+        RoutedItem::Notice(notice) => format!("notice {}", notice.code),
+        RoutedItem::Error(e) => format!("error {e}"),
+    }
+}
+
 #[tokio::test]
 async fn completed_order_routes_to_shared_channel() {
     let (stream, bus) = make_bus();

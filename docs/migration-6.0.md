@@ -1158,3 +1158,17 @@ enum rejects a name or a tagged object. An open string enum (`SecurityType`, `Se
 unrecognized code. A `Contract` stored by 5.x with `"security_type":"Stock"` loads as
 `SecurityType::Other("Stock")`, and a request built from it sends `Stock` to TWS. Convert stored JSON before loading it, by mapping each variant name to
 its code (`as_str()` lists the codes for the string enums, `i32::from` for the integer ones).
+
+### 48. A cancel or modify no longer ends the order's earlier subscription
+
+5.x kept one subscription per order ID: `cancel_order`, or a modify through another
+`place_order` with the same ID, replaced the earlier subscription, which ended at once. Fills
+that arrived after the cancel went only to `order_update_stream`. Every subscription on the ID
+now stays live and receives each of the order's frames once.
+
+- **After `cancel_order`**: the `place_order` subscription yields the `Cancelled` status, the
+  202 notice, and any fills and commission reports that follow. The `cancel_order` subscription
+  yields the same statuses and notice. Code that stopped reading the `place_order` subscription
+  because it ended, and read the outcome from the cancel, can read both from it.
+- **After a modify**: the earlier `place_order` subscription keeps yielding the order's events
+  beside the new one. Drop the subscription you no longer read.
