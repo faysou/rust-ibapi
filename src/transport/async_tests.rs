@@ -469,7 +469,7 @@ async fn subscriptions_with_executions_end_on_request_shutdown_sync() {
     let mut order = bus.send_order_request(OrderId::from(7), vec![]).await.unwrap();
     let mut executions = bus.send_request(RequestId::nth(99), vec![]).await.unwrap();
 
-    // Mapped by order id, and by request id where no order channel matches.
+    // A live execution maps by order id, a reply by request id.
     stream.push_inbound(execution_data_frame(CLIENT_ID, 0, 7, "exec-order"));
     stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 0, "exec-request"));
     bus.read_and_route_message().await.unwrap();
@@ -478,7 +478,8 @@ async fn subscriptions_with_executions_end_on_request_shutdown_sync() {
         let message = next_message(sub).await;
         assert_eq!(message.message_type(), crate::messages::IncomingMessages::ExecutionData, "{name}");
     }
-    assert_eq!(bus.executions.len(), 2, "both executions mapped");
+    assert_eq!(bus.executions.len(), 1, "live execution not mapped");
+    assert_eq!(bus.executions_requested.len(), 1, "reply not mapped");
 
     bus.clone().process_messages().expect("process_messages");
     bus.request_shutdown_sync();
@@ -488,6 +489,7 @@ async fn subscriptions_with_executions_end_on_request_shutdown_sync() {
         assert!(drained.is_ok(), "{name} subscription with an execution did not end");
     }
     assert!(bus.executions.is_empty());
+    assert!(bus.executions_requested.is_empty());
 }
 
 /// A frame with message id `-2` is `IncomingMessages::Shutdown`: the router
@@ -1440,7 +1442,7 @@ async fn execution_data_routes_to_order_channel() {
     let (stream, bus) = make_bus();
     let mut sub = bus.send_order_request(OrderId::from(7), vec![]).await.unwrap();
 
-    stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 7, "exec-1"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-1"));
     bus.read_and_route_message().await.unwrap();
 
     let msg = next_message(&mut sub).await;
@@ -1448,7 +1450,7 @@ async fn execution_data_routes_to_order_channel() {
 }
 
 #[tokio::test]
-async fn execution_data_falls_back_to_request_channel() {
+async fn execution_reply_routes_to_request_channel() {
     let (stream, bus) = make_bus();
     let request_id = RequestId::nth(99);
     let mut sub = bus.send_request(request_id, vec![]).await.unwrap();
@@ -1458,6 +1460,58 @@ async fn execution_data_falls_back_to_request_channel() {
 
     let msg = next_message(&mut sub).await;
     assert_eq!(msg.request_id(), Some(request_id.raw()));
+}
+
+/// An `executions` reply carries its request's id: it and its commission
+/// report reach the request that asked, never the order route that got the
+/// live fill, nor the update stream, which already saw that fill.
+#[tokio::test]
+async fn execution_reply_reaches_request_while_order_route_is_open() {
+    let (stream, bus) = make_bus();
+    let mut order_route = bus.send_order_request(OrderId::from(7), vec![]).await.unwrap();
+    let mut updates = bus.create_order_update_subscription().await.unwrap();
+    let request_id = RequestId::nth(99);
+    let mut request = bus.send_request(request_id, vec![]).await.unwrap();
+
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-1"));
+    stream.push_inbound(commission_frame("exec-1"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, request_id.raw(), 7, "exec-1"));
+    stream.push_inbound(commission_frame("exec-1"));
+    stream.push_inbound(binary_proto(
+        IncomingMessages::ExecutionDataEnd as i32,
+        &crate::proto::ExecutionDetailsEnd {
+            req_id: Some(request_id.raw()),
+        },
+    ));
+    for _ in 0..5 {
+        bus.read_and_route_message().await.unwrap();
+    }
+
+    let live = [
+        (IncomingMessages::ExecutionData, Some(-1)),
+        (IncomingMessages::CommissionsAndFeesReport, None),
+    ];
+    assert_eq!(frames(&mut order_route).await, live, "order route");
+    assert_eq!(frames(&mut updates).await, live, "update stream");
+    assert_eq!(
+        frames(&mut request).await,
+        [
+            (IncomingMessages::ExecutionData, Some(request_id.raw())),
+            (IncomingMessages::CommissionsAndFeesReport, None),
+            (IncomingMessages::ExecutionDataEnd, Some(request_id.raw())),
+        ],
+        "request"
+    );
+}
+
+/// Every frame queued on `sub`, as message type and request id.
+async fn frames(sub: &mut AsyncInternalSubscription) -> Vec<(IncomingMessages, Option<i32>)> {
+    let mut frames = Vec::new();
+    while let Ok(Some(item)) = tokio::time::timeout(TICK, sub.next()).await {
+        let message = item.unwrap();
+        frames.push((message.message_type(), message.request_id()));
+    }
+    frames
 }
 
 #[tokio::test]
@@ -1528,7 +1582,7 @@ async fn commission_and_fees_report_routes_via_execution_id_mapping() {
     let (stream, bus) = make_bus();
     let mut sub = bus.send_order_request(OrderId::from(7), vec![]).await.unwrap();
 
-    stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 7, "exec-abc"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-abc"));
     stream.push_inbound(binary_proto(
         crate::messages::IncomingMessages::CommissionsAndFeesReport as i32,
         &crate::proto::CommissionAndFeesReport {
@@ -1574,16 +1628,23 @@ async fn execution_aliases_pruned_when_subscriptions_drop() {
     stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 0, "exec-request"));
     bus.read_and_route_message().await.unwrap();
     bus.read_and_route_message().await.unwrap();
-    assert_eq!(bus.executions.len(), 2, "both executions mapped");
+    assert!(bus.executions.contains(&"exec-order".to_string()), "order execution not mapped");
+    assert!(
+        bus.executions_requested.contains(&"exec-request".to_string()),
+        "request execution not mapped"
+    );
 
     drop(order);
     drain_cleanup_signals(&bus).await;
-    assert!(!bus.executions.contains(&"exec-order".to_string()), "order alias leaked");
-    assert!(bus.executions.contains(&"exec-request".to_string()), "live request alias pruned");
+    assert!(bus.executions.is_empty(), "order alias leaked");
+    assert!(
+        bus.executions_requested.contains(&"exec-request".to_string()),
+        "live request alias pruned"
+    );
 
     drop(executions);
     drain_cleanup_signals(&bus).await;
-    assert!(bus.executions.is_empty(), "request alias leaked");
+    assert!(bus.executions_requested.is_empty(), "request alias leaked");
 }
 
 /// Each clone sends its own cleanup signal; the alias stays while any clone
@@ -3123,10 +3184,7 @@ async fn foreign_execution_answers_requests_only() {
         "request got the unprompted one"
     );
     assert!(tokio::time::timeout(TICK, order_route.next()).await.is_err(), "order route got it");
-    while let Ok(Some(item)) = tokio::time::timeout(TICK, updates.next()).await {
-        let message_type = item.unwrap().message_type();
-        assert_ne!(message_type, IncomingMessages::ExecutionData, "update stream got it");
-    }
+    assert!(tokio::time::timeout(TICK, updates.next()).await.is_err(), "update stream got it");
 }
 
 #[tokio::test]

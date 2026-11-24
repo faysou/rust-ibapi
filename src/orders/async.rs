@@ -53,6 +53,10 @@ impl Client {
     /// `execution_id` — the commission follows its execution and shares that key. See
     /// the [`CommissionAndFeesReport`] docs for the idiom.
     ///
+    /// The stream carries what TWS reports as it happens. A reply to
+    /// [`executions`](Self::executions), with its commission reports, goes only
+    /// to the request that asked and never appears here.
+    ///
     /// # Gaps and recovery
     ///
     /// TWS does not replay order events, so two situations leave a gap the
@@ -612,6 +616,11 @@ impl Client {
     /// [`CommissionAndFeesReport`] are delivered on this
     /// stream. Join a commission to its execution by `execution_id`
     /// (see the [`CommissionAndFeesReport`] docs) — the commission follows its execution.
+    ///
+    /// The reply reaches only this subscription. An open
+    /// [`place_order`](Self::place_order) subscription or
+    /// [`order_update_stream`](Self::order_update_stream) neither receives it
+    /// nor takes rows from it.
     ///
     /// # Examples
     ///

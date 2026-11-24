@@ -1184,3 +1184,18 @@ enum rejects a name or a tagged object. An open string enum (`SecurityType`, `Se
 unrecognized code. A `Contract` stored by 5.x with `"security_type":"Stock"` loads as
 `SecurityType::Other("Stock")`, and a request built from it sends `Stock` to TWS. Convert stored JSON before loading it, by mapping each variant name to
 its code (`as_str()` lists the codes for the string enums, `i32::from` for the integer ones).
+
+### 48. `executions()` replies no longer reach order subscriptions or `order_update_stream`
+
+An `ExecutionData` frame that answers `executions()` carries that request's id; a live fill
+carries -1. 5.x delivered a reply for an order with an open `place_order` subscription to that
+subscription instead of the request, and copied every reply, with its commission reports, to
+`order_update_stream`. A reply and its commission reports now go only to the request that asked,
+on both clients.
+
+- **`order_update_stream`**: yields executions and commission reports only as they happen. Code
+  that skipped replies by `request_id > 0` can drop that filter. Code that read a snapshot from
+  this stream reads it from the `executions()` subscription instead. A commission report that
+  answered a reply, including one for another client's execution, no longer arrives here.
+- **`place_order`**: no longer yields a second copy of an execution, with its commission report,
+  when any `executions()` call runs while the subscription is open.
