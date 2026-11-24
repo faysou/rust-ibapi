@@ -1,6 +1,6 @@
 use super::*;
 use crate::common::test_utils::helpers::tws_error_notice;
-use crate::market_data::historical::HistoricalParseError;
+use crate::market_data::historical::{HistoricalParseError, WhatToShow};
 use crate::messages::ResponseMessage;
 use crate::orders::builder::ValidationError;
 use crate::proto::decoders::DecodeProto;
@@ -57,6 +57,13 @@ fn error_display() {
         (Error::Shutdown, "Shutdown"),
         (Error::EndOfStream, "EndOfStream"),
         (Error::UnexpectedEndOfStream, "UnexpectedEndOfStream"),
+        (
+            Error::UnexpectedTickKind {
+                requested: WhatToShow::Trades,
+                received: WhatToShow::MidPoint,
+            },
+            "historical ticks requested as TRADES, but TWS answered with MIDPOINT ticks",
+        ),
         (Error::Timeout, "timed out before the request ended"),
         (
             Error::BufferLimitExceeded { limit: 5 },
@@ -279,6 +286,10 @@ fn clone_preserves_payloaded_variants() {
         },
         Error::BufferLimitExceeded { limit: 5 },
         Error::OrderIdInRequestRange { order_id: 7 },
+        Error::UnexpectedTickKind {
+            requested: WhatToShow::BidAsk,
+            received: WhatToShow::Trades,
+        },
     ];
 
     for original in originals {
