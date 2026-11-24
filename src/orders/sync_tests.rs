@@ -1014,6 +1014,69 @@ fn analyze_reports_end_of_stream_when_no_order_arrives() {
     assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "got {result:?}");
 }
 
+// Live (server 223): TWS answers a US stock limit what-if with a warning-only frame, then the
+// frame with margins and commission. `analyze` returns the second, keeping the first's warning.
+#[test]
+fn analyze_waits_past_the_warning_only_frame() {
+    let (client, _bus) = create_blocking_test_client_with_ordered_proto_responses(vec![
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .commission_and_fees(0.0)
+                .warning_text("If your order is not immediately executable")
+                .encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .initial_margin_before(257638.32)
+                .commission_and_fees(1.00003)
+                .encode_proto(),
+        ),
+    ]);
+    client.id_manager().raise_order_id(OrderId::from(9090));
+    let contract = Contract::stock("AAPL").build();
+
+    let state = client.order(&contract).buy(100).limit(50.0).analyze().expect("analyze should succeed");
+
+    assert_eq!(state.initial_margin_before, Some(257638.32));
+    assert_eq!(state.commission_and_fees, Some(1.00003));
+    assert_eq!(state.warning_text, "If your order is not immediately executable");
+}
+
+// Live (server 223): an order the account's margin cannot carry is answered with margins and a
+// suggested size, then a 201. `analyze` returns the 201, not the margins.
+#[test]
+fn analyze_surfaces_the_rejection_after_an_over_margin_frame() {
+    let (client, _bus) = create_blocking_test_client_with_ordered_proto_responses(vec![
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .initial_margin_before(257664.09)
+                .suggested_size("4000")
+                .encode_proto(),
+        ),
+        proto_error_response(9090, 201, "Order rejected - reason:YOUR ORDER IS NOT ACCEPTED."),
+    ]);
+    client.id_manager().raise_order_id(OrderId::from(9090));
+    let contract = Contract::stock("AAPL").build();
+
+    let err = client
+        .order(&contract)
+        .buy(10_000_000)
+        .limit(1.0)
+        .analyze()
+        .expect_err("an over-margin what-if order must surface the rejection");
+
+    assert_tws_error_message(err, 201, "YOUR ORDER IS NOT ACCEPTED");
+}
+
 // The `submit` family, against `Client::stubbed` rather than a mock client that
 // carried its own copy of each method. The shadows dated from before the
 // builder had a real seam to test against; #735 moved `analyze` off its shadow
