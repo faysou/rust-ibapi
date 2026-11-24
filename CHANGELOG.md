@@ -83,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `historical_ticks(..).last()` (sync and async) ends with the new `Error::UnexpectedTickKind` when TWS answers with ticks of another kind, which it does for contracts without trade ticks: forex pairs, spot metals and index CFDs get midpoint ticks. The subscription skipped that frame and then waited forever, since TWS sends nothing more. `bid_ask()` and `mid_point()` treat a frame of another kind the same way. An empty answer of the requested kind still ends the stream with no ticks (#PR).
+- `historical_ticks(..).last()` (sync and async) ends with the new `Error::UnexpectedTickKind` when TWS answers with ticks of another kind, which it does for contracts without trade ticks: forex pairs, spot metals and index CFDs get midpoint ticks. The subscription skipped that frame and then waited forever, since TWS sends nothing more. `bid_ask()` and `mid_point()` treat a frame of another kind the same way. An empty answer of the requested kind still ends the stream with no ticks (#1287).
 - Code 10349 "Order TIF was set to DAY based on order preset" is a `NoticeCategory::Warning` on any order. TWS goes on with the order after it. It arrives on every `exercise_options` request, where it ended the subscription with an error before the exercise's open order and executions arrived. It now arrives as a notice and the subscription keeps reading (#1210).
 
 ## [5.8.0] - 2026-11-24
