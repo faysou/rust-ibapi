@@ -284,7 +284,15 @@ Accepted trade-price `whatToShow`, or the error a rejected one drew:
 - A stock CFD (AAPL, rerouted on `reqMktData`) drew no answer to TRADES or MIDPOINT historical
   bars within 40 s; realtime bars drew notice 2127 and no bars.
 - The account has crypto market data (BTC on PAXOS) though it has no crypto trading permission.
-- **Not probed:** realtime bars for STK, FUT, OPT, FOP, IND and CFD (no real-time permission);
+- **Streaming requests during US hours** (*live 2026-11-24 16:41-16:43 UTC, paper TWS, server
+  223; BTC on PAXOS and MSFT*): BTC realtime bars stream for `TRADES`, `AGGTRADES` and
+  `MIDPOINT`; keep-up-to-date `TRADES` draws 10299, then the batch, `HistoricalDataEnd` and an
+  update every 5 seconds, and `AGGTRADES` draws 321 alone. Tick-by-tick `Last`, `AllLast` and
+  `BidAsk` stream BTC; tick-by-tick takes no `whatToShow`. MSFT, without real-time permission:
+  realtime `TRADES` bars draw 420 ("No market data permissions for ISLAND STK"), `AGGTRADES`,
+  `MIDPOINT` and every tick-by-tick type draw 10089, keep-up-to-date `TRADES` draws 162 ("HMDS
+  query returned no data"), and `AGGTRADES` draws 10299 and then 321.
+- **Not probed:** realtime bars for STK, FUT, OPT, FOP, IND and CFD with real-time permission;
   BOND, WAR, FUND, IOPT, EC, BAG; crypto on ZEROHASH; live accounts.
 
 ### Keep-up-to-date bar updates
