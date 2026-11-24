@@ -219,6 +219,18 @@ pub(crate) fn is_undeclared(ids: &[IncomingMessages], message: &ResponseMessage)
     !ids.contains(&message.message_type())
 }
 
+/// A TWS error the decoder knows the request continues after
+/// ([`StreamDecoder::error_continues_request`]) becomes a notice; anything
+/// else passes through.
+///
+/// Shared by both drivers for the same reason as [`is_undeclared`].
+pub(crate) fn continuing_error_as_notice<T: StreamDecoder<T>>(item: RoutedItem) -> RoutedItem {
+    match item {
+        RoutedItem::Error(Error::Notice(notice)) if T::error_continues_request(&notice) => RoutedItem::Notice(notice),
+        item => item,
+    }
+}
+
 /// The item a notice bound to this subscription becomes: data when the
 /// decoder models it ([`StreamDecoder::data_from_notice`]), else a `Notice`.
 ///
@@ -309,6 +321,15 @@ pub(crate) trait StreamDecoder<T> {
     /// one-shot query with nothing to continue (`HistoricalDataFrame`) may
     /// accept any error.
     fn rejection_ends_request(_notice: &Notice) -> bool {
+        false
+    }
+
+    /// Whether TWS goes on serving the request after this error, so the
+    /// subscription yields it as a `SubscriptionItem::Notice` and keeps reading
+    /// instead of ending. Opt in only where wire-verified that data follows the
+    /// error (10299 on historical bars). Default: `false`, the error ends the
+    /// stream.
+    fn error_continues_request(_notice: &Notice) -> bool {
         false
     }
 
