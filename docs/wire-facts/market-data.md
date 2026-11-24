@@ -309,7 +309,8 @@ server 223.*
 - MIDPOINT updates send `volume`, `WAP` and `barCount` as `-1`, like the batch. TRADES updates
   send real values, but a bar's first update can report `barCount` 0 with volume 305.
 - Refused or silent: crypto `AGGTRADES` and `BID_ASK` draw 321 "Source price not supported with
-  live updates"; crypto `TRADES` draws 10299 (use AGGTRADES). Without real-time permission (ES,
+  live updates"; crypto `TRADES` draws 10299 and then streams
+  ([10299 substitution](#10299-whattoshow-substitution)). Without real-time permission (ES,
   DAX and ESTX50 indices) and for AAPL and NVDA overnight, TWS sends the batch and then no update
   and no error.
 - Settles `historical::BarCompletion`: a bar is final when
