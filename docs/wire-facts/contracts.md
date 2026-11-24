@@ -179,3 +179,93 @@ Contract details and option chains. Format: [README](README.md).
 - **Not probed:** equity and index options, bonds, funds, non-US stocks; a contract with a non-zero
   `minAlgoSize`; what the AAPL step governs (sub-penny prices and fractional shares are both
   smaller than its `minTick` 0.01 and `minSize` 0.0001).
+
+### Local symbols of HKFE, OSE and KSE options
+
+*Live 2026-11-24 21:47-21:51 UTC (HKFE, OSE and KSE closed), paper TWS, server 223; contract
+details of every listed contract.*
+
+| Query | Rows | `localSymbol` | `tradingClass` |
+| ----- | ---- | ------------- | -------------- |
+| OPT HSI HKFE | 2,572 | `HSI25600L6`, `HSI25600X6`, `HSI19200L6W04` | `HSI` |
+| OPT MHI HKFE | 866 | `MHI12800L6`, `MHI12800X6` | `MHI` |
+| FOP HSI HKFE | 1,942 | `PHS25600L6`, `PHS25600X6` | `PHS` |
+| OPT N225 OSE.JPN 202612 | 706 | `131126218` (16250 P), `141127718` (17750 C) | `225` |
+| OPT K200 KSE 202612 | 1,134 | `K200270L6.KS`, `K200992L6.KS` (992.5 C), `K200220X6.KS` | `01` |
+
+- HKFE and KSE: trading class (`K200` for KSE), strike, one letter for month and right, last digit
+  of the expiry year, then `.KS` on KSE. Calls take `A` (January) to `L` (December), puts `M` to
+  `X`. All 5,380 HKFE rows matched the contract's own strike, right and expiry month and year.
+  KSE drops a strike's decimals: `K200992L6.KS` is the 992.5 call.
+- The year is one digit: `HSI19200L6` expires in 2026 and `HSI19200L0` in 2030, so the symbol
+  alone does not give the decade.
+- The one HSI weekly series listed, expiring 2026-12-04, carried `W04` after the year
+  (`HSI19200L6W04`). Whether the digits are the expiry day or a week number is not settled by a
+  single series.
+- FOP HSI (class `PHS`) is an option on the HSI future: `underSymbol` `HSIZ6`, expiring
+  2026-12-18, where OPT HSI (class `HSI`) is on the index and expires 2026-12-30. FOP MHI and OPT
+  700 on HKFE drew 200.
+- OSE.JPN local symbols are 9-digit exchange codes. Seen: the second digit is `3` or `8` for
+  puts and `4` or `9` for calls; the last two are `18` (also on the N225 future, `161120018`;
+  the N225 mini future ends in `19`). The middle digits change with the strike range. Read the
+  strike, right and expiry from the contract fields; the code does not spell them.
+- **Not probed:** SEHK stock options (OPT 700 HKFE drew 200; no other symbol tried), KSE weekly
+  options, OSE weekly options and other OSE products.
+
+### Board lots: `min_size` and `size_increment`
+
+*Live 2026-11-24 21:47-22:23 UTC (TSE, SEHK and LSE closed), paper TWS, server 223.*
+
+| Contract | `minSize` | `sizeIncrement` | `suggestedSizeIncrement` |
+| -------- | --------- | --------------- | ------------------------ |
+| 7203 TSEJ (Toyota) | 100 | 100 | 100 |
+| 700 SEHK (Tencent) | 100 | 100 | 100 |
+| 5 SEHK (HSBC) | 400 | 400 | 400 |
+| VOD LSE | 0.0001 | 0.0001 | 1 |
+| HSI, N225, N225M, K200 futures; HSI, K200, N225 options | 1 | 1 | 1 |
+
+- The board lot is `minSize`, and `sizeIncrement` equals it on TSE and SEHK. It differs per
+  stock on SEHK (100 for 700, 400 for 5).
+- An order below it is rejected before TWS creates it: 700 BUY 50, 7203 BUY 50 and 5 BUY 100 drew
+  388 "Order size 50 is smaller than the minimum required size of 100." (400 for 5).
+- A size above the lot but not a multiple of it is discarded with 461: 700 BUY 150 and 7203
+  (SMART) BUY 150 drew "Order size 150 is not correct; it should be a multiple of 100".
+- **Not probed:** SEHK and TSE odd-lot order types; a modify to an odd size.
+
+### Tick-size bands of TSE, SEHK and LSE stocks
+
+*Live 2026-11-24 21:47 and 22:03-22:10 UTC (all three closed), paper TWS, server 223;
+`market_rule`, orders and what-if orders.*
+
+| Contract (exchanges) | Rule | Bands (low edge: increment) |
+| -------------------- | ---- | --------------------------- |
+| 7203 (TSEJ) | 1460 | 0: 0.1, 1,000: 0.5, 3,000: 1, 10,000: 5, 30,000: 10, ... 30,000,000: 10,000 |
+| 7203 (SMART, JPNNEXT) | 3407 | 0: 0.1, 10,000: 0.5, 30,000: 1, 100,000: 5, 300,000: 10, 1,000,000: 100 |
+| 700, 5 (SEHK) | 1910, 1852 | 0: 0.001, 0.25: 0.005, 10: 0.01, 20: 0.02, 50: 0.05, 100: 0.1, ... 5,000: 5 |
+| VOD (LSE and 5 others; EUIBSI 3060) | 1918 | 0: 0.000001, ... 1: 0.0005, 2: 0.001, ... 500: 0.2 |
+| HSI future and options; N225 future; N225M future; K200 future | 68, 197, 380, 11 | one band: 1, 10, 5, 0.05 |
+
+- `minTick` is the first band's increment (7203: 0.1, SEHK: 0.001), not the increment at the
+  stock's price. One stock can carry different rules per venue: 7203's TSEJ rule moves to 0.5 at
+  1,000 JPY, its SMART rule at 10,000.
+- Off-tick prices drew 110 "The price does not conform to the minimum price variation": 700 LMT
+  320.01 (HKD band 0.2 above 200), 7203 TSEJ LMT 2000.1 (band 0.5 above 1,000).
+- LSE rules are in pounds while VOD is quoted and ordered in pence (`priceMagnifier` 100, currency
+  `GBP`; IB sends no `GBX`). A what-if VOD BUY 100 LMT 100 cost commission 3.5 (stamp duty on
+  GBP 100 plus the GBP 3 minimum); LMT 1.0 cost 3.005 (GBP 1). LMT 100.05 was accepted and LMT
+  100.01 and 100.001 drew 110: at 100 pence (GBP 1) the band increment 0.0005 GBP is 0.05
+  pence. Multiply a band's edges and increment by `priceMagnifier` before comparing them with an
+  order or market-data price.
+- **Not probed:** an LSE order or fill (what-if only); real-time quotes (no TSE permission: 162
+  "No market data permissions for TSEJ STK").
+
+### KSE contracts report the `Japan` time zone
+
+*Live 2026-11-24 21:47 and 22:08 UTC, paper TWS, server 223.*
+
+- `contract_details` for the K200 future and K200 options on KSE: `timeZoneId` `Japan`, trading
+  hours `20261124:1800-20261125:0600;20261125:0845-20261125:1545`. Korea and Japan share UTC+9, so
+  the hours are right in either zone, but a caller mapping `timeZoneId` to a market calendar gets
+  Japan's.
+- A historical K200 request echoed its window in `+09:00`.
+- **Not probed:** KSE stocks (005930 on KSE drew 200).
