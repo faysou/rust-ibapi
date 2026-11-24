@@ -389,8 +389,9 @@ notice carried the order id as its request id and reached both the `place_order`
   an id with no order behind it.
 - 110 answers a new order only. An off-tick price on a modify of a working order drew 201 instead;
   see [refused modifies](#refused-modifies-leave-the-order-working).
-- **Not probed:** 10244 on other order types, other stocks, or during RTH; the same codes on IB
-  Gateway or a live account.
+- 10244 during US hours on AAPL, an AAPL option, ESZ6 and BTC: see
+  [cash quantity](#cash-quantity).
+- **Not probed:** 10244 on other stocks; the same codes on IB Gateway or a live account.
 
 ### Refused modifies leave the order working
 
@@ -462,8 +463,23 @@ subscription (which ended on it) and `order_update_stream`, and came with no sta
   side, AAPL none.
 - Cash quantity on EUR.USD must be a multiple of 0.01 (10317), and a quantity of 0.21 EUR without
   `cash_qty` drew 10318 "This order doesn't support fractional quantity trading".
-- **Not probed:** stocks during RTH or on an account with fractional-share permission, other
-  currency pairs, and other order types on EUR.USD.
+- **US hours, by security type** (*live 2026-11-24 16:28-16:31 UTC, US market open, paper TWS,
+  server 223*): AAPL stock (LMT BUY at 1.00 and MKT BUY), an AAPL option (LMT BUY), ESZ6 (LMT
+  BUY) and BTC on PAXOS (LMT BUY) each drew 10244 within 0.2 s. BTC MKT BUY with `cash_qty` 100
+  passed that check: TWS echoed a quantity of 0.001678 BTC and then rejected it with 201 "The
+  crypto buy order must be Minutes or IOC"; with `tif` IOC, it echoed 0.00167857 BTC and a limit
+  of 59579.75, then 201 for the account's missing crypto trading permission. BTC MKT SELL and
+  LMT BUY with IOC drew 10244. So for crypto, cash quantity depends on the order type and side.
+- **Filled cash-quantity order, US hours** (*EUR.USD MKT BUY, `cash_qty` 1000*): 399 (the USD
+  leg warning, twice), OpenOrder `PreSubmitted` with quantity 1093.82; OrderStatus
+  `PreSubmitted` with `filled` 911.41 and `remaining` 182.41 before any execution; the
+  ExecutionData (911.41 EUR at 1.0972); `Submitted`; `PendingCancel`; `Filled` with `filled`
+  911.41 and `remaining` 182.41; OpenOrder with the 2 USD commission; the report. TWS cancels the
+  rest of the estimate, and `Filled` keeps the cancelled remainder in `remaining`. The 911.41
+  EUR could not be sold by quantity (10318); a SELL with `cash_qty` 1000 sold 911.57 and a BUY
+  with `cash_qty` 0.18 bought 0.16 (`remaining` 0.04 after `Filled`).
+- **Not probed:** an account with fractional-share or crypto trading permission, other currency
+  pairs, and other order types on EUR.USD.
 
 ### `why_held` values
 
