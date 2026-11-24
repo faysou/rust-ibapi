@@ -4,7 +4,7 @@ use crate::common::test_utils::helpers::{
     assert_request, assert_tws_error_message, create_test_client, create_test_client_with_ordered_proto_responses, decode_request_proto,
     order_status_response, proto_error_response, proto_response, request_message_count, TEST_REQ_ID_FIRST,
 };
-use crate::contracts::{ComboLeg, Contract, LegAction, SecurityIdType, SecurityType};
+use crate::contracts::{Contract, SecurityIdType, SecurityType};
 use crate::contracts::{Currency, Exchange, OptionRight, Symbol};
 use crate::messages::IncomingMessages;
 use crate::orders::builder::{BracketPrices, TrailBy, ValidationError};
@@ -505,29 +505,13 @@ async fn executions_pair_combo_fills() {
     ];
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
     let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
-    let legs = [
-        ComboLeg {
-            contract_id: 515416632,
-            ratio: 1,
-            action: LegAction::Buy,
-            ..Default::default()
-        },
-        ComboLeg {
-            contract_id: 649180684,
-            ratio: 1,
-            action: LegAction::Sell,
-            ..Default::default()
-        },
-    ];
 
     let mut subscription = client.executions(ExecutionFilter::default()).await.expect("executions");
     let rows = subscription
         .collect_to_end_within(Duration::from_secs(5))
         .await
         .expect("reply read to its end");
-    let mut matcher = crate::orders::FillMatcher::new();
-    matcher.add_combo(perm_id, &legs);
-    let (fills, unpaired) = matcher.pair_executions(rows);
+    let (fills, unpaired) = crate::orders::FillMatcher::new().pair_executions(rows);
 
     assert_eq!(fills.len(), 1, "{fills:?}");
     let combo = &fills[0];

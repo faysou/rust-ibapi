@@ -35,8 +35,9 @@ pub struct Fill {
     /// for this execution (see [`FillMatcher::expects_report`]), or when the execution came
     /// from [`FillMatcher::take_expired`].
     pub commission: Option<CommissionAndFeesReport>,
-    /// For a combo fill ([`FillMatcher::add_combo`]), the fills of the combo's legs in arrival
-    /// order, each with its own commission report. `execution` is then the combo-level
+    /// For a combo fill ([`FillMatcher::add_combo`], or any combo in a reply given to
+    /// [`FillMatcher::pair_executions`]), the fills of the combo's legs in arrival order, each
+    /// with its own commission report. `execution` is then the combo-level
     /// execution: security type [`Spread`](crate::contracts::SecurityType::Spread), the combo's
     /// quantity and net price, and no commission. Empty for any other fill.
     pub legs: Vec<Fill>,
@@ -64,14 +65,20 @@ pub struct Fill {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, Default)]
 pub struct Unpaired {
-    /// Executions whose commission report did not arrive.
+    /// Executions whose commission report did not arrive. From
+    /// [`FillMatcher::pair_executions`], usually a fill so recent that TWS had not sent its
+    /// report yet: a reply that lands between a live execution and its report lists the
+    /// execution without one, and the report follows on the live stream after the reply's end
+    /// (live 2026-11-24, paper TWS, server 223). Read the reply again, or wait for the report
+    /// on the stream, before treating the commission as missing.
     pub executions: Vec<ExecutionData>,
     /// Commission reports whose execution did not arrive.
     pub reports: Vec<CommissionAndFeesReport>,
     /// Parts of combo fills ([`FillMatcher::add_combo`]) handed out incomplete: a combo fill
     /// with the legs that arrived, or, when the combo-level execution did not arrive, each leg
     /// fill on its own. Also a combo fill that a leg handed out here without its report
-    /// completed.
+    /// completed, and a combo fill of a [`FillMatcher::pair_executions`] reply with a leg whose
+    /// report the reply lacks; that leg has no commission.
     pub fills: Vec<Fill>,
 }
 
@@ -161,8 +168,12 @@ impl ComboParts {
 }
 
 /// The part of an execution id that a combo-level execution shares with the leg executions of
-/// the same fill: all but the last two dot-separated fields, `0000e1a7.6b0719db` of
-/// `0000e1a7.6b0719db.02.01`. See `docs/wire-facts/orders.md#combo-bag-executions-and-commissions`.
+/// the same fill: all but the last two dot-separated fields. TWS's ids have four fields
+/// (`0000e1a7.6b0719db.02.01`), so the key is the first two (`0000e1a7.6b0719db`): the
+/// combo-level execution and its legs differ only in the third field, and each fill of an order
+/// gets a new second field. An id with three fields keys by its first field alone, and an id
+/// with fewer than three fields is its own key, so it joins only an identical id. Callers also
+/// require the same `perm_id`. See `docs/wire-facts/orders.md#combo-bag-executions-and-commissions`.
 fn fill_key(execution_id: &str) -> &str {
     execution_id.rsplitn(3, '.').nth(2).unwrap_or(execution_id)
 }
@@ -191,6 +202,11 @@ fn fill_key(execution_id: &str) -> &str {
 /// every leg has filled the combo quantity times its ratio and has its report. A combo the
 /// matcher was not told about comes as separate fills: the combo-level execution without a
 /// commission, and each leg.
+///
+/// [`pair_executions`](Self::pair_executions) needs no `add_combo`: a reply holds the whole
+/// fill, so it puts each leg (same `perm_id`, execution id differing from the combo-level
+/// execution's only in the last two fields) into the combo fill. The combo fill's
+/// `commission` is `None` there too; the commissions are on the legs.
 ///
 /// # What it holds
 ///
@@ -350,11 +366,11 @@ impl FillMatcher {
 
     /// Tells the matcher that order `perm_id` is a combo with these legs, so it returns each
     /// fill of the order as one combo [`Fill`] (see [Combos](Self#combos)). Call it before the
-    /// order's executions arrive: with the legs of the open-order echo, which TWS sends before
-    /// the first execution, or of an order from `open_orders` or `completed_orders` before
-    /// passing an [`executions`](crate::Client::executions) reply to
-    /// [`pair_executions`](Self::pair_executions). Only each leg's `contract_id` and `ratio`
-    /// are used. Calling it again for the same `perm_id` replaces the legs.
+    /// order's executions arrive, with the legs of the open-order echo, which TWS sends before
+    /// the first execution. An [`executions`](crate::Client::executions) reply needs no call:
+    /// [`pair_executions`](Self::pair_executions) assembles its combo fills from the
+    /// executions alone. Only each leg's `contract_id` and `ratio` are used. Calling it again
+    /// for the same `perm_id` replaces the legs.
     ///
     /// The matcher remembers the last [`memory`](Self::memory) combos, the oldest dropped
     /// first; with `memory(0)` this has no effect.
@@ -675,15 +691,23 @@ impl FillMatcher {
     /// no partner. A report that comes after an execution the rule expects none for fills in
     /// that fill's commission; a repeated report is dropped. A first report for an execution
     /// the matcher handed out without one before the call is returned in
-    /// [`Unpaired::reports`], after the reports that found no execution. A combo fill
-    /// ([`add_combo`](Self::add_combo)) is in the fills at its combo-level execution's place;
-    /// one the reply does not complete is in [`Unpaired::fills`].
+    /// [`Unpaired::reports`], after the reports that found no execution.
+    ///
+    /// Each combo fill is in the fills at its combo-level execution's place, with the leg
+    /// fills of the reply in [`Fill::legs`]. A combo fill with a leg whose report the reply
+    /// lacks is in [`Unpaired::fills`], that leg without a commission. A combo announced with
+    /// [`add_combo`](Self::add_combo) completes by its legs' ratios instead, and is in
+    /// [`Unpaired::fills`] when the reply does not complete it.
     ///
     /// Pass the whole reply: read it with `collect_to_end_within`, which fails rather than
     /// return a partial reply, so an execution whose report was cut off never shows up as
     /// unpaired. The matcher remembers every execution of the reply, so a later copy of one
     /// of its reports on a stream fed to the same matcher is [`ReportMatch::Duplicate`], or
-    /// [`ReportMatch::Late`] for an unpaired execution. What it held before is untouched.
+    /// [`ReportMatch::Late`] for an unpaired execution. What it held before is untouched: an
+    /// execution of the reply that the matcher was already waiting for (from a live stream)
+    /// pairs with the reply's report and is in the fills, or, without one, stays held for the
+    /// live report and is in neither the fills nor [`Unpaired`]. An unpaired execution is
+    /// most often a fill whose report TWS has not sent yet; see [`Unpaired::executions`].
     ///
     /// # Examples
     ///
@@ -709,6 +733,11 @@ impl FillMatcher {
     /// ```
     pub fn pair_executions(&mut self, rows: impl IntoIterator<Item = Executions>) -> (Vec<Fill>, Unpaired) {
         let now = Instant::now();
+        let held: HashSet<String> = self
+            .executions
+            .iter()
+            .map(|(execution, _)| execution.execution.execution_id.clone())
+            .collect();
         let mut positions: HashMap<String, usize> = HashMap::new();
         let mut report_ids: HashSet<String> = HashSet::new();
         let mut fills: Vec<Fill> = Vec::new();
@@ -718,7 +747,9 @@ impl FillMatcher {
                 Executions::ExecutionData(execution) => {
                     let position = positions.len();
                     positions.entry(execution.execution.execution_id.clone()).or_insert(position);
-                    fills.extend(self.push_execution_at(execution, now));
+                    if !held.contains(&execution.execution.execution_id) {
+                        fills.extend(self.push_execution_at(execution, now));
+                    }
                 }
                 Executions::CommissionAndFeesReport(report) => {
                     report_ids.insert(report.execution_id.clone());
@@ -736,7 +767,10 @@ impl FillMatcher {
         }
         fills.sort_by_key(|fill| positions.get(&fill.execution.execution.execution_id).copied().unwrap_or(usize::MAX));
         let (executions, reports) = self.take_where(
-            |execution, _| positions.contains_key(&execution.execution.execution_id),
+            |execution, _| {
+                let execution_id = &execution.execution.execution_id;
+                positions.contains_key(execution_id) && !held.contains(execution_id)
+            },
             |report, _| report_ids.contains(&report.execution_id),
         );
         let mut unpaired = self.hand_out(executions, reports, |parts| {
@@ -747,7 +781,68 @@ impl FillMatcher {
                 .any(|fill| positions.contains_key(&fill.execution.execution.execution_id))
         });
         unpaired.reports.extend(late);
+        let fills = self.attach_legs(fills, &mut unpaired, &positions);
         (fills, unpaired)
+    }
+
+    /// Puts each leg fill of a reply into the combo fill of its combo-level execution, for the
+    /// combos [`add_combo`](Self::add_combo) did not announce: a leg is an execution of another
+    /// security type with the combo-level execution's `perm_id` and [`fill_key`]. A leg from
+    /// `unpaired.executions` joins without a commission and moves its combo fill to
+    /// `unpaired.fills`. Legs keep their order in the reply (`positions`).
+    fn attach_legs(&self, fills: Vec<Fill>, unpaired: &mut Unpaired, positions: &HashMap<String, usize>) -> Vec<Fill> {
+        let part_of = |execution: &ExecutionData| (execution.execution.perm_id, fill_key(&execution.execution.execution_id).to_string());
+        let combo_keys: HashSet<(i64, String)> = fills
+            .iter()
+            .map(|fill| &fill.execution)
+            .filter(|execution| execution.contract.security_type == SecurityType::Spread && !self.combos.contains_key(&execution.execution.perm_id))
+            .map(part_of)
+            .collect();
+        if combo_keys.is_empty() {
+            return fills;
+        }
+        let is_leg = |execution: &ExecutionData| execution.contract.security_type != SecurityType::Spread && combo_keys.contains(&part_of(execution));
+
+        let mut legs: HashMap<(i64, String), Vec<Fill>> = HashMap::new();
+        let mut incomplete: HashSet<(i64, String)> = HashSet::new();
+        let mut kept = Vec::with_capacity(fills.len());
+        for fill in fills {
+            if is_leg(&fill.execution) {
+                legs.entry(part_of(&fill.execution)).or_default().push(fill);
+            } else {
+                kept.push(fill);
+            }
+        }
+        for execution in mem::take(&mut unpaired.executions) {
+            if !is_leg(&execution) {
+                unpaired.executions.push(execution);
+                continue;
+            }
+            let key = part_of(&execution);
+            incomplete.insert(key.clone());
+            legs.entry(key).or_default().push(Fill {
+                execution,
+                commission: None,
+                legs: Vec::new(),
+            });
+        }
+
+        let mut assembled = Vec::with_capacity(kept.len());
+        for mut fill in kept {
+            if fill.execution.contract.security_type == SecurityType::Spread && fill.legs.is_empty() {
+                let key = part_of(&fill.execution);
+                if let Some(mut found) = legs.remove(&key) {
+                    found.sort_by_key(|leg| positions.get(&leg.execution.execution.execution_id).copied());
+                    fill.legs = found;
+                }
+                if incomplete.contains(&key) {
+                    unpaired.fills.push(fill);
+                    continue;
+                }
+            }
+            assembled.push(fill);
+        }
+        assembled
     }
 
     fn take_where(
