@@ -263,6 +263,39 @@ and EUR.USD BUY 20,000 MKT cancelled right after placing.*
   lost the race; no 202 or other error followed.
 - **Not probed:** a partial fill followed by a cancel of the rest, and a cancel during RTH.
 
+### Modifying an order
+
+*Live 2026-11-24 off-hours (04:25-04:36 ET), paper TWS, server 223; EUR.USD BUY 20,000 LMT 0.95
+(Submitted), modified with `place_order` on the same id; #PR.*
+
+| Modify sent                                                       | Reply                                                                                |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| limit 0.95 -> 0.96; quantity 20,000 -> 25,000; `DAY` -> `GTC`     | OpenOrder and OrderStatus Submitted (once or twice) with the new terms, same perm id |
+| only `order_type` and `lmt_price` set (quantity 0)                | 321 "... The size value cannot be zero"                                              |
+| action BUY -> SELL; contract EUR.USD -> GBP.USD                   | 105 "Order being modified does not match original order."                            |
+| order type LMT -> STP                                             | 329 "Order modify failed. Cannot change to the new order type.STP"                   |
+| id of a cancelled, filled (MKT) or rejected (201, Inactive) order | 104 "Cannot modify a filled order."                                                  |
+| id of an order TWS had not acknowledged yet                       | 103 "Duplicate order id: 5"                                                          |
+
+- Every refusal carried the order id, came with no status, and left the order working with its
+  earlier terms (`open_orders` right after). A second cancel of a cancelled order drew 10148.
+- **Held order** (`transmit` false): the place and a modify with a new price drew no frames and
+  `open_orders` did not list it. The modify that set `transmit` released it with the newest price
+  (Submitted).
+- **Another client**: client 209 sending client 208's working order id placed a second, separate
+  order (another perm id, both listed by `all_open_orders`); its cancel of that id before then drew
+  10147.
+- **Slow acknowledgment**: in one run TWS took 7 s before the OpenOrder of a new order, and in
+  another sent none; modifies sent meanwhile drew 103, and the unanswered order's cancel
+  drew OrderStatus ApiCancelled with perm id 0.
+- **Subscriptions**: with every subscription on an order id receiving its frames (#1282), the 105 of a
+  refused modify reached the earlier `place_order` subscriptions as an error and ended them, while
+  the order kept working (the next modify was accepted). On 6.0-dev before that, each `place_order`
+  or `cancel_order` on the id ended the earlier subscription at once, and a refused modify then
+  ended its own, leaving none.
+- **Not probed:** a partly filled order modified to below its filled quantity (paper EUR.USD
+  filled 20,000 at once, and US stocks were closed); RTH; futures and stock orders; IB Gateway.
+
 ### Weekend cancel of a PreSubmitted ES order wedges in PendingCancel
 
 *Live 2026-11-14 weekend (Sat 16:55 ET, CME closed), paper Gateway, server 226; #1214.*
