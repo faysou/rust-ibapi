@@ -91,8 +91,9 @@ the cancel; types whose code is verified here now skip it, so the reply no longe
   market data requires additional subscription for API ... Delayed market data is available",
   then nothing for 12-15 s: no ticks, no TickSnapshotEnd. A cancel afterwards drew 300 every
   time, so TWS had already ended the request.
-- The client classifies 10089 as a data advisory (`DATA_ADVISORY_CODES`), so the stream stays
-  open and its drop still sends the cancel.
+- The client ends the stream on 10089 and sends no cancel; the full sweep is in
+  [market data type and permission notices](market-data.md#market-data-type-and-permission-notices)
+  (#1297).
 - With market data type delayed (3) or delayed-frozen (4), the same requests drew 10167 and
   delayed ticks; frozen (2) drew 10168.
 - **Not probed:** RTH, and an account with delayed data enabled for the API.
