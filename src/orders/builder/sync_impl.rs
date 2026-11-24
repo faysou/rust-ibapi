@@ -51,7 +51,7 @@ impl OrderBuilder<ClientBound<'_, Client>> {
     pub fn analyze(self) -> Result<crate::orders::OrderState, Error> {
         let ClientBound { client, contract } = self.target;
         let order = self.build()?;
-        client.analyze_order(contract, &order)
+        client.analyze_order(client.next_order_id(), contract, &order)
     }
 }
 

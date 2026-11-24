@@ -84,6 +84,20 @@ frames; #1289.*
 - **Not probed:** RTH (the US stock frames may differ at the open); options, combos and other
   warnings; Gateway (the 2026-10-27 SPY probe above ran on Gateway 226 and did not count frames).
 
+### What-if order ids
+
+*Live 2026-11-24 21:53 UTC (US stocks closed), paper TWS, server 223; #1289.*
+
+- One connection per step, same client id, AAPL BUY 1 LMT 100: what-if under id 1000 answered
+  with two frames (PreSubmitted, then the margins); a real order under 1000 then drew 103
+  "Duplicate order id: 1000", and so did a second what-if under 1000. A what-if under 1005
+  answered; a second what-if under 1005, a what-if under 1003 and a real order under 1005 each
+  drew 103.
+- Settles that a what-if uses its order id like a placed order: the id and every id below it are
+  spent for that client, although no order is left working. A caller that keeps its own id
+  sequence must take what-if ids from it, or its next order collides.
+- **Not probed:** whether the spent id survives a TWS restart; Gateway.
+
 ### IBKRATS PEG BEST / PEG MID
 
 *Live 2026-10-04 (Sunday), paper Gateway, AAPL on IBKRATS, BUY 100 @ $1; #936.*
