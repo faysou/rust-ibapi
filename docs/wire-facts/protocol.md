@@ -99,7 +99,10 @@ the cancel; types whose code is verified here now skip it, so the reply no longe
 - With `keepUpToDate` (`stream()`), TWS sent the bars after the 10299 and kept sending updates
   every ~5 s. A cancel sent right after the 10299 drew 366 "No historical data query found",
   and the updates kept coming for the 37 s left in the session.
-- The client ends the stream on the 10299, so those frames reach no recipient.
+- Clients before #1298 ended the stream on the 10299, so those frames reached no recipient. Bar
+  requests now yield it as a notice and read on
+  ([10299 substitution](market-data.md#10299-whattoshow-substitution)); historical ticks still
+  end on it.
 - historical_ticks TRADES on BTC drew the same 10299 and no ticks afterwards.
 - **Not probed:** whether a later cancel stops the updates.
 
