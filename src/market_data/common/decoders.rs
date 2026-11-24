@@ -1,6 +1,6 @@
 use crate::market_data::{TickAttributeBidAsk, TickAttributeLast, TickBidAsk, TickLast, TickMidpoint};
 use crate::proto;
-use crate::proto::decoders::{parse_decimal_or_zero, ts};
+use crate::proto::decoders::{parse_decimal_or_zero, parse_optional_decimal, ts};
 use crate::Error;
 
 pub(in crate::market_data) fn decode_tick_last(t: proto::HistoricalTickLast) -> Result<TickLast, Error> {
@@ -39,6 +39,30 @@ pub(in crate::market_data) fn decode_tick_midpoint(t: proto::HistoricalTick) -> 
         time: ts(t.time.unwrap_or_default()),
         price: t.price.unwrap_or_default(),
     }
+}
+
+/// A historical or realtime bar's volume, WAP and trade count, each `None` where the bar has none.
+pub(in crate::market_data) struct BarVolume {
+    pub(in crate::market_data) volume: Option<f64>,
+    pub(in crate::market_data) wap: Option<f64>,
+    pub(in crate::market_data) count: Option<i32>,
+}
+
+/// A bar that isn't TRADES (MIDPOINT, BID, ASK, ...) has no traded volume. TWS leaves the three
+/// fields out or sends them as `-1`, and for a contract with a price magnifier it sends the WAP as
+/// `-1` times the magnifier, so the WAP is kept only beside a volume
+/// (`docs/wire-facts/market-data.md#bar-volume-and-wap-on-non-trades-bars`).
+pub(in crate::market_data) fn decode_bar_volume(volume: Option<&str>, wap: Option<&str>, count: Option<i32>) -> Result<BarVolume, Error> {
+    let volume = parse_optional_decimal(volume)?.filter(|volume| *volume >= 0.0);
+    let wap = match volume {
+        Some(_) => parse_optional_decimal(wap)?,
+        None => None,
+    };
+    Ok(BarVolume {
+        volume,
+        wap,
+        count: count.filter(|count| *count >= 0),
+    })
 }
 
 #[cfg(test)]
