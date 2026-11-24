@@ -114,7 +114,7 @@ paper Gateway, server 220 (#841, closed, not a bug).*
 ### What-if answer frames
 
 *Live 2026-11-24 off-hours (04:15 ET), paper TWS, server 223; raw capture of `openOrder`
-frames; #PR.*
+frames; #1289.*
 
 | Order (what-if)                                              | Frames | Margin fields           | Commission             | Then    |
 | ------------------------------------------------------------ | ------ | ----------------------- | ---------------------- | ------- |
