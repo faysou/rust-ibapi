@@ -83,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Error 10299 ("Expected what to show is AGGTRADES, please use that instead of TRADES") no longer ends a historical bar request (`fetch`, `subscribe`, `stream`). TWS goes on with the `whatToShow` it names and sends those bars, and for a crypto `stream()` the updates; the subscription yields the 10299 as a notice and then the data, and `fetch` returns the bars. Historical ticks still end on 10299: nothing follows it there. A `stream()` that TWS refuses with 321 ("Source price not supported with live updates") no longer sends a cancel, which TWS answered with 366 (#PR).
+- Error 10299 ("Expected what to show is AGGTRADES, please use that instead of TRADES") no longer ends a historical bar request (`fetch`, `subscribe`, `stream`). TWS goes on with the `whatToShow` it names and sends those bars, and for a crypto `stream()` the updates; the subscription yields the 10299 as a notice and then the data, and `fetch` returns the bars. Historical ticks still end on 10299: nothing follows it there. A `stream()` that TWS refuses with 321 ("Source price not supported with live updates") no longer sends a cancel, which TWS answered with 366 (#1298).
 - Code 10349 "Order TIF was set to DAY based on order preset" is a `NoticeCategory::Warning` on any order. TWS goes on with the order after it. It arrives on every `exercise_options` request, where it ended the subscription with an error before the exercise's open order and executions arrived. It now arrives as a notice and the subscription keeps reading (#1210).
 
 ## [5.8.0] - 2026-11-24
