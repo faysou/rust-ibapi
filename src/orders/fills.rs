@@ -65,6 +65,8 @@ impl Fill {
     /// sorted by contract id, so the result compares with an echo's `contract.combo_legs`
     /// leg by leg (live, 14 ES combo fills: 2026-11-24, server 223;
     /// `docs/wire-facts/orders.md#combo-bag-executions-and-commissions`).
+    /// [`Contract::spread_from_legs`](crate::contracts::Contract::spread_from_legs) keeps its legs
+    /// in the order given, so sort that contract's `combo_legs` by `contract_id` before comparing.
     ///
     /// # Examples
     ///
