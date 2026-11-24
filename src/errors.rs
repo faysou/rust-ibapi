@@ -414,8 +414,8 @@ impl Error {
     /// - [`Io`](Error::Io) is a failed socket write.
     /// - [`Poison`](Error::Poison) comes from a lock, including locks taken after the handshake
     ///   was written.
-    /// - [`Notice`](Error::Notice) and the decode, parse and stream variants report what TWS
-    ///   sent back, so the request was sent.
+    /// - [`Notice`](Error::Notice), [`UnexpectedTickKind`](Error::UnexpectedTickKind) and the
+    ///   decode, parse and stream variants report what TWS sent back, so the request was sent.
     ///
     /// A call that sends several requests reports only on the one that failed:
     /// `submit_oca_orders` sends its orders one at a time, so a `true` error on a later order
@@ -474,6 +474,7 @@ impl Error {
             | Error::InvalidFrame(_)
             | Error::Notice(_)
             | Error::HistoricalParseError(_)
+            | Error::UnexpectedTickKind { .. }
             | Error::ProtobufDecode(_) => false,
         }
     }
