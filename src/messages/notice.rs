@@ -260,6 +260,10 @@ const ORDER_CODE_CATEGORIES: &[(i32, NoticeCategory)] = &[
     (10244, NoticeCategory::OrderRejection),
     // docs/wire-facts/orders.md#order-rejections-outside-the-200-399-band
     (10317, NoticeCategory::OrderRejection),
+    // docs/wire-facts/orders.md#orders-tws-discards-461-and-10311
+    (461, NoticeCategory::OrderRejection),
+    // docs/wire-facts/orders.md#orders-tws-discards-461-and-10311
+    (10311, NoticeCategory::OrderRejection),
     // docs/wire-facts/orders.md#refused-modifies-leave-the-order-working
     (104, NoticeCategory::OrderChangeRejection),
     // docs/wire-facts/orders.md#refused-modifies-leave-the-order-working
@@ -499,7 +503,7 @@ pub(crate) fn resubscribed_notice() -> Notice {
 /// 5. [`RequestError`](Self::RequestError) — [`REQUEST_ERROR_CODES`]. Ahead of
 ///    [`ORDER_REJECTION_CODE_RANGE`], which they sit inside.
 /// 6. Order codes outside the band, each verified live:
-///    [`OrderRejection`](Self::OrderRejection) for 103, 110, 10244 and 10317;
+///    [`OrderRejection`](Self::OrderRejection) for 103, 110, 461, 10244, 10311 and 10317;
 ///    [`OrderChangeRejection`](Self::OrderChangeRejection) for 104, 105, 10067,
 ///    10147, 10148, 10241 and 10242.
 /// 7. [`OrderRejection`](Self::OrderRejection) — [`ORDER_REJECTION_CODE_RANGE`],
@@ -538,7 +542,7 @@ pub enum NoticeCategory {
     /// Connectivity / system status (codes 1100, 1101, 1102, 1300).
     SystemMessage,
     /// TWS rejected an order request ([`ORDER_REJECTION_CODE_RANGE`] excluding the
-    /// cases above it in the precedence chain, and 103, 110, 10244, 10317).
+    /// cases above it in the precedence chain, and 103, 110, 461, 10244, 10311, 10317).
     ///
     /// For a new order, TWS created no order. For a modify of a working order, TWS
     /// rejected the modification only: the order goes on working with its previous
