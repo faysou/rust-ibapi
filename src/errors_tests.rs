@@ -389,6 +389,13 @@ fn is_unsent_only_for_errors_raised_before_a_write() {
         (Error::InvalidFrame("short".into()), false),
         (tws_error_notice(201, "Order rejected"), false),
         (Error::HistoricalParseError(HistoricalParseError::WhatToShow("Z".into())), false),
+        (
+            Error::UnexpectedTickKind {
+                requested: WhatToShow::Trades,
+                received: WhatToShow::MidPoint,
+            },
+            false,
+        ),
         (protobuf_decode_error(), false),
     ];
 
