@@ -309,7 +309,13 @@ pub struct TcpMessageBus<S: Stream> {
     handles: Mutex<Vec<JoinHandle<()>>>,
     requests: SenderHash<RequestId, RoutedItem>,
     orders: SenderHash<OrderId, RoutedItem>,
+    /// Execution-id aliases of order routes, for the commission report that
+    /// follows a live execution.
     executions: SenderHash<String, RoutedItem>,
+    /// Execution-id aliases of `executions` request routes, for the
+    /// commission reports in a reply, which go to the request alone and not
+    /// to the order update stream.
+    executions_requested: SenderHash<String, RoutedItem>,
     shared_channels: SharedChannels,
     signals_send: Sender<Signal>,
     signals_recv: Receiver<Signal>,
@@ -353,6 +359,7 @@ impl<S: Stream> TcpMessageBus<S> {
             requests: SenderHash::new(),
             orders: SenderHash::new(),
             executions: SenderHash::new(),
+            executions_requested: SenderHash::new(),
             shared_channels: SharedChannels::new(),
             signals_send,
             signals_recv,
@@ -392,6 +399,7 @@ impl<S: Stream> TcpMessageBus<S> {
         self.shared_channels.fail_all(|| Error::Shutdown.into());
         // Aliases of the routes just failed.
         self.executions.clear();
+        self.executions_requested.clear();
         self.connection.notice_broadcaster.close();
 
         // Both latch: the connection signal releases every `wait_connected`
@@ -491,6 +499,7 @@ impl<S: Stream> TcpMessageBus<S> {
         self.shared_channels.reset_counts();
         // Aliases of the routes just failed.
         self.executions.clear();
+        self.executions_requested.clear();
         self.order_taps.reset();
     }
 
@@ -509,7 +518,7 @@ impl<S: Stream> TcpMessageBus<S> {
 
     fn clean_request(&self, request_id: RequestId, lease: &LeaseRef) {
         let removed = self.requests.remove_if_same(request_id, lease);
-        let aliases = self.executions.remove_all_same(lease);
+        let aliases = self.executions_requested.remove_all_same(lease);
         debug!(
             "cleanup request_id {request_id}: removed={removed}, aliases={aliases}, requests.len()={}",
             self.requests.len()
@@ -737,9 +746,9 @@ impl<S: Stream> TcpMessageBus<S> {
 
     fn process_orders(&self, message: ResponseMessage) {
         let foreign = is_foreign(&message, self.connection.client_id);
-        let strategy = order_routing_strategy(message.message_type(), foreign);
         let message_order_id = message.order_id().map(OrderId::from);
         let message_request_id = message.request_id().and_then(RequestId::from_raw);
+        let strategy = order_routing_strategy(message.message_type(), foreign, message_request_id.is_some());
 
         if !foreign {
             self.order_taps.publish_status(&message);
@@ -752,14 +761,18 @@ impl<S: Stream> TcpMessageBus<S> {
             OrderRoutingStrategy::ExecutionData => {
                 let sent_to_update_stream = self.send_order_update(&message);
                 let execution_id = message.execution_id();
-                if let Err(item) = self.deliver_to_order_or_request(message_order_id, message_request_id, message.into(), execution_id.as_ref()) {
+                let unrouted = match message_order_id {
+                    Some(id) => self.orders.deliver_aliased(&id, message.into(), execution_id.as_ref(), &self.executions),
+                    None => Err(message.into()),
+                };
+                if let Err(item) = unrouted {
                     if !sent_to_update_stream {
                         warn!("could not route message {item:?}");
                     }
                 }
             }
             OrderRoutingStrategy::ExecutionDataEnd => {
-                if let Err(item) = self.deliver_to_order_or_request(message_order_id, message_request_id, message.into(), None) {
+                if let Err(item) = self.deliver_to_order_or_request(message_order_id, message_request_id, message.into()) {
                     warn!("could not route message {item:?}");
                 }
             }
@@ -776,26 +789,39 @@ impl<S: Stream> TcpMessageBus<S> {
                     }
                 }
             }
-            OrderRoutingStrategy::ByExecutionId => {
-                let sent_to_update_stream = self.send_order_update(&message);
-
-                let unrouted = match message.execution_id() {
-                    Some(execution_id) => self.executions.deliver(&execution_id, message.into()),
-                    None => Err(message.into()),
-                };
-                if let Err(item) = unrouted {
-                    if !sent_to_update_stream {
-                        warn!("could not route commission report {item:?}");
+            OrderRoutingStrategy::ByExecutionId => match message.execution_id() {
+                // A commission report in an `executions` reply goes to that
+                // request alone; a live fill's is copied to the update stream
+                // and follows its execution to the order route.
+                Some(execution_id) => {
+                    if let Err(item) = self.executions_requested.deliver(&execution_id, message.clone().into()) {
+                        let sent_to_update_stream = self.send_order_update(&message);
+                        if let Err(item) = self.executions.deliver(&execution_id, item) {
+                            if !sent_to_update_stream {
+                                warn!("could not route commission report {item:?}");
+                            }
+                        }
                     }
                 }
-            }
+                None => {
+                    if !self.send_order_update(&message) {
+                        warn!("could not route commission report {message:?}");
+                    }
+                }
+            },
             OrderRoutingStrategy::SharedOnly => {
                 self.shared_channels.send_message(message.message_type(), &message);
             }
             OrderRoutingStrategy::ByRequestId => {
                 let execution_id = message.execution_id();
-                if let Err(item) = self.deliver_to_order_or_request(None, message_request_id, message.into(), execution_id.as_ref()) {
-                    debug!("another client's execution answers no request: {item:?}");
+                let unrouted = match message_request_id {
+                    Some(id) => self
+                        .requests
+                        .deliver_aliased(&id, message.into(), execution_id.as_ref(), &self.executions_requested),
+                    None => Err(message.into()),
+                };
+                if let Err(item) = unrouted {
+                    debug!("execution answers no live request: {item:?}");
                 }
             }
             OrderRoutingStrategy::Ignore => {}
@@ -843,22 +869,15 @@ impl<S: Stream> TcpMessageBus<S> {
         Ok(subscription)
     }
 
-    /// Deliver to `order_id`'s route, else `request_id`'s, aliasing the route
-    /// under `execution_id` for the commission report that follows. Hands
-    /// the item back when neither is registered.
-    fn deliver_to_order_or_request(
-        &self,
-        order_id: Option<OrderId>,
-        request_id: Option<RequestId>,
-        item: RoutedItem,
-        execution_id: Option<&String>,
-    ) -> Result<(), RoutedItem> {
+    /// Deliver to `order_id`'s route, else `request_id`'s. Hands the item
+    /// back when neither is registered.
+    fn deliver_to_order_or_request(&self, order_id: Option<OrderId>, request_id: Option<RequestId>, item: RoutedItem) -> Result<(), RoutedItem> {
         match order_id {
-            Some(id) => self.orders.deliver_aliased(&id, item, execution_id, &self.executions),
+            Some(id) => self.orders.deliver(&id, item),
             None => Err(item),
         }
         .or_else(|item| match request_id {
-            Some(id) => self.requests.deliver_aliased(&id, item, execution_id, &self.executions),
+            Some(id) => self.requests.deliver(&id, item),
             None => Err(item),
         })
     }

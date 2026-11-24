@@ -10,7 +10,7 @@ triggers:
   - adding an Order field that carries another order's id
 symbols: [REQUEST_ID_FLOOR, RequestId, OrderId, WireId, WireId::classify, OrderId::checked, verify_and_reserve_order_ids, carried_order_ids, Client::mint_request_id]
 related: [proto-aware-accessors]
-precedents: ["#789", "#1069", "#1231"]
+precedents: ["#789", "#1069", "#1231", "#PR"]
 ---
 
 An error frame carries one integer for both requests and orders, so the two id domains must
@@ -65,3 +65,6 @@ only on user demand.
 - #1231 — the generator ignored caller-chosen ids, so `next_valid_order_id()` then
   `submit_order(id, ..)` let the next builder `submit` reuse `id`. Checking and reserving merged
   into one entry point over one carried-id list; `next_valid_order_id` reserves what it returns.
+- #PR — an `ExecutionData` reply to `executions()` went to the order route whenever one was open
+  for its order id, so the order-id field outranked the request-id field. The request-id field
+  now decides: a request-range id routes to that request only, -1 to the order route.
