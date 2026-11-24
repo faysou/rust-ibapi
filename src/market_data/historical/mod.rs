@@ -26,6 +26,7 @@ use time::{Date, OffsetDateTime};
 
 use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
+use crate::contracts::SecurityType;
 use crate::messages::{IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
@@ -757,6 +758,8 @@ pub enum WhatToShow {
     ///
     /// Required for crypto contracts: TWS rejects `TRADES` for crypto with
     /// error 10299, so crypto trade-price series must be requested as `AGGTRADES`.
+    /// Other security types reject `AGGTRADES` with 10299.
+    /// [`trades_for`](Self::trades_for) picks between the two.
     AggTrades,
     /// Historical volatility computed by IB.
     HistoricalVolatility,
@@ -768,6 +771,39 @@ pub enum WhatToShow {
     Schedule,
     /// Split-adjusted last price series.
     AdjustedLast,
+}
+
+impl WhatToShow {
+    /// The `whatToShow` that requests trade prices for `security_type`, or `None` where TWS has
+    /// no trade data for it.
+    ///
+    /// - Crypto: [`AggTrades`](Self::AggTrades). TWS rejects `TRADES` with error 10299.
+    /// - Forex pairs, commodities (`XAUUSD`) and CFDs: `None`. TWS answers `TRADES` with error 162
+    ///   ("No historical market data"); request [`MidPoint`](Self::MidPoint), [`Bid`](Self::Bid)
+    ///   or [`Ask`](Self::Ask) instead.
+    /// - Every other security type: [`Trades`](Self::Trades). An index's TRADES bars carry no
+    ///   volume.
+    ///
+    /// Live-checked for stocks, futures, options, futures options, indices, forex, `XAUUSD`, an
+    /// index CFD and crypto (`docs/wire-facts/market-data.md#trade-price-whattoshow-by-security-type`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::SecurityType;
+    /// use ibapi::market_data::historical::WhatToShow;
+    ///
+    /// assert_eq!(WhatToShow::trades_for(&SecurityType::Crypto), Some(WhatToShow::AggTrades));
+    /// assert_eq!(WhatToShow::trades_for(&SecurityType::Stock), Some(WhatToShow::Trades));
+    /// assert_eq!(WhatToShow::trades_for(&SecurityType::ForexPair), None);
+    /// ```
+    pub fn trades_for(security_type: &SecurityType) -> Option<Self> {
+        match security_type {
+            SecurityType::Crypto => Some(Self::AggTrades),
+            SecurityType::ForexPair | SecurityType::Commodity | SecurityType::CFD => None,
+            _ => Some(Self::Trades),
+        }
+    }
 }
 
 impl std::fmt::Display for WhatToShow {
