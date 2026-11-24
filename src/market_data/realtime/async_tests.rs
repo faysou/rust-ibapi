@@ -14,7 +14,7 @@ use crate::testdata::builders::market_data::{
     depth_market_data_description, market_data_request, market_depth_exchanges_request, market_depth_request, market_depth_response,
     mkt_depth_exchanges_response, realtime_bar_tick, realtime_bars_request, reroute_market_data, reroute_market_depth, tick_bid_ask,
     tick_by_tick_bid_ask_response, tick_by_tick_last_response, tick_by_tick_midpoint_response, tick_by_tick_request, tick_generic, tick_last,
-    tick_midpoint, tick_price, tick_size, tick_string,
+    tick_midpoint, tick_price, tick_size, tick_snapshot_end, tick_string,
 };
 use crate::testdata::builders::ResponseProtoEncoder;
 use futures::StreamExt;
@@ -868,4 +868,58 @@ async fn market_data_rejected_with_unverified_code_still_cancels() {
     assert!(matches!(subscription.next().await, Some(Err(Error::Notice(n))) if n.code == 10197));
     subscription.cancel().await;
     assert_eq!(message_bus.request_messages().len(), 2, "request, then the cancel");
+}
+
+#[tokio::test]
+async fn market_data_10089_ends_the_subscription() {
+    let (message_bus, client) = rejecting_client(10089);
+    let contract = Contract::stock("AAPL").build();
+    let subscription = client.market_data(&contract).subscribe().await.expect("subscribe failed");
+    assert_rejection_ends_without_cancel(&message_bus, subscription, 10089).await;
+}
+
+#[tokio::test]
+async fn market_data_snapshot_10089_ends_the_subscription() {
+    let (message_bus, client) = rejecting_client(10089);
+    let contract = Contract::stock("AAPL").build();
+    let subscription = client.market_data(&contract).snapshot().subscribe().await.expect("subscribe failed");
+    assert_rejection_ends_without_cancel(&message_bus, subscription, 10089).await;
+}
+
+#[tokio::test]
+async fn realtime_bars_10089_ends_the_subscription() {
+    let (message_bus, client) = rejecting_client(10089);
+    let contract = Contract::stock("AAPL").build();
+    let subscription = client.realtime_bars(&contract).subscribe().await.expect("subscribe failed");
+    assert_rejection_ends_without_cancel(&message_bus, subscription, 10089).await;
+}
+
+#[tokio::test]
+async fn tick_by_tick_10089_ends_the_subscription() {
+    let (message_bus, client) = rejecting_client(10089);
+    let contract = Contract::stock("AAPL").build();
+    let subscription = client.tick_by_tick(&contract, 0).mid_point().await.expect("subscribe failed");
+    assert_rejection_ends_without_cancel(&message_bus, subscription, 10089).await;
+}
+
+/// 10167 reports the delayed data that follows it: the stream stays open and yields the ticks.
+#[tokio::test]
+async fn market_data_10167_is_a_notice_before_delayed_ticks() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+        proto_error_response(
+            TEST_REQ_ID_FIRST,
+            10167,
+            "Requested market data is not subscribed. Displaying delayed market data.",
+        ),
+        proto_response(IncomingMessages::TickSnapshotEnd, tick_snapshot_end().encode_proto()),
+    ]));
+    let client = Client::stubbed(message_bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    let contract = Contract::stock("AAPL").build();
+    let mut subscription = client.market_data(&contract).snapshot().subscribe().await.expect("subscribe failed");
+
+    assert!(matches!(subscription.next().await, Some(Ok(SubscriptionItem::Notice(n))) if n.code == 10167));
+    assert!(matches!(
+        subscription.next().await,
+        Some(Ok(SubscriptionItem::Data(TickTypes::SnapshotEnd)))
+    ));
 }

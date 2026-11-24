@@ -76,6 +76,12 @@ pub(crate) const MARKET_DATA_DELAYED_NOT_ENABLED_CODE: i32 = 10168;
 /// "Failed to request tick-by-tick data" (e.g. no market data permission).
 pub(crate) const TICK_BY_TICK_FAILED_CODE: i32 = 10189;
 
+/// "Requested market data requires additional subscription for API ... Delayed market data is
+/// available." Ends the request at TWS whatever the market data type: nothing follows it, and
+/// a cancel draws 300. With a delayed type set, a contract TWS has delayed data for draws 10167
+/// instead (`docs/wire-facts/market-data.md#market-data-type-and-permission-notices`).
+pub(crate) const MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE: i32 = 10089;
+
 /// Range of error codes that are considered warnings: the whole `21xx` band.
 ///
 /// IB's published table stops at 2169, but the gateway keeps adding codes above
@@ -179,14 +185,13 @@ pub const SYSTEM_MESSAGE_CODES: [i32; 4] = [
 ///   before applying any new entries. A depth subscription yields it as
 ///   [`MarketDepths::Reset`](crate::market_data::realtime::MarketDepths::Reset).
 /// - 2188: Up-to-the-second historical data requires additional subscription for the API.
-/// - 10089: Requested market data requires additional subscription for API; delayed market data is available.
 /// - 10090: Part of requested market data is not subscribed. Subscription-independent ticks are still active.
 /// - 10091: Part of requested market data requires additional subscription for API.
 /// - 10167: Requested market data is not subscribed. Displaying delayed market data.
 ///
 /// A slice rather than an array so that adding a code is not a type change
 /// for callers that bind the constant explicitly.
-pub const DATA_ADVISORY_CODES: &[i32] = &[MARKET_DEPTH_RESET_CODE, 2188, 10089, 10090, 10091, 10167];
+pub const DATA_ADVISORY_CODES: &[i32] = &[MARKET_DEPTH_RESET_CODE, 2188, 10090, 10091, 10167];
 
 /// Request-error codes inside [`ORDER_REJECTION_CODE_RANGE`]: a request other
 /// than an order failed (market data, depth, historical data, scanner, session
