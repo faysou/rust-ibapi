@@ -37,7 +37,7 @@ use crate::connection::r#async::AsyncConnection;
 use crate::messages::{is_cancel_frame, transport_reconnect_notice, IncomingMessages, Notice, OutgoingMessages, ResponseMessage};
 use crate::Error;
 
-use super::common::{lock, log_orphan, report_unroutable_frame, Lease, LeaseRef};
+use super::common::{lock, log_orphan, report_unroutable_frame, Lease, LeaseRef, LiveExecutions};
 use super::order_taps::{NewTap, OrderTaps};
 use super::rate_limiter::RateLimiter;
 use super::routing::{
@@ -501,6 +501,8 @@ pub struct AsyncTcpMessageBus<S: AsyncStream = AsyncSocket> {
     /// because a reply's commission report goes to the request alone, not to
     /// the order update stream. Pruned when the request is cleaned up.
     executions_requested: Arc<SenderHash<String>>,
+    /// This client's live fills still waiting for their commission report.
+    live_executions: LiveExecutions,
     shared_channels: SharedChannels,
     /// The order-update stream and the per-order status streams. A std lock
     /// inside, like the registries', so shutdown can close it from `Drop`.
@@ -577,6 +579,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             orders: Arc::new(SenderHash::new()),
             executions: Arc::new(SenderHash::new()),
             executions_requested: Arc::new(SenderHash::new()),
+            live_executions: LiveExecutions::default(),
             shared_channels: SharedChannels::new(|request| ChannelClass::of_shared(request).capacity(channel_capacity)),
             order_taps,
             channel_capacity,
@@ -885,6 +888,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         // Aliases of the routes just failed.
         self.executions.clear();
         self.executions_requested.clear();
+        self.live_executions.clear();
         // Shared channels too, mirroring sync's `fail_all`: an in-flight
         // open_orders/positions subscription awaits an end marker only the
         // pre-reconnect request could produce, so it would hang forever.
@@ -998,6 +1002,9 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             OrderRoutingStrategy::OrderUpdateOnly => {}
             OrderRoutingStrategy::ExecutionData => {
                 let execution_id = message.execution_id();
+                if let Some(execution_id) = &execution_id {
+                    self.live_executions.insert(execution_id);
+                }
                 let unrouted = match message_order_id {
                     Some(id) => self.orders.deliver_aliased(&id, message.into(), execution_id.as_ref(), &self.executions),
                     None => Err(message.into()),
@@ -1026,17 +1033,17 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                 }
             }
             OrderRoutingStrategy::ByExecutionId => match message.execution_id() {
-                // A commission report in an `executions` reply goes to that
-                // request alone; a live fill's is copied to the update stream
-                // and follows its execution to the order route.
+                // A live fill's report goes to the update stream and follows
+                // its execution to the order route, and to any request that
+                // listed the fill. Any other report answers an `executions`
+                // reply and goes to that request alone.
                 Some(execution_id) => {
-                    if let Err(item) = self.executions_requested.deliver(&execution_id, message.clone().into()) {
-                        let routed = self.send_order_update(&message);
-                        if let Err(item) = self.executions.deliver(&execution_id, item) {
-                            if !routed {
-                                warn!("could not route commission report {item:?}");
-                            }
-                        }
+                    let live = self.live_executions.take(&execution_id);
+                    let requested = self.executions_requested.deliver(&execution_id, message.clone().into()).is_ok();
+                    let routed = live && self.send_order_update(&message);
+                    let delivered = live && self.executions.deliver(&execution_id, message.clone().into()).is_ok();
+                    if !(requested || routed || delivered) {
+                        debug!("commission report answers no live fill or request: {message:?}");
                     }
                 }
                 None => {
