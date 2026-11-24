@@ -246,6 +246,14 @@ impl Client {
     /// Submits an [`crate::orders::Order`] using [Client] for the given [Contract].
     /// Upon successful submission, the client will start receiving events related to the order's activity via the subscription, including order status updates and execution reports.
     ///
+    /// The subscription keeps receiving the order's events after
+    /// [`cancel_order`](Self::cancel_order) or a modify (another `place_order`
+    /// with the same ID): each opens its own subscription beside this one, and
+    /// every subscription on the order ID receives each event once. After a
+    /// cancel, this subscription yields the `Cancelled` status and the 202
+    /// notice too, as well as fills and commission reports that arrive after
+    /// the cancel was sent.
+    ///
     /// # Arguments
     /// * `order_id` - ID for [`crate::orders::Order`]. Get next valid ID using [Client::next_order_id].
     ///   The client's order-ID generator moves past this ID and every ID the order carries
@@ -306,6 +314,12 @@ impl Client {
     /// [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem);
     /// the subscription stays open until dropped, so break once cancellation
     /// is observed.
+    ///
+    /// The order's [`place_order`](Self::place_order) subscription, if one is
+    /// open, keeps receiving the order's events. Both subscriptions yield the
+    /// order's statuses, `Cancelled` included, and the 202 notice; fills and
+    /// commission reports reach only the `place_order` subscription, since
+    /// [`CancelOrder`] has no variant for them.
     ///
     /// Sends an immediate cancel with default [`OrderCancel`] fields (no manual cancel
     /// time, operator ID or manual order indicator). To set any of them, use

@@ -1028,3 +1028,17 @@ and no longer matches. A serialized `Contract` with one of these types writes `"
 or `"EventContract"` where it wrote `{"Other":"IOPT"}`, and JSON written by 5.x for them still
 deserializes as `Other`, which compares unequal to the new variant; re-parse with
 `t.as_str().parse()` to normalize.
+
+### 44. A cancel or modify no longer ends the order's earlier subscription
+
+5.x kept one subscription per order ID: `cancel_order`, or a modify through another
+`place_order` with the same ID, replaced the earlier subscription, which ended at once. Fills
+that arrived after the cancel went only to `order_update_stream`. Every subscription on the ID
+now stays live and receives each of the order's frames once.
+
+- **After `cancel_order`**: the `place_order` subscription yields the `Cancelled` status, the
+  202 notice, and any fills and commission reports that follow. The `cancel_order` subscription
+  yields the same statuses and notice. Code that stopped reading the `place_order` subscription
+  because it ended, and read the outcome from the cancel, can read both from it.
+- **After a modify**: the earlier `place_order` subscription keeps yielding the order's events
+  beside the new one. Drop the subscription you no longer read.
