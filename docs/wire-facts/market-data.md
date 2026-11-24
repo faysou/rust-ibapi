@@ -116,6 +116,12 @@ server 223.*
   live updates"; crypto `TRADES` draws 10299 (use AGGTRADES). Without real-time permission (ES,
   DAX and ESTX50 indices) and for AAPL and NVDA overnight, TWS sends the batch and then no update
   and no error.
+- **Batch, then nothing** (*11:23 UTC, ES Dec 26 TRADES 1-minute, no real-time permission*): the
+  batch's 30 bars ended with the 21:59 UTC bar of the previous day, the last before CME's
+  daily break, followed by the batch end and no update in 150 s. `BarCompletion::apply` left
+  that bar forming; `BarCompletion::expire` with a 10 s grace completed it at once. EUR.USD
+  MIDPOINT on the same connection: updates completed each bar 0.3 to 0.5 s after its end, and
+  `expire` with a 10 s grace never fired.
 - Settles `historical::BarCompletion`: a bar is final when
   an update for it arrives after its end, or when an update for a later bar arrives.
 - **Not probed:** a session end (the last bar before a close or the FX daily break); RTH-only

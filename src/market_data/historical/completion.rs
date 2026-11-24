@@ -37,7 +37,8 @@ pub enum StreamedBar {
 ///
 /// The initial batch's bars are complete except the last, which may still be forming: it is
 /// [`Forming`](StreamedBar::Forming) until the first update. A bar no update follows, such as
-/// the last one before TWS stops sending, is never completed.
+/// the last one before TWS stops sending, stays forming; [`expire`](BarCompletion::expire)
+/// completes it once the local clock is past its end plus a grace the caller chooses.
 ///
 /// Updates for a bar already completed are dropped. Reuse one `BarCompletion` across a
 /// resubscription: the new batch replays the bars already completed, and they are not
@@ -198,6 +199,71 @@ impl BarCompletion {
         items
     }
 
+    /// Completes the forming bar if the local clock has passed its end plus `grace`; `None`
+    /// otherwise.
+    ///
+    /// For a bar that no later update completes. Live, TWS sent the batch and then no update
+    /// at all for contracts without real-time permission (ES futures, DAX and ESTX50 indices)
+    /// and for AAPL and NVDA overnight, so [`apply`](Self::apply) left the batch's last bar
+    /// forming for good: for ES at 11:23 UTC, the 21:59 UTC bar of the day before
+    /// (2026-11-24, server 223). Whether TWS sends a final update for the last bar before a
+    /// session close is not probed.
+    ///
+    /// The bar is completed with the last values received, which are final only if TWS sent
+    /// its last update for the bar. TWS sent that update 0.3 to 2.6 s after a 1-minute bar ended,
+    /// so a `grace` below about 3 s can complete a bar before its final values arrive. An update
+    /// for the bar after `expire` completed it is dropped, so no bar is completed twice. Daily
+    /// and longer bars have no end to expire at ([`forming_end`](Self::forming_end) is `None`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::market_data::historical::{Bar, BarCompletion, BarSize, BarTimestamp, HistoricalBarUpdate};
+    /// use time::macros::datetime;
+    ///
+    /// let mut completion = BarCompletion::new(BarSize::Min);
+    /// let bar = Bar { date: BarTimestamp::DateTime(datetime!(2026-04-14 9:31 UTC)), ..Bar::default() };
+    /// completion.apply(HistoricalBarUpdate::Historical(vec![bar]));
+    ///
+    /// // Long after 9:32, with no update since the batch, the forming bar completes.
+    /// assert_eq!(completion.expire(time::Duration::seconds(10)), Some(bar));
+    /// assert_eq!(completion.expire(time::Duration::seconds(10)), None);
+    /// ```
+    pub fn expire(&mut self, grace: time::Duration) -> Option<Bar> {
+        self.expire_at(grace, OffsetDateTime::now_utc())
+    }
+
+    fn expire_at(&mut self, grace: time::Duration, now: OffsetDateTime) -> Option<Bar> {
+        if self.forming_end().is_none_or(|end| now < end + grace) {
+            return None;
+        }
+        let bar = self.forming.take()?;
+        self.completed_through = Some(bar.date);
+        Some(bar)
+    }
+
+    /// The end of the forming bar, its start plus the bar size; `None` when no bar is forming or
+    /// for daily and longer bars, whose end follows the trading session.
+    ///
+    /// The time to call [`expire`](Self::expire) is this end plus the grace passed to it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::market_data::historical::{Bar, BarCompletion, BarSize, BarTimestamp, HistoricalBarUpdate};
+    /// use time::macros::datetime;
+    ///
+    /// let mut completion = BarCompletion::new(BarSize::Min);
+    /// assert_eq!(completion.forming_end(), None);
+    ///
+    /// let bar = Bar { date: BarTimestamp::DateTime(datetime!(2026-04-14 9:31 UTC)), ..Bar::default() };
+    /// completion.apply(HistoricalBarUpdate::Historical(vec![bar]));
+    /// assert_eq!(completion.forming_end(), Some(datetime!(2026-04-14 9:32 UTC)));
+    /// ```
+    pub fn forming_end(&self) -> Option<OffsetDateTime> {
+        self.end(&self.forming?)
+    }
+
     fn is_new(&self, bar: &Bar) -> bool {
         self.completed_through.is_none_or(|through| bar.date > through)
     }
@@ -210,9 +276,13 @@ impl BarCompletion {
     }
 
     fn has_ended(&self, bar: &Bar, now: OffsetDateTime) -> bool {
+        self.end(bar).is_some_and(|end| now >= end)
+    }
+
+    fn end(&self, bar: &Bar) -> Option<OffsetDateTime> {
         match (bar.date, self.span) {
-            (BarTimestamp::DateTime(start), Some(span)) => now >= start + span,
-            _ => false,
+            (BarTimestamp::DateTime(start), Some(span)) => Some(start + span),
+            _ => None,
         }
     }
 }
