@@ -266,6 +266,12 @@ fn rejection_ends_request_only_for_verified_codes() {
             Some(200),
             162,
         ),
+        case(
+            "HistoricalDataFrame, keep_up_to_date",
+            |code| rejection_ends_with::<HistoricalDataFrame>(code, &DecoderContext::default().with_keep_up_to_date(true)),
+            Some(321),
+            162,
+        ),
         case("PnL", rejection_ends::<PnL>, Some(321), 200),
         case("PnLSingle", rejection_ends::<PnLSingle>, Some(321), 200),
         case("Vec<ScannerData>", rejection_ends::<Vec<ScannerData>>, Some(162), 309),
@@ -288,4 +294,17 @@ fn rejection_ends_request_only_for_verified_codes() {
     for code in [162, 200, 10197, 10314] {
         assert!(rejection_ends::<HistoricalDataFrame>(code), "one-shot HistoricalDataFrame: {code}");
     }
+}
+
+/// Only the historical bar decoders read on after 10299: TWS sends their series anyway. Another
+/// terminal code still ends them, and other decoders still end on 10299.
+#[test]
+fn error_continues_request_only_for_10299_on_historical_bars() {
+    use crate::market_data::historical::HistoricalDataFrame;
+    use crate::market_data::realtime::TickTypes;
+
+    let continues = |hook: fn(&Notice) -> bool, code| hook(&Notice::synthesized(code, String::new()));
+    assert!(continues(HistoricalDataFrame::error_continues_request, 10299));
+    assert!(!continues(HistoricalDataFrame::error_continues_request, 162));
+    assert!(!continues(TickTypes::error_continues_request, 10299));
 }

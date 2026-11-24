@@ -26,7 +26,9 @@ use time::{Date, OffsetDateTime};
 
 use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
-use crate::messages::{IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE};
+use crate::messages::{
+    IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE, WHAT_TO_SHOW_SUBSTITUTED_CODE,
+};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
@@ -655,10 +657,19 @@ impl StreamDecoder<HistoricalDataFrame> for HistoricalDataFrame {
 
     /// Without `keep_up_to_date`, any error: a one-shot query has nothing to
     /// continue after one. Verified live for 162, 200 and 10314, where TWS
-    /// answers a cancel with 366 (no query found). With it, only 200, after
+    /// answers a cancel with 366 (no query found). With it, only 200, or 321
+    /// ("Source price not supported with live updates", AGGTRADES), after
     /// which TWS answers the cancel with 366.
     fn rejection_ends_request(notice: &Notice, context: &DecoderContext) -> bool {
-        !context.keep_up_to_date || notice.code == NO_SECURITY_DEFINITION_CODE
+        !context.keep_up_to_date || matches!(notice.code, NO_SECURITY_DEFINITION_CODE | REQUEST_VALIDATION_CODE)
+    }
+
+    /// Live: after 10299 TWS sends the bars of the series the error names
+    /// (AGGTRADES for crypto `TRADES`, TRADES for AGGTRADES on stocks and
+    /// futures), then the window. With `keep_up_to_date` it streams the
+    /// updates too, and a later cancel draws 162.
+    fn error_continues_request(notice: &Notice) -> bool {
+        notice.code == WHAT_TO_SHOW_SUBSTITUTED_CODE
     }
 }
 

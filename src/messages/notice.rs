@@ -65,6 +65,11 @@ pub(crate) const HMDS_ERROR_CODE: i32 = 162;
 /// "Error validating request" (e.g. an invalid account code).
 pub(crate) const REQUEST_VALIDATION_CODE: i32 = 321;
 
+/// "Expected what to show is AGGTRADES, please use that instead of TRADES" (or the reverse
+/// for non-crypto). On a historical bar request TWS goes on with the `whatToShow` it names
+/// and sends that series (`docs/wire-facts/market-data.md#10299-whattoshow-substitution`).
+pub(crate) const WHAT_TO_SHOW_SUBSTITUTED_CODE: i32 = 10299;
+
 /// Range of error codes that are considered warnings: the whole `21xx` band.
 ///
 /// IB's published table stops at 2169, but the gateway keeps adding codes above
