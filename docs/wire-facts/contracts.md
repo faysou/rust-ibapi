@@ -110,6 +110,60 @@ contract_details.*
   200), bonds, and whether a date-alone contract gains a time once its expiry enters the
   listed week.
 
+*Live 2026-11-24 04:15-04:45 ET off-hours (Thanksgiving week), paper TWS, server 223;
+contract_details per exchange, every contract of one expiry. #1276 follow-up.*
+
+The last trade time compared with the requested exchange's own `tradingHours` on an expiry
+date inside the listed week (20261124, 20261125 or 20261127; 20261127 is a half day):
+
+| Contract | Exchange | `lastTradeTime` | `timeZoneId` | `tradingHours` on the expiry date | Stated in |
+| --- | --- | --- | --- | --- | --- |
+| AAPL OPT 20261127 | SMART, AMEX | `13:15:00` | `US/Eastern` | `0930-1315` | New York |
+| AAPL OPT 20261127 | PHLX, ISE, BOX, NASDAQOM, MIAX, BATS, EDGX, GEMINI, EMERALD, PEARL | `13:15:00` | `US/Eastern` | `0930-1300` | New York |
+| AAPL, MSFT, TSLA, QQQ, IWM OPT 20261127 | CBOE | `13:15:00` | `US/Central` | `0830-1215` | New York |
+| AAPL OPT 20261127 | CBOE2 | `13:15:00` | `US/Central` | `0830-1200` | New York |
+| AAPL OPT 20261127 | PSE | `13:15:00` | `US/Pacific` | `0630-1000` | New York |
+| SPY OPT 20261124 | CBOE | `16:15:00` | `US/Central` | `0830-1515` | New York |
+| SPY OPT 20261124, 20261125 | SMART, AMEX | `16:15:00` | `US/Eastern` | `0930-1615` | New York |
+| SPXW OPT 20261124 | CBOE, SMART | `15:00:00` | `US/Central` | `0830-1500` | Chicago |
+| SPXW OPT 20261127 | CBOE | `12:00:00` | `US/Central` | `0830-1200` | Chicago |
+| XSP, RUTW OPT 20261124 | CBOE | `15:00:00` | `US/Central` | `0830-1500` | Chicago |
+| OEX, XEO OPT 20261127 | CBOE | `12:15:00` | `US/Central` | `0830-1215` | Chicago |
+| VIXW OPT 20261130 | CBOE | `15:15:00` | `US/Central` | `0830-1515` | Chicago |
+| NDXP OPT 20261124, 20261127 | SMART, ISE | `16:00:00`, `13:00:00` | `US/Eastern` | `0930-1600`, `0930-1300` | New York |
+| ES FOP E4B, E4C, EW4 | CME | `15:00:00`, `15:00:00`, `12:00:00` | `US/Central` | ends `1500`, `1500`, `1200` | Chicago |
+| 6E FOP 4EU 20261127 | CME | `09:00:00` | `US/Central` | ends `0900` | Chicago |
+| ZC FOP 20261127 | CBOT | `12:00:00` | `US/Central` | `0830-1200` | Chicago |
+| CL FOP 20261124, 20261127 | NYMEX | `14:30:00` | `US/Eastern` | ends `1430` | New York |
+| GC FOP OG 20261124 | COMEX | `13:30:00` | `US/Eastern` | ends `1330` | New York |
+| OESX, OEXP 20261124, 20261127 | EUREX | `12:00:00`, `17:30:00` | `MET` | ends `1200`, `1730` | `MET` |
+
+- Every option whose underlying is a US stock or ETF (`underSecType` `STK`) states its last
+  trade time in New York time on all 15 exchanges probed. CBOE and CBOE2 label it
+  `US/Central` and PSE `US/Pacific`, so localizing it with `timeZoneId` puts the expiry one or
+  three hours late.
+  Everything else seen states it in `timeZoneId`: index options on CBOE (SPX, SPXW, XSP,
+  RUT, OEX, XEO, VIX), Nasdaq index options, CME, CBOT, NYMEX and COMEX futures options, and
+  EUREX. Options on non-US stocks state their exchange's zone (SAP on EUREX `17:30:00 MET`, RY
+  on CDE `16:00:00 US/Eastern`, VOD on ICEEU `16:30:00 GB-Eire`); none was in the listed week.
+- Compare with `tradingHours`, not `liquidHours`: on SMART, AAPL's liquid session on
+  20261127 ends at `1300` while its trading session and last trade time end at `1315`.
+  Exchange sessions do not pin the time either: most US option exchanges end the half day at
+  13:00 New York against the contracts' `13:15:00`, and their regular liquid sessions at
+  16:00 (AMEX 16:15).
+- A date alone (no time) comes for standard monthly and quarterly options on US stocks and
+  ETFs on every exchange (AAPL, TSLA, MSFT 20261218; SPY 20261218 and 20261231), none in the
+  listed week, so no session can stand in for the time. The exchange sessions near them close
+  at 16:00 or 16:15 New York depending on the exchange, which is the uncertainty a fallback
+  would carry.
+- An expired contract TWS still lists sends neither: VIXW 20261123, queried on 20261124,
+  has empty `lastTradeTime` and empty `timeZoneId`. AAPL 20261120 drew 200.
+- Reply times for one expiry, every strike: 0.2-14 s (SPY 20261231 on CBOE, 650 contracts,
+  13.6 s; SPXW 20261124 on CBOE, 702 contracts, 1.6 s).
+- **Not probed:** a date-alone expiry inside the listed week (the next is 20261218), options
+  on US stocks quoted outside CBOE, CBOE2 and PSE in a non-Eastern zone, and index options
+  listed on an exchange whose zone differs from the index's home.
+
 ### Open-order echo of `lastTradeDateOrContractMonth` (tag 4)
 
 *Live 2026-11-14 weekend, paper Gateway, server 226; #1214.*
