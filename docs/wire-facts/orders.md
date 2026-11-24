@@ -162,6 +162,20 @@ Placement, echoes, status, executions and completed orders. Format: [README](REA
   reachable (`last_n_days` above 7 returns nothing), so whether TWS applies the "within the
   past week" in IB's `ExecutionFilter.proto` to `specific_dates` is not known.
 
+### Executions: request id on replies and live fills
+
+*Live 2026-11-23 23:56Z off-hours, paper TWS, server 223; EUR.USD BUY 20,000 MKT, then
+`executions(ExecutionFilter::default())`.*
+
+- The live `ExecutionData` frame carried request id -1; the same execution in the
+  `executions` reply carried the request's id (`1500000000`). The request id alone tells a
+  reply from a live fill.
+- The reply carried a commission report for each execution, other clients' executions
+  included. A commission report carries no request id or client id, so only the execution id
+  links it to its execution.
+- **Not probed:** whether a reply can carry an execution's commission report before the live
+  commission report for that execution arrives.
+
 ### `Execution.time` rendering
 
 *Live 2026-11-11 overnight (02:17Z to 03:09Z), paper Gateway, server 226; #1225.*
