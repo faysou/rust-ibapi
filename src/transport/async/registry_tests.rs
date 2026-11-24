@@ -1,5 +1,5 @@
 use super::*;
-use crate::client::ids::RequestId;
+use crate::client::ids::{OrderId, RequestId};
 use crate::transport::common::Lease;
 use crate::transport::BufferBound;
 
@@ -58,6 +58,44 @@ fn deliver_hands_the_item_back_when_unrouted() {
     let routes = SenderHash::<RequestId>::new();
     let item = routes.deliver(&RequestId::nth(1), RoutedItem::Error(Error::Cancelled));
     assert!(matches!(item, Err(RoutedItem::Error(Error::Cancelled))));
+}
+
+/// Two subscriptions under one key both receive each item; registering a
+/// lease again replaces its route instead of adding a second.
+#[test]
+fn insert_keeps_other_leases_and_replaces_the_same_lease() {
+    let routes = SenderHash::new();
+    let (first, mut first_receiver, _first_lease) = route();
+    let (second, mut second_receiver, second_lease) = route();
+    let (sender, mut second_again_receiver) = broadcast::channel(8);
+    routes.insert(OrderId::from(7), first);
+    routes.insert(OrderId::from(7), second);
+    routes.insert(OrderId::from(7), Route::unbounded(sender, second_lease.downgrade()));
+
+    routes.deliver(&OrderId::from(7), RoutedItem::Error(Error::Cancelled)).unwrap();
+
+    let counts = [
+        items(&mut first_receiver).len(),
+        items(&mut second_receiver).len(),
+        items(&mut second_again_receiver).len(),
+    ];
+    assert_eq!(counts, [1, 0, 1]);
+}
+
+/// Removing one subscription's route leaves the others under the key.
+#[test]
+fn remove_if_same_keeps_the_other_routes_under_the_key() {
+    let routes = SenderHash::new();
+    let (first, _first_receiver, first_lease) = route();
+    let (second, mut second_receiver, _second_lease) = route();
+    routes.insert(OrderId::from(7), first);
+    routes.insert(OrderId::from(7), second);
+
+    routes.remove_if_same(OrderId::from(7), &first_lease.downgrade());
+    routes.deliver(&OrderId::from(7), RoutedItem::Error(Error::Cancelled)).unwrap();
+
+    assert_eq!(items(&mut second_receiver).len(), 1);
+    assert_eq!(routes.len(), 1);
 }
 
 #[test]
