@@ -192,3 +192,57 @@ fn span_of_each_bar_size() {
         assert_eq!(span(bar_size), seconds.map(time::Duration::seconds), "{bar_size}");
     }
 }
+
+fn forming_batch_bar() -> BarCompletion {
+    let mut completion = BarCompletion::new(BarSize::Min);
+    completion.apply_at(
+        HistoricalBarUpdate::Historical(vec![bar(datetime!(2026-11-24 9:15 UTC), 2.0), bar(datetime!(2026-11-24 9:16 UTC), 3.0)]),
+        datetime!(2026-11-24 9:16:34 UTC),
+    );
+    completion
+}
+
+// Live: without real-time permission TWS sent the batch and then no update, leaving the batch's
+// last bar forming.
+#[test]
+fn expire_completes_the_forming_bar_once_past_its_end_plus_grace() {
+    let mut completion = forming_batch_bar();
+    let grace = time::Duration::seconds(10);
+
+    let end = completion.forming_end();
+    let early = completion.expire_at(grace, datetime!(2026-11-24 9:17:09.999 UTC));
+    let due = completion.expire_at(grace, datetime!(2026-11-24 9:17:10 UTC));
+    let again = completion.expire_at(grace, datetime!(2026-11-24 9:18:00 UTC));
+
+    assert_eq!(end, Some(datetime!(2026-11-24 9:17 UTC)));
+    assert_eq!(early, None);
+    assert_eq!(due, Some(bar(datetime!(2026-11-24 9:16 UTC), 3.0)));
+    assert_eq!(again, None, "a completed bar is not completed twice");
+    assert_eq!(completion.forming_end(), None);
+}
+
+#[test]
+fn update_for_an_expired_bar_is_dropped() {
+    let mut completion = forming_batch_bar();
+    completion.expire_at(time::Duration::seconds(10), datetime!(2026-11-24 9:17:10 UTC));
+
+    let late = completion.apply_at(update(bar(datetime!(2026-11-24 9:16 UTC), 3.5)), datetime!(2026-11-24 9:17:11 UTC));
+    let next = completion.apply_at(update(bar(datetime!(2026-11-24 9:17 UTC), 4.0)), datetime!(2026-11-24 9:17:15 UTC));
+
+    assert_eq!(late, Vec::new());
+    assert_eq!(next, vec![StreamedBar::Forming(bar(datetime!(2026-11-24 9:17 UTC), 4.0))]);
+}
+
+#[test]
+fn expire_leaves_a_daily_bar_forming() {
+    let mut completion = BarCompletion::new(BarSize::Day);
+    completion.apply_at(
+        HistoricalBarUpdate::Historical(vec![daily(date!(2026 - 11 - 24), 3.0)]),
+        datetime!(2026-11-24 9:16:34 UTC),
+    );
+
+    let expired = completion.expire_at(time::Duration::seconds(10), datetime!(2026-12-24 0:00 UTC));
+
+    assert_eq!(expired, None);
+    assert_eq!(completion.forming_end(), None);
+}
