@@ -874,9 +874,7 @@ The compiler finds every use as `f64`. It doesn't catch the serialized form: `Ba
 marks both fields nullable. JSON written by 5.x still deserializes, with a stored `0` read as
 `Some(0.0)`.
 
-`count` stays `i32` and is `-1` on a non-TRADES bar, as TWS sends it. The historical `Bar`
-(`market_data::historical::Bar`) is unchanged: TWS sends `-1` for its volume, WAP and count on
-non-TRADES bars rather than leaving them out, so they stay `f64` and `i32`.
+`count`, and the historical `Bar`'s volume, WAP and count, follow in [§44](#44-bar-volume-wap-and-count-are-none-on-a-non-trades-bar).
 
 ### 39. Tick-by-tick and historical ticks share `TickLast`, `TickBidAsk` and `TickMidpoint`
 
@@ -1028,3 +1026,35 @@ and no longer matches. A serialized `Contract` with one of these types writes `"
 or `"EventContract"` where it wrote `{"Other":"IOPT"}`, and JSON written by 5.x for them still
 deserializes as `Other`, which compares unequal to the new variant; re-parse with
 `t.as_str().parse()` to normalize.
+
+### 44. Bar volume, WAP and count are `None` on a non-TRADES bar
+
+A bar that isn't `WhatToShow::Trades` (MIDPOINT, BID, ASK, ...) has no traded volume. TWS sends
+its volume, WAP and trade count as `-1`, or leaves them out. For a contract with a price
+magnifier, it sends the WAP as `-1` times the magnifier (`-100` for a CBOT corn option).
+
+- **Historical `Bar`** (`market_data::historical::Bar`): `volume` and `wap` are `Option<f64>`
+  instead of `f64`, and `count` is `Option<i32>` instead of `i32`. 5.x stored the `-1` values.
+- **Realtime `Bar`**: `count` is `Option<i32>` instead of `i32`. `volume` and `wap` were already
+  `Option<f64>` (§38), but a `-1` from TWS decoded as `Some(-1.0)`. It is now `None`.
+
+All three are `None` on a non-TRADES bar. A TRADES bar with no volume, such as an index's, still
+has `Some(0.0)`.
+
+```rust,ignore
+// 5.x
+if bar.volume >= 0.0 {
+    println!("volume {} vwap {:.2} trades {}", bar.volume, bar.wap, bar.count);
+}
+
+// 6.0
+if let (Some(volume), Some(wap), Some(count)) = (bar.volume, bar.wap, bar.count) {
+    println!("volume {volume} vwap {wap:.2} trades {count}");
+}
+let volume = bar.volume.unwrap_or(0.0); // where a missing volume should read as zero
+```
+
+The compiler finds every use as `f64` or `i32`. It doesn't catch the serialized form: both `Bar`
+types derive `Serialize` / `Deserialize`, and a missing value now serializes as `null`. JSON
+written by 5.x still deserializes, but a stored `-1` reads as `Some(-1.0)` or `Some(-1)`, not
+`None`. The `utoipa` schemas mark the fields nullable.

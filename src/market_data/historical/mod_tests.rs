@@ -253,9 +253,9 @@ fn trim_bar(date: BarTimestamp) -> Bar {
         high: 1.0,
         low: 1.0,
         close: 1.0,
-        volume: 0.0,
-        wap: 0.0,
-        count: 0,
+        volume: Some(0.0),
+        wap: Some(0.0),
+        count: Some(0),
     }
 }
 
@@ -331,6 +331,6 @@ fn bar_default_is_zero_at_epoch_with_no_count() {
         count,
     } = Bar::default();
     assert_eq!(date, BarTimestamp::DateTime(OffsetDateTime::UNIX_EPOCH));
-    assert_eq!((open, high, low, close, volume, wap), (0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
-    assert_eq!(count, NO_BAR_COUNT);
+    assert_eq!((open, high, low, close), (0.0, 0.0, 0.0, 0.0));
+    assert_eq!((volume, wap, count), (None, None, None));
 }
