@@ -3,7 +3,7 @@ use std::mem;
 use std::time::{Duration, Instant};
 
 use super::{CommissionAndFeesReport, ExecutionData, Executions};
-use crate::contracts::{ComboLeg, SecurityType};
+use crate::contracts::{ComboLeg, LegAction, SecurityType};
 
 /// An execution with its commission report, joined by `execution_id`; for a combo, the
 /// combo-level execution with the fills of its legs.
@@ -41,6 +41,77 @@ pub struct Fill {
     /// execution: security type [`Spread`](crate::contracts::SecurityType::Spread), the combo's
     /// quantity and net price, and no commission. Empty for any other fill.
     pub legs: Vec<Fill>,
+}
+
+impl Fill {
+    /// The combo legs of a combo fill, one per leg execution, sorted by contract id; empty for
+    /// any other fill.
+    ///
+    /// The combo-level execution carries the per-exchange placeholder BAG contract without its
+    /// legs, so these legs are what identify the combo. Each is derived from its leg execution
+    /// in this fill alone:
+    ///
+    /// - **Ratio**: the leg's shares in this fill over the combo-level execution's shares. TWS
+    ///   sizes each leg execution of a partial fill to that fill (2 combos of a 1x2 fill the
+    ///   ratio-2 leg with 4), so a partial fill gives the order's ratio.
+    /// - **Action**: [`Buy`](LegAction::Buy) for a leg executed on the combo execution's side,
+    ///   [`Sell`](LegAction::Sell) for the other side. That is the leg's action as the combo
+    ///   order lists it, whether the combo was bought or sold: a sold calendar whose order buys
+    ///   the back month executes a sale of the back month, and that leg comes back as `Buy`.
+    /// - **Exchange**: the leg contract's exchange as the execution reports it.
+    /// - **Contract id**: the leg contract's. Other fields keep their defaults.
+    ///
+    /// The order echoes TWS sends (`open_orders`, `completed_orders`) list a combo's legs
+    /// sorted by contract id, so the result compares with an echo's `contract.combo_legs`
+    /// leg by leg (live, 14 ES combo fills: 2026-11-24, server 223;
+    /// `docs/wire-facts/orders.md#combo-bag-executions-and-commissions`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::{Contract, LegAction};
+    /// use ibapi::orders::{Execution, ExecutionData, ExecutionSide, Fill};
+    ///
+    /// let execution = |contract_id, side, shares| ExecutionData {
+    ///     contract: Contract { contract_id, exchange: "CME".into(), ..Default::default() },
+    ///     execution: Execution { side, shares, ..Default::default() },
+    ///     ..Default::default()
+    /// };
+    /// let leg = |contract_id, side, shares| Fill { execution: execution(contract_id, side, shares), commission: None, legs: Vec::new() };
+    ///
+    /// // Two 1x2 calendars sold: the executions sell 4 of the back month and buy 2 of the front
+    /// // month, so the order buys the back month at ratio 2 and sells the front month.
+    /// let fill = Fill {
+    ///     execution: execution(16472979, ExecutionSide::Sold, 2.0),
+    ///     commission: None,
+    ///     legs: vec![leg(649180695, ExecutionSide::Sold, 4.0), leg(495512563, ExecutionSide::Bought, 2.0)],
+    /// };
+    ///
+    /// let legs = fill.combo_legs();
+    /// assert_eq!((legs[0].contract_id, legs[0].ratio, legs[0].action), (495512563, 1, LegAction::Sell));
+    /// assert_eq!((legs[1].contract_id, legs[1].ratio, legs[1].action), (649180695, 2, LegAction::Buy));
+    /// assert_eq!(legs[1].exchange, "CME");
+    /// ```
+    pub fn combo_legs(&self) -> Vec<ComboLeg> {
+        let combo = &self.execution.execution;
+        let mut legs: Vec<ComboLeg> = self
+            .legs
+            .iter()
+            .map(|leg| ComboLeg {
+                contract_id: leg.execution.contract.contract_id,
+                ratio: (leg.execution.execution.shares / combo.shares).round() as i32,
+                action: if leg.execution.execution.side == combo.side {
+                    LegAction::Buy
+                } else {
+                    LegAction::Sell
+                },
+                exchange: leg.execution.contract.exchange.to_string(),
+                ..ComboLeg::default()
+            })
+            .collect();
+        legs.sort_by_key(|leg| leg.contract_id);
+        legs
+    }
 }
 
 /// Executions and commission reports that found no partner, in arrival order, and combo fills

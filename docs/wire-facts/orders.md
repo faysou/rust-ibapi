@@ -137,6 +137,14 @@ fills, each read on `place_order`, `order_update_stream` and `executions`. Guard
   contracts (ES futures or options). Every execution with a combo order's `perm_id` was a
   combo-level execution or a leg of one: the orders filled in 2 and 3 parts gave 2 and 3 such
   groups, one per second field. The 14 missing reports were the combo-level executions'.
+- **Legs against the order echo** (*live 2026-11-24 11:20 UTC, paper TWS, server 223,
+  `last_n_days` 7*): for each of the 14 combo fills, the legs `Fill::combo_legs` derives (ratio
+  = leg shares / combo shares, `Buy` when the leg executed on the combo execution's side) equal
+  the legs TWS echoed on that order's `openOrder` frames when it was placed (contract id, ratio
+  and action; 1x1 and 1x2 ES calendars and an ES put vertical, bought and sold, fills of 1, 2
+  and 3 parts). Each leg execution's contract carried exchange `CME`, as the echo's legs do.
+  `completed_orders` no longer listed those orders; it listed one cancelled ES calendar order,
+  legs sorted by contract id with ratio 1 and `CME`.
 - **Executions missing once**: on one fill (1 of a 4-lot market sell, 23:26:39 UTC) the client
   got the two leg reports on both streams but none of the three executions; the OrderStatus
   for the fill came 8 s later with `last_fill_price` 0, and `executions` afterwards listed all
