@@ -3,8 +3,10 @@ use std::mem;
 use std::time::{Duration, Instant};
 
 use super::{CommissionAndFeesReport, ExecutionData, Executions};
+use crate::contracts::{ComboLeg, SecurityType};
 
-/// An execution with its commission report, joined by `execution_id`.
+/// An execution with its commission report, joined by `execution_id`; for a combo, the
+/// combo-level execution with the fills of its legs.
 ///
 /// Built by [`FillMatcher`].
 ///
@@ -19,6 +21,7 @@ use super::{CommissionAndFeesReport, ExecutionData, Executions};
 ///         ..Default::default()
 ///     },
 ///     commission: Some(CommissionAndFeesReport { execution_id: "0000e1a7.0001.01".to_string(), commission_and_fees: 1.25, ..Default::default() }),
+///     legs: Vec::new(),
 /// };
 /// let fees = fill.commission.as_ref().map(|report| report.commission_and_fees);
 /// println!("{} shares, commissions and fees {fees:?}", fill.execution.execution.shares);
@@ -32,9 +35,15 @@ pub struct Fill {
     /// for this execution (see [`FillMatcher::expects_report`]), or when the execution came
     /// from [`FillMatcher::take_expired`].
     pub commission: Option<CommissionAndFeesReport>,
+    /// For a combo fill ([`FillMatcher::add_combo`]), the fills of the combo's legs in arrival
+    /// order, each with its own commission report. `execution` is then the combo-level
+    /// execution: security type [`Spread`](crate::contracts::SecurityType::Spread), the combo's
+    /// quantity and net price, and no commission. Empty for any other fill.
+    pub legs: Vec<Fill>,
 }
 
-/// Executions and commission reports that found no partner, in arrival order.
+/// Executions and commission reports that found no partner, in arrival order, and combo fills
+/// the matcher stopped waiting to complete.
 ///
 /// Returned by [`FillMatcher::take_expired`] and [`FillMatcher::pair_executions`].
 ///
@@ -59,6 +68,11 @@ pub struct Unpaired {
     pub executions: Vec<ExecutionData>,
     /// Commission reports whose execution did not arrive.
     pub reports: Vec<CommissionAndFeesReport>,
+    /// Parts of combo fills ([`FillMatcher::add_combo`]) handed out incomplete: a combo fill
+    /// with the legs that arrived, or, when the combo-level execution did not arrive, each leg
+    /// fill on its own. Also a combo fill that a leg handed out here without its report
+    /// completed.
+    pub fills: Vec<Fill>,
 }
 
 /// What [`FillMatcher::push_report`] did with a commission report.
@@ -73,6 +87,7 @@ pub struct Unpaired {
 /// match matcher.push_report(report) {
 ///     ReportMatch::Paired(fill) => println!("fill: {fill:?}"),
 ///     ReportMatch::Waiting => println!("execution not seen yet"),
+///     ReportMatch::ComboPending => println!("leg paired, the combo fill is not complete"),
 ///     ReportMatch::Late(report) => println!("execution already handed out without it: {report:?}"),
 ///     ReportMatch::Duplicate(report) => println!("already seen: {report:?}"),
 /// }
@@ -81,11 +96,16 @@ pub struct Unpaired {
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum ReportMatch {
-    /// The execution was waiting; here is the joined fill.
+    /// The execution was waiting; here is the joined fill. When the execution was the last
+    /// missing part of a combo fill, the combo fill.
     Paired(Fill),
     /// The execution has not arrived; the matcher holds the report until it does or
     /// [`FillMatcher::take_expired`] returns it.
     Waiting,
+    /// The report paired with a leg of a combo ([`FillMatcher::add_combo`]); the matcher holds
+    /// the leg fill until the combo fill is complete or [`FillMatcher::take_expired`] returns
+    /// it.
+    ComboPending,
     /// The first report for an execution the matcher handed out without a commission, by
     /// [`FillMatcher::take_expired`] or because its rule expects no report. The matcher
     /// remembers that it has now seen a report for the execution.
@@ -102,6 +122,51 @@ enum Handout {
     Reported,
 }
 
+/// The fills of one combo fill gathered so far: the combo-level execution and the legs whose
+/// execution ids share `key` (see [`fill_key`]).
+#[derive(Debug)]
+struct ComboParts {
+    perm_id: i64,
+    key: String,
+    execution: Option<Fill>,
+    legs: Vec<Fill>,
+    arrived: Instant,
+}
+
+impl ComboParts {
+    /// Whether the combo-level execution has come and each leg has filled its quantity times
+    /// its ratio.
+    fn is_complete(&self, ratios: &[(i32, f64)]) -> bool {
+        let Some(combo) = &self.execution else {
+            return false;
+        };
+        let quantity = combo.execution.execution.shares;
+        ratios.iter().all(|&(contract_id, ratio)| {
+            let filled: f64 = self
+                .legs
+                .iter()
+                .filter(|leg| leg.execution.contract.contract_id == contract_id)
+                .map(|leg| leg.execution.execution.shares)
+                .sum();
+            filled >= quantity * ratio
+        })
+    }
+
+    fn into_fills(self) -> Vec<Fill> {
+        match self.execution {
+            Some(combo) => vec![Fill { legs: self.legs, ..combo }],
+            None => self.legs,
+        }
+    }
+}
+
+/// The part of an execution id that a combo-level execution shares with the leg executions of
+/// the same fill: all but the last two dot-separated fields, `0000e1a7.6b0719db` of
+/// `0000e1a7.6b0719db.02.01`. See `docs/wire-facts/orders.md#combo-bag-executions-and-commissions`.
+fn fill_key(execution_id: &str) -> &str {
+    execution_id.rsplitn(3, '.').nth(2).unwrap_or(execution_id)
+}
+
 /// Joins each [`ExecutionData`] with its [`CommissionAndFeesReport`] as both arrive.
 ///
 /// TWS sends an execution and its commission report as two messages that share only
@@ -112,9 +177,20 @@ enum Handout {
 /// reply, use [`pair_executions`](Self::pair_executions).
 ///
 /// Some executions never get a report. The matcher returns those at once with no commission,
-/// as its rule says (by default [`Execution::expects_commission_report`](super::Execution::expects_commission_report);
-/// set your own with [`expects_report`](Self::expects_report)). For any other execution whose
-/// report does not come, call [`take_expired`](Self::take_expired) periodically.
+/// as its rule says (by default [`ExecutionData::expects_commission_report`]; set your own with
+/// [`expects_report`](Self::expects_report)). For any other execution whose report does not
+/// come, call [`take_expired`](Self::take_expired) periodically.
+///
+/// # Combos
+///
+/// For each fill of a combo (BAG) order TWS sends one execution for the combo itself, with the
+/// combo's quantity and net price and no commission report, then one execution per leg with
+/// the leg's quantity and price, each with its own report. Tell the matcher the order's
+/// `perm_id` and legs with [`add_combo`](Self::add_combo) before its executions arrive, and it
+/// returns each combo fill as one [`Fill`] whose [`legs`](Fill::legs) hold the leg fills, once
+/// every leg has filled the combo quantity times its ratio and has its report. A combo the
+/// matcher was not told about comes as separate fills: the combo-level execution without a
+/// commission, and each leg.
 ///
 /// # What it holds
 ///
@@ -122,6 +198,9 @@ enum Handout {
 ///   they pair or `take_expired` returns them. One `max_wait` bounds both: a report precedes
 ///   its execution by milliseconds when it does at all, and a repeated report never waits
 ///   (see below).
+/// - The parts of combo fills that are not complete, until they complete or `take_expired`
+///   returns them; `max_wait` counts from the first part's arrival.
+/// - The legs of the last [`memory`](Self::memory) combos given to `add_combo`.
 /// - The ids of the executions it handed out, the last [`memory`](Self::memory) of them
 ///   ([`DEFAULT_MEMORY`](Self::DEFAULT_MEMORY) by default), oldest dropped first. A report
 ///   for one of these never waits: it is [`ReportMatch::Late`] the first time for an execution
@@ -148,8 +227,12 @@ enum Handout {
 ///         Ok(Some(item)) => item,
 ///         Ok(None) => break,
 ///         Err(_elapsed) => {
-///             for execution in matcher.take_expired(Duration::from_secs(5)).executions {
+///             let unpaired = matcher.take_expired(Duration::from_secs(5));
+///             for execution in unpaired.executions {
 ///                 println!("fill without commission: {execution:?}");
+///             }
+///             for fill in unpaired.fills {
+///                 println!("incomplete combo fill: {fill:?}");
 ///             }
 ///             continue;
 ///         }
@@ -163,8 +246,11 @@ enum Handout {
 ///         SubscriptionItem::Data(OrderUpdate::CommissionAndFeesReport(report)) => match matcher.push_report(report) {
 ///             ReportMatch::Paired(fill) => println!("fill: {fill:?}"),
 ///             ReportMatch::Late(report) => println!("late commission: {report:?}"),
-///             ReportMatch::Waiting | ReportMatch::Duplicate(_) => {}
+///             ReportMatch::Waiting | ReportMatch::ComboPending | ReportMatch::Duplicate(_) => {}
 ///         },
+///         SubscriptionItem::Data(OrderUpdate::OpenOrder(order)) if !order.contract.combo_legs.is_empty() => {
+///             matcher.add_combo(order.order.perm_id, &order.contract.combo_legs);
+///         }
 ///         SubscriptionItem::Data(update) => println!("update: {update:?}"),
 ///         SubscriptionItem::Notice(notice) => println!("notice: {}", notice.message),
 ///     }
@@ -181,18 +267,24 @@ pub struct FillMatcher {
     handouts: HashMap<String, (u64, Handout)>,
     handout_order: VecDeque<(u64, String)>,
     handout_count: u64,
+    combos: HashMap<i64, Vec<(i32, f64)>>,
+    combo_order: VecDeque<i64>,
+    combo_parts: Vec<ComboParts>,
 }
 
 impl Default for FillMatcher {
     fn default() -> Self {
         Self {
-            expects_report: |data| data.execution.expects_commission_report(),
+            expects_report: ExecutionData::expects_commission_report,
             memory: Self::DEFAULT_MEMORY,
             executions: Vec::new(),
             reports: Vec::new(),
             handouts: HashMap::new(),
             handout_order: VecDeque::new(),
             handout_count: 0,
+            combos: HashMap::new(),
+            combo_order: VecDeque::new(),
+            combo_parts: Vec::new(),
         }
     }
 }
@@ -220,7 +312,8 @@ impl FillMatcher {
 
     /// Sets how many handed-out execution ids the matcher remembers to recognize a late or
     /// repeated report; the oldest is dropped first. A report for a dropped id is treated as
-    /// new. `0` remembers none.
+    /// new. It also bounds the combos [`add_combo`](Self::add_combo) remembers, the oldest
+    /// dropped first. `0` remembers none of either.
     ///
     /// # Examples
     ///
@@ -237,19 +330,17 @@ impl FillMatcher {
 
     /// Sets the rule that says whether TWS sends a report for an execution. An execution it
     /// returns `false` for is a [`Fill`] with no commission as soon as it arrives, unless its
-    /// report came first. The default is
-    /// [`Execution::expects_commission_report`](super::Execution::expects_commission_report),
-    /// which covers only what was verified live.
+    /// report came first. The default is [`ExecutionData::expects_commission_report`], which
+    /// covers only what was verified live.
     ///
     /// # Examples
     ///
     /// ```
-    /// use ibapi::contracts::SecurityType;
     /// use ibapi::orders::{ExecutionData, FillMatcher, OptionExerciseType};
     ///
-    /// // Also expect no report for any exercise type and for a combo's own execution.
+    /// // Also expect no report for any exercise type.
     /// let matcher = FillMatcher::new().expects_report(|data: &ExecutionData| {
-    ///     data.execution.option_exercise_type == OptionExerciseType::None && data.contract.security_type != SecurityType::Spread
+    ///     data.expects_commission_report() && data.execution.option_exercise_type == OptionExerciseType::None
     /// });
     /// ```
     pub fn expects_report(mut self, rule: fn(&ExecutionData) -> bool) -> Self {
@@ -257,9 +348,53 @@ impl FillMatcher {
         self
     }
 
+    /// Tells the matcher that order `perm_id` is a combo with these legs, so it returns each
+    /// fill of the order as one combo [`Fill`] (see [Combos](Self#combos)). Call it before the
+    /// order's executions arrive: with the legs of the open-order echo, which TWS sends before
+    /// the first execution, or of an order from `open_orders` or `completed_orders` before
+    /// passing an [`executions`](crate::Client::executions) reply to
+    /// [`pair_executions`](Self::pair_executions). Only each leg's `contract_id` and `ratio`
+    /// are used. Calling it again for the same `perm_id` replaces the legs.
+    ///
+    /// The matcher remembers the last [`memory`](Self::memory) combos, the oldest dropped
+    /// first; with `memory(0)` this has no effect.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::{ComboLeg, Contract, LegAction, SecurityType};
+    /// use ibapi::orders::{Execution, ExecutionData, FillMatcher};
+    ///
+    /// let mut matcher = FillMatcher::new();
+    /// let legs = vec![
+    ///     ComboLeg { contract_id: 515416632, ratio: 1, action: LegAction::Buy, ..Default::default() },
+    ///     ComboLeg { contract_id: 649180684, ratio: 1, action: LegAction::Sell, ..Default::default() },
+    /// ];
+    /// matcher.add_combo(1290491156, &legs);
+    ///
+    /// // The combo-level execution waits for its legs.
+    /// let combo = ExecutionData {
+    ///     contract: Contract { security_type: SecurityType::Spread, ..Default::default() },
+    ///     execution: Execution { execution_id: "0000e1a7.6b0717ad.01.01".to_string(), perm_id: 1290491156, shares: 1.0, ..Default::default() },
+    ///     ..Default::default()
+    /// };
+    /// assert!(matcher.push_execution(combo).is_none());
+    /// ```
+    pub fn add_combo(&mut self, perm_id: i64, legs: &[ComboLeg]) {
+        if self.memory == 0 {
+            return;
+        }
+        let ratios = legs.iter().map(|leg| (leg.contract_id, f64::from(leg.ratio))).collect();
+        if self.combos.insert(perm_id, ratios).is_none() {
+            self.combo_order.push_back(perm_id);
+            self.evict();
+        }
+    }
+
     /// Adds an execution. Returns the [`Fill`] when its report has already arrived, or when
     /// the rule expects no report (then with `commission: None`); otherwise holds the
-    /// execution and returns `None`.
+    /// execution and returns `None`. A part of a combo fill ([`add_combo`](Self::add_combo))
+    /// returns `None` until it completes the combo fill, then the combo fill.
     ///
     /// # Examples
     ///
@@ -300,6 +435,11 @@ impl FillMatcher {
     /// assert_eq!(matcher.take_expired_at(Duration::from_secs(5), start + Duration::from_secs(5)).executions.len(), 1);
     /// ```
     pub fn push_execution_at(&mut self, execution: ExecutionData, now: Instant) -> Option<Fill> {
+        let fill = self.pair_execution(execution, now)?;
+        self.gather(fill, now)
+    }
+
+    fn pair_execution(&mut self, execution: ExecutionData, now: Instant) -> Option<Fill> {
         let execution_id = &execution.execution.execution_id;
         if let Some(index) = self.reports.iter().position(|(report, _)| report.execution_id == *execution_id) {
             let (report, _) = self.reports.remove(index);
@@ -307,14 +447,57 @@ impl FillMatcher {
             return Some(Fill {
                 execution,
                 commission: Some(report),
+                legs: Vec::new(),
             });
         }
         if !(self.expects_report)(&execution) {
             self.remember(execution_id.clone(), Handout::Unreported { arrived: now });
-            return Some(Fill { execution, commission: None });
+            return Some(Fill {
+                execution,
+                commission: None,
+                legs: Vec::new(),
+            });
         }
         self.executions.push((execution, now));
         None
+    }
+
+    /// Returns `fill` unless it is a part of a combo fill [`add_combo`](Self::add_combo)
+    /// announced; then holds it with the other parts and returns the combo fill once complete.
+    /// `arrived` is when the fill's execution arrived.
+    fn gather(&mut self, fill: Fill, arrived: Instant) -> Option<Fill> {
+        let perm_id = fill.execution.execution.perm_id;
+        let Some(ratios) = self.combos.get(&perm_id) else {
+            return Some(fill);
+        };
+        let key = fill_key(&fill.execution.execution.execution_id);
+        let index = match self.combo_parts.iter().position(|parts| parts.perm_id == perm_id && parts.key == key) {
+            Some(index) => index,
+            None => {
+                self.combo_parts.push(ComboParts {
+                    perm_id,
+                    key: key.to_string(),
+                    execution: None,
+                    legs: Vec::new(),
+                    arrived,
+                });
+                self.combo_parts.len() - 1
+            }
+        };
+        let parts = &mut self.combo_parts[index];
+        parts.arrived = parts.arrived.min(arrived);
+        if fill.execution.contract.security_type == SecurityType::Spread {
+            if parts.execution.is_some() {
+                return Some(fill);
+            }
+            parts.execution = Some(fill);
+        } else {
+            parts.legs.push(fill);
+        }
+        if !parts.is_complete(ratios) {
+            return None;
+        }
+        self.combo_parts.remove(index).into_fills().pop()
     }
 
     /// Adds a commission report: pairs it with its waiting execution, recognizes it as late or
@@ -364,12 +547,17 @@ impl FillMatcher {
             .iter()
             .position(|(execution, _)| execution.execution.execution_id == report.execution_id)
         {
-            let (execution, _) = self.executions.remove(index);
+            let (execution, arrived) = self.executions.remove(index);
             self.remember(report.execution_id.clone(), Handout::Reported);
-            return ReportMatch::Paired(Fill {
+            let fill = Fill {
                 execution,
                 commission: Some(report),
-            });
+                legs: Vec::new(),
+            };
+            return match self.gather(fill, arrived) {
+                Some(fill) => ReportMatch::Paired(fill),
+                None => ReportMatch::ComboPending,
+            };
         }
         if let Some((_, handout)) = self.handouts.get_mut(&report.execution_id) {
             return match mem::replace(handout, Handout::Reported) {
@@ -385,8 +573,11 @@ impl FillMatcher {
     }
 
     /// Removes and returns the executions and reports that have waited at least `max_wait`
-    /// for their partner. The matcher remembers each returned execution, so its report, if it
-    /// still comes, is [`ReportMatch::Late`]. `Duration::ZERO` returns everything it holds.
+    /// for their partner, and the combo fills whose first part arrived at least `max_wait`
+    /// ago, with the parts that came (in [`Unpaired::fills`]). A leg execution whose report
+    /// has not come goes into its combo fill without a commission. The matcher remembers each
+    /// returned execution, so its report, if it still comes, is [`ReportMatch::Late`].
+    /// `Duration::ZERO` returns everything it holds.
     ///
     /// # Examples
     ///
@@ -403,7 +594,7 @@ impl FillMatcher {
     ///
     /// // No report came: emit the execution without a commission.
     /// for execution in matcher.take_expired(Duration::ZERO).executions {
-    ///     let fill = Fill { execution, commission: None };
+    ///     let fill = Fill { execution, commission: None, legs: Vec::new() };
     ///     println!("fill without commission: {fill:?}");
     /// }
     /// ```
@@ -433,7 +624,8 @@ impl FillMatcher {
     /// ```
     pub fn take_expired_at(&mut self, max_wait: Duration, now: Instant) -> Unpaired {
         let expired = |at: &Instant| now.saturating_duration_since(*at) >= max_wait;
-        self.take_where(|_, at| expired(at), |_, at| expired(at))
+        let (executions, reports) = self.take_where(|_, at| expired(at), |_, at| expired(at));
+        self.hand_out(executions, reports, |parts| expired(&parts.arrived))
     }
 
     /// Returns an execution that [`take_expired`](Self::take_expired) handed out to the
@@ -483,7 +675,9 @@ impl FillMatcher {
     /// no partner. A report that comes after an execution the rule expects none for fills in
     /// that fill's commission; a repeated report is dropped. A first report for an execution
     /// the matcher handed out without one before the call is returned in
-    /// [`Unpaired::reports`], after the reports that found no execution.
+    /// [`Unpaired::reports`], after the reports that found no execution. A combo fill
+    /// ([`add_combo`](Self::add_combo)) is in the fills at its combo-level execution's place;
+    /// one the reply does not complete is in [`Unpaired::fills`].
     ///
     /// Pass the whole reply: read it with `collect_to_end_within`, which fails rather than
     /// return a partial reply, so an execution whose report was cut off never shows up as
@@ -535,16 +729,23 @@ impl FillMatcher {
                             Some(fill) => fill.commission = Some(report),
                             None => late.push(report),
                         },
-                        ReportMatch::Waiting | ReportMatch::Duplicate(_) => {}
+                        ReportMatch::Waiting | ReportMatch::ComboPending | ReportMatch::Duplicate(_) => {}
                     }
                 }
             }
         }
         fills.sort_by_key(|fill| positions.get(&fill.execution.execution.execution_id).copied().unwrap_or(usize::MAX));
-        let mut unpaired = self.take_where(
+        let (executions, reports) = self.take_where(
             |execution, _| positions.contains_key(&execution.execution.execution_id),
             |report, _| report_ids.contains(&report.execution_id),
         );
+        let mut unpaired = self.hand_out(executions, reports, |parts| {
+            parts
+                .execution
+                .iter()
+                .chain(&parts.legs)
+                .any(|fill| positions.contains_key(&fill.execution.execution.execution_id))
+        });
         unpaired.reports.extend(late);
         (fills, unpaired)
     }
@@ -553,7 +754,7 @@ impl FillMatcher {
         &mut self,
         mut take_execution: impl FnMut(&ExecutionData, &Instant) -> bool,
         mut take_report: impl FnMut(&CommissionAndFeesReport, &Instant) -> bool,
-    ) -> Unpaired {
+    ) -> (Vec<(ExecutionData, Instant)>, Vec<CommissionAndFeesReport>) {
         let (taken, kept): (Vec<_>, Vec<_>) = mem::take(&mut self.executions)
             .into_iter()
             .partition(|(execution, at)| take_execution(execution, at));
@@ -565,10 +766,38 @@ impl FillMatcher {
         for (execution, arrived) in &taken {
             self.remember(execution.execution.execution_id.clone(), Handout::Unreported { arrived: *arrived });
         }
-        Unpaired {
-            executions: taken.into_iter().map(|(execution, _)| execution).collect(),
-            reports: taken_reports.into_iter().map(|(report, _)| report).collect(),
+        (taken, taken_reports.into_iter().map(|(report, _)| report).collect())
+    }
+
+    /// Builds the [`Unpaired`] for executions and reports [`take_where`](Self::take_where)
+    /// took: puts each combo leg execution into its combo fill without a commission, then
+    /// hands out the combo fills `give_up` selects.
+    fn hand_out(
+        &mut self,
+        executions: Vec<(ExecutionData, Instant)>,
+        reports: Vec<CommissionAndFeesReport>,
+        mut give_up: impl FnMut(&ComboParts) -> bool,
+    ) -> Unpaired {
+        let mut unpaired = Unpaired {
+            reports,
+            ..Default::default()
+        };
+        for (execution, arrived) in executions {
+            if self.combos.contains_key(&execution.execution.perm_id) {
+                let fill = Fill {
+                    execution,
+                    commission: None,
+                    legs: Vec::new(),
+                };
+                unpaired.fills.extend(self.gather(fill, arrived));
+            } else {
+                unpaired.executions.push(execution);
+            }
         }
+        let (given_up, kept): (Vec<_>, Vec<_>) = mem::take(&mut self.combo_parts).into_iter().partition(|parts| give_up(parts));
+        self.combo_parts = kept;
+        unpaired.fills.extend(given_up.into_iter().flat_map(ComboParts::into_fills));
+        unpaired
     }
 
     fn remember(&mut self, execution_id: String, handout: Handout) {
@@ -583,6 +812,11 @@ impl FillMatcher {
     }
 
     fn evict(&mut self) {
+        while self.combo_order.len() > self.memory {
+            if let Some(perm_id) = self.combo_order.pop_front() {
+                self.combos.remove(&perm_id);
+            }
+        }
         while self.handouts.len() > self.memory {
             let Some((sequence, execution_id)) = self.handout_order.pop_front() else {
                 break;
