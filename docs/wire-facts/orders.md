@@ -126,6 +126,12 @@ fills, each read on `place_order`, `order_update_stream` and `executions`. Guard
   contract carries no legs there either. The replay was read on a connection with no live
   `place_order` subscription for the order: while one is open, the client delivers that
   order's executions to it and they are missing from the reply.
+- **Legs from the reply alone** (*live 2026-11-24 09:16 UTC, paper TWS, server 223,
+  `last_n_days` 7*): 91 executions and 77 reports. Every one of the 14 combo-level executions
+  had exactly two executions with its `perm_id` and its first two id fields, both leg
+  contracts (ES futures or options). Every execution with a combo order's `perm_id` was a
+  combo-level execution or a leg of one: the orders filled in 2 and 3 parts gave 2 and 3 such
+  groups, one per second field. The 14 missing reports were the combo-level executions'.
 - **Executions missing once**: on one fill (1 of a 4-lot market sell, 23:26:39 UTC) the client
   got the two leg reports on both streams but none of the three executions; the OrderStatus
   for the fill came 8 s later with `last_fill_price` 0, and `executions` afterwards listed all
