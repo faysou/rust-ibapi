@@ -55,7 +55,7 @@ Placement, echoes, status, executions and completed orders. Format: [README](REA
 ### What-if answer frames
 
 *Live 2026-11-24 off-hours (04:15 ET), paper TWS, server 223; raw capture of `openOrder`
-frames; #PR.*
+frames; #1289.*
 
 | Order (what-if)                                              | Frames | Margin fields           | Commission             | Then    |
 | ------------------------------------------------------------ | ------ | ----------------------- | ---------------------- | ------- |
