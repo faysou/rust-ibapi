@@ -419,3 +419,47 @@ with `override_natural_action`.*
 - **Not probed:** a futures or EFP order, where `refFuturesConId` would be set; a filled or
   partially filled order.
 
+
+### Non-US orders outside the trading session
+
+*Live 2026-11-24 22:03-22:17 UTC (SEHK, HKFE, TSE, OSE and KSE closed), paper TWS, server 223;
+non-marketable limit orders, each cancelled after 5 s.*
+
+| Order | Reply | Cancel |
+| ----- | ----- | ------ |
+| 700 SEHK BUY 100 LMT 320 | 399 "Warning: Your order will not be placed at the exchange until 2026-11-25 09:30:00 Hongkong", then PreSubmitted | Cancelled, 202 |
+| HSI future HKFE BUY 1 LMT 20000; HSI option `HSI25600L6` BUY 1 LMT 1 | the same 399 with `09:15:00 Hongkong`, PreSubmitted, then Submitted within 1.3 s | Cancelled, 202 |
+| HSI futures option `PHS25600L6` BUY 1 LMT 1 | 399 with `09:15:00`, PreSubmitted twice | Cancelled, 202 |
+| N225M future OSE.JPN BUY 1 LMT 40000 | PreSubmitted, no 399 | Cancelled, 202 |
+| 7203 SMART BUY 100 LMT 2000 | Submitted, no 399 | Cancelled, 202 |
+| K200 future KSE BUY 1 LMT 300 | nothing in 5 s | nothing in 5 s; `PendingCancel` in `all_open_orders` 21 s after placing; at 22:17 a second cancel drew 10147 and no open order was listed |
+
+- The 399 carries a `Warning:` line and the order goes on, so it is a warning, not a rejection.
+  The time is the exchange's next open in its own zone, as text.
+- HKFE orders reached `Submitted` while the exchange was closed: `Submitted` does not mean the
+  order is at the exchange.
+- The KSE order neither acknowledged nor cancelled promptly, like the
+  [weekend ES cancel](#weekend-cancel-of-a-presubmitted-es-order-wedges-in-pendingcancel), and
+  cleared without a terminal status reaching the probe.
+- **Not probed:** the same orders during a session or the lunch break (see below if recorded),
+  fills.
+
+### Auction orders on SEHK and TSE
+
+*Live 2026-11-24 22:04-22:06 UTC (both closed), paper TWS, server 223.*
+
+| Order | 700 SEHK | 7203 SMART (JPY) |
+| ----- | -------- | ---------------- |
+| LMT, `tif` OPG (LOO) | Inactive, 201 "The time-in-force OPG is invalid for this combination of exchange and security type." | not run (connection timed out) |
+| MKT, `tif` OPG (MOO) | not run (connection timed out) | Submitted; cancelled |
+| MOC | 387 "Unsupported order type for this exchange and security type." | no frame in 5 s; `PendingSubmit` in `all_open_orders`; cancelled (PendingCancel, Cancelled, 202) |
+| LOC | 387 | as MOC |
+| MTL or LMT, `tif` AUC | Inactive, 201 "The time-in-force AUC is invalid ..." | Inactive, 201 (MTL) |
+
+- The unsupported time in force drew an Inactive status before the 201; the unsupported order
+  type drew 387 with no status.
+- The 7203 MOC and LOC orders sat in `PendingSubmit` with no frame on their `place_order`
+  replies while two other connections in the same minute timed out at the handshake, so the
+  silence may be TWS load rather than the order type.
+- **Not probed:** SEHK's closing auction order types (`tif` AUC was refused; no other type
+  tried), TSE MOC and LOC during a session.
