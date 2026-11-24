@@ -641,6 +641,10 @@ let mut matcher = FillMatcher::new();
 let (fills, unpaired) = matcher.pair_executions(rows);
 ```
 
+A combo fill's `Fill::combo_legs()` returns the order's legs (contract id, ratio, action and
+exchange) from its leg executions, sorted by contract id as TWS's order echoes list them. Use it
+to identify the combo when the order echo is gone, as for a previous day's fill.
+
 ### Concurrent Subscriptions
 ```rust
 use std::sync::Arc;
