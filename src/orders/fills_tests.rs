@@ -1,6 +1,6 @@
 use super::*;
 use crate::contracts::{LegAction, SecurityType};
-use crate::orders::{Execution, OptionExerciseType};
+use crate::orders::{Execution, ExecutionSide, OptionExerciseType};
 
 const MAX_WAIT: Duration = Duration::from_secs(5);
 
@@ -1119,4 +1119,60 @@ fn fill_key_drops_the_last_two_fields() {
     for (execution_id, expected) in cases {
         assert_eq!(fill_key(execution_id), expected, "{execution_id}");
     }
+}
+
+/// One partial fill of a 1x2 ES calendar from an `executions` reply, live shape: 2 combos, the
+/// ratio-2 far leg with 4 contracts, legs on `side` and its opposite as TWS executes them.
+fn calendar_1x2_rows(side: ExecutionSide) -> Vec<Executions> {
+    let opposite = match side {
+        ExecutionSide::Bought => ExecutionSide::Sold,
+        ExecutionSide::Sold => ExecutionSide::Bought,
+    };
+    let mut combo = bag("0000e1a7.6b071816.01.01", 2.0);
+    combo.execution.side = side;
+    let mut far = leg("0000e1a7.6b071816.02.01", ESH7, 4.0);
+    far.execution.side = opposite;
+    far.contract.exchange = "CME".into();
+    let mut near = leg("0000e1a7.6b071816.03.01", ESZ6, 2.0);
+    near.execution.side = side;
+    near.contract.exchange = "CME".into();
+    vec![
+        Executions::ExecutionData(combo),
+        Executions::ExecutionData(far),
+        Executions::ExecutionData(near),
+        Executions::CommissionAndFeesReport(report("0000e1a7.6b071816.02.01", 4.32)),
+        Executions::CommissionAndFeesReport(report("0000e1a7.6b071816.03.01", 2.16)),
+    ]
+}
+
+// Live (server 223): the 14 ES combo fills of a 7-day `executions` reply gave the legs TWS
+// echoed on each order, bought or sold, partial or whole: the echo's legs are the order's
+// legs, sorted by contract id, whichever side the combo executed on.
+#[test]
+fn combo_legs_of_a_partial_fill_match_the_order_bought_or_sold() {
+    let expected: Vec<ComboLeg> = combo_legs(1, 2)
+        .into_iter()
+        .map(|leg| ComboLeg {
+            exchange: "CME".to_string(),
+            ..leg
+        })
+        .collect();
+
+    for side in [ExecutionSide::Bought, ExecutionSide::Sold] {
+        let (fills, _) = FillMatcher::new().pair_executions(calendar_1x2_rows(side));
+
+        assert_eq!(fills.len(), 1, "{side:?}: {fills:?}");
+        assert_eq!(fills[0].combo_legs(), expected, "{side:?}");
+    }
+}
+
+#[test]
+fn combo_legs_of_a_single_fill_is_empty() {
+    let fill = Fill {
+        execution: execution("e1"),
+        commission: None,
+        legs: Vec::new(),
+    };
+
+    assert_eq!(fill.combo_legs(), Vec::<ComboLeg>::new());
 }
