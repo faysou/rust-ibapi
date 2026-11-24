@@ -2339,12 +2339,6 @@ fn execution_reply_reaches_request_while_order_route_is_open() -> Result<(), Err
         bus.dispatch()?;
     }
 
-    let frames = |sub: &InternalSubscription| -> Vec<(IncomingMessages, Option<i32>)> {
-        std::iter::from_fn(|| sub.next_timeout(TICK))
-            .map(|m| m.unwrap())
-            .map(|m| (m.message_type(), m.request_id()))
-            .collect()
-    };
     let live = [
         (IncomingMessages::ExecutionData, Some(-1)),
         (IncomingMessages::CommissionsAndFeesReport, None),
@@ -2360,6 +2354,65 @@ fn execution_reply_reaches_request_while_order_route_is_open() -> Result<(), Err
         ],
         "request"
     );
+    Ok(())
+}
+
+/// Every frame queued on `sub`, as message type and request id.
+fn frames(sub: &InternalSubscription) -> Vec<(IncomingMessages, Option<i32>)> {
+    std::iter::from_fn(|| sub.next_timeout(TICK))
+        .map(|m| m.unwrap())
+        .map(|m| (m.message_type(), m.request_id()))
+        .collect()
+}
+
+/// TWS sends one commission report per live fill and one per `executions`
+/// reply that lists it. A reply sent before the live report lists the fill
+/// without one, so the live report reaches the update stream and the order
+/// route exactly once, whatever the order, and is copied to the request; the
+/// request may then see the fill's report twice.
+#[test]
+fn commission_reports_follow_live_fills_and_replies() -> Result<(), Error> {
+    let request_id = RequestId::nth(99);
+    let live_exec = || execution_data_frame(CLIENT_ID, -1, 7, "exec-1");
+    let reply_exec = || execution_data_frame(CLIENT_ID, request_id.raw(), 7, "exec-1");
+    let report = || commission_frame("exec-1");
+    let cases: [(&str, Vec<Vec<u8>>, usize); 4] = [
+        ("live exec, reply exec, report", vec![live_exec(), reply_exec(), report()], 1),
+        ("reply exec, live exec, report", vec![reply_exec(), live_exec(), report()], 1),
+        (
+            "live exec, live report, reply exec, reply report",
+            vec![live_exec(), report(), reply_exec(), report()],
+            1,
+        ),
+        (
+            "live exec, reply exec, two reports",
+            vec![live_exec(), reply_exec(), report(), report()],
+            2,
+        ),
+    ];
+    for (name, inbound, request_reports) in cases {
+        let (stream, bus) = make_bus();
+        let order_route = bus.send_order_request(OrderId::from(7), &[])?;
+        let updates = bus.create_order_update_subscription()?;
+        let request = bus.send_request(request_id, &[])?;
+        let count = inbound.len();
+        for frame in inbound {
+            stream.push_inbound(frame);
+        }
+        for _ in 0..count {
+            bus.dispatch()?;
+        }
+
+        let live = vec![
+            (IncomingMessages::ExecutionData, Some(-1)),
+            (IncomingMessages::CommissionsAndFeesReport, None),
+        ];
+        let mut reply = vec![(IncomingMessages::ExecutionData, Some(request_id.raw()))];
+        reply.extend(std::iter::repeat_n((IncomingMessages::CommissionsAndFeesReport, None), request_reports));
+        assert_eq!(frames(&order_route), live, "{name}: order route");
+        assert_eq!(frames(&updates), live, "{name}: update stream");
+        assert_eq!(frames(&request), reply, "{name}: request");
+    }
     Ok(())
 }
 

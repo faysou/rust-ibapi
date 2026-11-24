@@ -19,7 +19,7 @@ use crate::client::ids::{OrderId, RequestId, WireId};
 use crate::connection::common::STARTUP_STALL;
 use crate::connection::sync::Connection;
 
-use super::common::{lock, log_orphan, read_lock, report_unroutable_frame, validate_frame_length, write_lock, Lease, LeaseRef};
+use super::common::{lock, log_orphan, read_lock, report_unroutable_frame, validate_frame_length, write_lock, Lease, LeaseRef, LiveExecutions};
 use super::order_taps::{NewTap, OrderTaps};
 use super::rate_limiter::RateLimiter;
 use super::raw_capture::RawFrameTap;
@@ -316,6 +316,8 @@ pub struct TcpMessageBus<S: Stream> {
     /// commission reports in a reply, which go to the request alone and not
     /// to the order update stream.
     executions_requested: SenderHash<String, RoutedItem>,
+    /// This client's live fills still waiting for their commission report.
+    live_executions: LiveExecutions,
     shared_channels: SharedChannels,
     signals_send: Sender<Signal>,
     signals_recv: Receiver<Signal>,
@@ -360,6 +362,7 @@ impl<S: Stream> TcpMessageBus<S> {
             orders: SenderHash::new(),
             executions: SenderHash::new(),
             executions_requested: SenderHash::new(),
+            live_executions: LiveExecutions::default(),
             shared_channels: SharedChannels::new(),
             signals_send,
             signals_recv,
@@ -500,6 +503,7 @@ impl<S: Stream> TcpMessageBus<S> {
         // Aliases of the routes just failed.
         self.executions.clear();
         self.executions_requested.clear();
+        self.live_executions.clear();
         self.order_taps.reset();
     }
 
@@ -761,6 +765,9 @@ impl<S: Stream> TcpMessageBus<S> {
             OrderRoutingStrategy::ExecutionData => {
                 let sent_to_update_stream = self.send_order_update(&message);
                 let execution_id = message.execution_id();
+                if let Some(execution_id) = &execution_id {
+                    self.live_executions.insert(execution_id);
+                }
                 let unrouted = match message_order_id {
                     Some(id) => self.orders.deliver_aliased(&id, message.into(), execution_id.as_ref(), &self.executions),
                     None => Err(message.into()),
@@ -790,17 +797,17 @@ impl<S: Stream> TcpMessageBus<S> {
                 }
             }
             OrderRoutingStrategy::ByExecutionId => match message.execution_id() {
-                // A commission report in an `executions` reply goes to that
-                // request alone; a live fill's is copied to the update stream
-                // and follows its execution to the order route.
+                // A live fill's report goes to the update stream and follows
+                // its execution to the order route, and to any request that
+                // listed the fill. Any other report answers an `executions`
+                // reply and goes to that request alone.
                 Some(execution_id) => {
-                    if let Err(item) = self.executions_requested.deliver(&execution_id, message.clone().into()) {
-                        let sent_to_update_stream = self.send_order_update(&message);
-                        if let Err(item) = self.executions.deliver(&execution_id, item) {
-                            if !sent_to_update_stream {
-                                warn!("could not route commission report {item:?}");
-                            }
-                        }
+                    let live = self.live_executions.take(&execution_id);
+                    let requested = self.executions_requested.deliver(&execution_id, message.clone().into()).is_ok();
+                    let sent_to_update_stream = live && self.send_order_update(&message);
+                    let delivered = live && self.executions.deliver(&execution_id, message.clone().into()).is_ok();
+                    if !(requested || sent_to_update_stream || delivered) {
+                        debug!("commission report answers no live fill or request: {message:?}");
                     }
                 }
                 None => {

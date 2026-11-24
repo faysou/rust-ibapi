@@ -87,7 +87,9 @@ sequenceDiagram
 2. **Requests without IDs**: MessageBus uses shared channels for responses
 3. **Order-based requests**: Routed by order id, with copies to the order update stream:
    - A live execution carries request id -1. It goes to its order's subscriptions and to the
-     order update stream, and its commission report follows it there by execution id.
+     order update stream, and its commission report follows it there once by execution id,
+     also when a reply listing the execution arrives first. That report is also copied to any
+     request that listed the execution.
    - A reply to `executions` carries that request's id. The reply, its commission reports, and
      its end marker go only to that request, whatever order subscriptions are open.
 

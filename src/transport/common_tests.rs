@@ -186,3 +186,35 @@ fn session_state_verdicts() {
         assert_eq!(state.is_terminal(), check_ended.is_some(), "{state:?} is_terminal");
     }
 }
+
+#[test]
+fn live_executions_take_clears_the_mark_once() {
+    let live = LiveExecutions::default();
+    live.insert("exec-1");
+    live.insert("exec-1");
+
+    assert!(live.take("exec-1"));
+    assert!(!live.take("exec-1"));
+    assert!(!live.take("exec-2"));
+    assert_eq!(live.len(), 0);
+}
+
+#[test]
+fn live_executions_drop_the_oldest_past_capacity() {
+    let live = LiveExecutions::default();
+    for n in 0..=LIVE_EXECUTIONS_CAPACITY {
+        live.insert(&format!("exec-{n}"));
+    }
+
+    assert_eq!(live.len(), LIVE_EXECUTIONS_CAPACITY);
+    assert!(!live.take("exec-0"), "oldest mark kept");
+    assert!(live.take(&format!("exec-{LIVE_EXECUTIONS_CAPACITY}")));
+}
+
+#[test]
+fn live_executions_clear_drops_every_mark() {
+    let live = LiveExecutions::default();
+    live.insert("exec-1");
+    live.clear();
+    assert!(!live.take("exec-1"));
+}

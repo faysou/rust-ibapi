@@ -224,7 +224,11 @@ impl Client {
     /// The reply reaches only this subscription. An open
     /// [`place_order`](Self::place_order) subscription or
     /// [`order_update_stream`](Self::order_update_stream) neither receives it
-    /// nor takes rows from it.
+    /// nor takes rows from it. A reply that TWS sends between one of this
+    /// client's fills and the fill's commission report lists the fill without
+    /// the report; the live report follows on the order's streams, and is
+    /// copied here too, so a reply can carry a fill's report twice. Key
+    /// commissions by `execution_id`.
     /// When requesting executions, a filter can be specified to receive only a subset of them
     ///
     /// # Arguments
