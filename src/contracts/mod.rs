@@ -184,7 +184,8 @@ pub struct Contract {
     /// unset (stocks, an open futures query).
     #[serde(default, deserialize_with = "types::deserialize_optional_expiry")]
     pub last_trade_date_or_contract_month: Option<Expiry>,
-    /// The option's strike price.
+    /// The option's strike price. `0.0` is not sent. `f64::MAX`, the Python client's unset
+    /// value, is sent, and TWS reads it as unset in contract details (live: 2026-11-23, paper).
     pub strike: f64,
     /// Option type (only meaningful when `security_type == SecurityType::Option`).
     /// `None` on non-option contracts. Wire values are `"C"` (Call) and `"P"` (Put).
