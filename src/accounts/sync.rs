@@ -1,5 +1,6 @@
 //! Synchronous implementation of account management functionality
 
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -287,6 +288,9 @@ impl Client {
     /// It ends after yielding any other error, the error [`wait_connected`](Self::wait_connected)
     /// returns when the reconnect gave up, or once the subscription ends.
     ///
+    /// The iterator borrows the client. To move it into a spawned thread, open it from an
+    /// `Arc<Client>` with [`AccountSummarySnapshotsResubscribing::subscribe`].
+    ///
     /// # Arguments
     /// * `group` - Set to "All" to return account summary data for all accounts, or set to a specific Advisor Account Group name that has already been created in TWS Global Configuration.
     /// * `tags`  - List of the desired tags.
@@ -322,16 +326,8 @@ impl Client {
         group: &AccountGroup,
         tags: &[&str],
         quiet: Duration,
-    ) -> Result<AccountSummarySnapshotsResubscribing<'_>, Error> {
-        let snapshots = self.account_summary_snapshots(group, tags, quiet)?;
-
-        Ok(AccountSummarySnapshotsResubscribing {
-            client: self,
-            group: group.clone(),
-            tags: tags.iter().map(|tag| tag.to_string()).collect(),
-            quiet,
-            snapshots: Some(snapshots),
-        })
+    ) -> Result<AccountSummarySnapshotsResubscribing<&Self>, Error> {
+        AccountSummarySnapshotsResubscribing::subscribe(self, group, tags, quiet)
     }
 
     /// Subscribes to a specific account's information and portfolio.
@@ -687,9 +683,13 @@ impl Iterator for AccountSummarySnapshots {
 }
 
 /// Account summary snapshots that survive transport reconnects, from
-/// [`Client::account_summary_snapshots_resubscribing`].
-pub struct AccountSummarySnapshotsResubscribing<'a> {
-    client: &'a Client,
+/// [`Client::account_summary_snapshots_resubscribing`] or [`subscribe`](Self::subscribe).
+///
+/// `C` is how the iterator holds the client it resubscribes with: `&Client` from the client
+/// method, or an owned handle such as `Arc<Client>` from [`subscribe`](Self::subscribe), which
+/// makes the iterator `'static` so it can move into a spawned thread.
+pub struct AccountSummarySnapshotsResubscribing<C> {
+    client: C,
     group: AccountGroup,
     tags: Vec<String>,
     quiet: Duration,
@@ -697,7 +697,7 @@ pub struct AccountSummarySnapshotsResubscribing<'a> {
     snapshots: Option<AccountSummarySnapshots>,
 }
 
-impl std::fmt::Debug for AccountSummarySnapshotsResubscribing<'_> {
+impl<C> std::fmt::Debug for AccountSummarySnapshotsResubscribing<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AccountSummarySnapshotsResubscribing")
             .field("group", &self.group)
@@ -707,7 +707,54 @@ impl std::fmt::Debug for AccountSummarySnapshotsResubscribing<'_> {
     }
 }
 
-impl AccountSummarySnapshotsResubscribing<'_> {
+impl<C: Deref<Target = Client>> AccountSummarySnapshotsResubscribing<C> {
+    /// Requests the account summary through `client` and returns its snapshots, resubscribing
+    /// after each transport reconnect, as
+    /// [`Client::account_summary_snapshots_resubscribing`] does.
+    ///
+    /// Pass an `Arc<Client>` to get an iterator that owns its client handle and can move into a
+    /// spawned thread.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// use ibapi::accounts::types::AccountGroup;
+    /// use ibapi::accounts::AccountSummaryTags;
+    /// use ibapi::client::blocking::{AccountSummarySnapshotsResubscribing, Client};
+    ///
+    /// let client = Arc::new(Client::connect("127.0.0.1:4002", 100).expect("connection failed"));
+    ///
+    /// let group = AccountGroup("All".to_string());
+    /// let tags = &[AccountSummaryTags::NET_LIQUIDATION];
+    /// let mut snapshots = AccountSummarySnapshotsResubscribing::subscribe(Arc::clone(&client), &group, tags, Duration::from_secs(1))
+    ///     .expect("error requesting account summary");
+    ///
+    /// // The first snapshot here, the rest in a thread.
+    /// let first = snapshots.next();
+    /// println!("first: {first:?}");
+    /// std::thread::spawn(move || {
+    ///     for snapshot in snapshots {
+    ///         println!("{snapshot:?}");
+    ///     }
+    /// });
+    /// ```
+    // Four required arguments, the client method's three plus the handle; a builder would only
+    // rename them.
+    pub fn subscribe(client: C, group: &AccountGroup, tags: &[&str], quiet: Duration) -> Result<Self, Error> {
+        let snapshots = client.account_summary_snapshots(group, tags, quiet)?;
+
+        Ok(Self {
+            client,
+            group: group.clone(),
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            quiet,
+            snapshots: Some(snapshots),
+        })
+    }
+
     /// Cancels the underlying subscription. Iteration then ends, after a final snapshot of any rows
     /// not yet emitted.
     pub fn cancel(&self) {
@@ -736,7 +783,7 @@ impl AccountSummarySnapshotsResubscribing<'_> {
     }
 }
 
-impl Iterator for AccountSummarySnapshotsResubscribing<'_> {
+impl<C: Deref<Target = Client>> Iterator for AccountSummarySnapshotsResubscribing<C> {
     type Item = Result<AccountSummarySnapshot, Error>;
 
     /// Returns the next snapshot, the reconnect notice, or `None` once the stream has ended.
