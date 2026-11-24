@@ -125,8 +125,22 @@ impl_str_partial_eq!(Exchange);
 ///
 /// IBKR supports trading in many currencies worldwide. This type provides a lightweight
 /// wrapper around currency codes.
+///
+/// The default is empty, which leaves the currency to TWS: it resolves a contract whose
+/// other fields name one listing (an HSI future on HKFE resolves to HKD) and lists every
+/// listing for contract details. Market data and orders on a contract that matches listings in
+/// several currencies (AAPL on SMART also matches EBS in CHF and TSE in CAD) fail with error
+/// 200, "The contract description specified for AAPL is ambiguous; you must specify the
+/// currency". Set the currency for those.
+///
+/// ```
+/// use ibapi::contracts::{Contract, Currency};
+///
+/// assert_eq!(Currency::default().as_str(), "");
+/// assert_eq!(Contract::default().currency, Currency::default());
+/// ```
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Currency(pub String);
 
 impl Currency {
@@ -138,12 +152,6 @@ impl Currency {
     /// Get the currency code as a string slice
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl Default for Currency {
-    fn default() -> Self {
-        Currency("USD".to_string())
     }
 }
 
