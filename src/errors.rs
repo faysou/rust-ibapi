@@ -401,9 +401,12 @@ impl Error {
     /// - [`Notice`](Error::Notice) and the decode, parse and stream variants report what TWS
     ///   sent back, so the request was sent.
     ///
-    /// A call that sends several requests reports only on the one that failed: the bracket
-    /// builder's `submit_all` and `submit_oca_orders` send their orders one at a time, so a
-    /// `true` error on a later order leaves the earlier ones sent. Likewise
+    /// A call that sends several requests reports only on the one that failed:
+    /// `submit_oca_orders` sends its orders one at a time, so a `true` error on a later order
+    /// leaves the earlier ones sent. `submit_linked_orders` and the bracket builder's
+    /// `submit_all` check every order before sending any and return a
+    /// [`LinkedOrdersError`](crate::orders::LinkedOrdersError): its `error.is_unsent()` is
+    /// `true` only when its `sent` is empty. Likewise
     /// `next_valid_order_id` returns `OrderIdInRequestRange` for an id TWS sent back, after its
     /// id request was written; that request places nothing.
     ///
