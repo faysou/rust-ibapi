@@ -452,6 +452,18 @@ with `override_natural_action`.*
 - **Not probed:** lapse, assignment, automatic exercise at expiry, puts, futures options, and
   exercising from a client other than the one that bought.
 
+### Cancel replies, and a cancel that races a fill
+
+*Live 2026-11-23 23:56Z off-hours, paper TWS, server 223; AAPL BUY 1 LMT 1.00 (PreSubmitted),
+and EUR.USD BUY 20,000 MKT cancelled right after placing.*
+
+- Resting order: `cancel_order` drew `OrderStatus` `Cancelled` and then error 202 ("Order
+  Canceled - reason:"), both on the order id, within 0.2 s. No `PendingCancel` status came first.
+- Market order cancelled at once: `OrderStatus` `PendingCancel`, then the fill
+  (`ExecutionData`, request id -1), `OrderStatus` `Filled`, and the commission report. The cancel
+  lost the race; no 202 or other error followed.
+- **Not probed:** a partial fill followed by a cancel of the rest, and a cancel during RTH.
+
 ### Weekend cancel of a PreSubmitted ES order wedges in PendingCancel
 
 *Live 2026-11-14 weekend (Sat 16:55 ET, CME closed), paper Gateway, server 226; #1214.*

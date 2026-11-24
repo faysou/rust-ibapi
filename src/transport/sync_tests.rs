@@ -2429,6 +2429,40 @@ fn commission_and_fees_report_routes_via_execution_id_mapping() -> Result<(), Er
     Ok(())
 }
 
+/// `cancel_order` registers its own subscription under the order id. The
+/// `place_order` subscription keeps the order's frames that follow, the fill
+/// a cancel races included, and each subscription gets each frame once.
+#[test]
+fn order_subscription_keeps_frames_after_a_cancel_subscription_opens() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    let cancel = bus.send_order_request(OrderId::from(7), &[])?;
+
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::PendingCancel));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-1"));
+    stream.push_inbound(commission_frame("exec-1"));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Cancelled));
+    stream.push_inbound(error_frame(7, 202, "Order Canceled - reason:"));
+    for _ in 0..5 {
+        bus.dispatch()?;
+    }
+
+    let expected = ["OrderStatus", "ExecutionData", "CommissionsAndFeesReport", "OrderStatus", "notice 202"];
+    for (name, sub) in [("place", &place), ("cancel", &cancel)] {
+        let items: Vec<String> = std::iter::from_fn(|| sub.next_timeout_routed(TICK)).map(routed_label).collect();
+        assert_eq!(items, expected, "{name}");
+    }
+    Ok(())
+}
+
+fn routed_label(item: RoutedItem) -> String {
+    match item {
+        RoutedItem::Response(message) => format!("{:?}", message.message_type()),
+        RoutedItem::Notice(notice) => format!("notice {}", notice.code),
+        RoutedItem::Error(e) => format!("error {e}"),
+    }
+}
+
 #[test]
 fn completed_order_routes_to_shared_channel() -> Result<(), Error> {
     let (stream, bus) = make_bus();
