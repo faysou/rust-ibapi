@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `ContractDetails::last_trade_date_time()` joins the expiry date and `last_trade_time` into a `time::PrimitiveDateTime`, wall clock with no zone applied: `2026-12-18 08:30` for ES 202612. `None` when TWS sends the date alone, as for standard monthly US equity options; `Error::Parse` for a time that isn't `HH:MM:SS`. Its rustdoc records that TWS labels the time with the requested exchange's zone while the clock follows the contract (a US equity option on CBOE carries its New York time under `US/Central`), so resolving the zone stays with the caller (#PR).
+- `ContractDetails::last_trade_date_time()` joins the expiry date and `last_trade_time` into a `time::PrimitiveDateTime`, wall clock with no zone applied: `2026-12-18 08:30` for ES 202612. `None` when TWS sends the date alone, as for standard monthly US equity options; `Error::Parse` for a time that isn't `HH:MM:SS`. Its rustdoc records that TWS labels the time with the requested exchange's zone while the clock follows the contract (a US equity option on CBOE carries its New York time under `US/Central`), so resolving the zone stays with the caller (#1276).
 - `ExpirationDate` and `ContractMonth` implement `Copy` (#1260).
 - `ContractDetails::event_contract_topic`, `event_contract_description` and `event_contract_question`: a ForecastEx event contract's topic (`"US Fed Funds Target Rate"`), description (strike, expiry and right, `"FF Jan28'27 3.125"`) and full question. TWS sent them, and the client dropped them. Empty for other contracts. A struct literal or pattern naming every field must add them; see `docs/migration-6.0.md` §35 (#1251).
 - Historical and realtime `Bar`, and `TickLast`, `TickBidAsk`, `TickMidpoint`, `TickAttributeLast` and `TickAttributeBidAsk`, implement `Default`: zero values, empty strings and a Unix-epoch timestamp, with `count` `-1` on a historical `Bar` (what TWS sends for non-TRADES bars) and no `volume` or `wap` on a realtime `Bar` (#1232, #1244).
@@ -84,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Contract details from ICE Europe keep their expiry and last trade time. TWS sends them as `20261218 16:30:00 GB-Eire`, and the decoder split on the `-` in the zone name, as IB's C# client does, leaving `Expiry::Unknown("20261218 16:30:00 GB")` and `last_trade_time` `"Eire"`. Text holding whitespace now splits on whitespace (#PR).
+- Contract details from ICE Europe keep their expiry and last trade time. TWS sends them as `20261218 16:30:00 GB-Eire`, and the decoder split on the `-` in the zone name, as IB's C# client does, leaving `Expiry::Unknown("20261218 16:30:00 GB")` and `last_trade_time` `"Eire"`. Text holding whitespace now splits on whitespace (#1276).
 - `Client::resubscribing` (sync and async) ends after a market data snapshot's `TickTypes::SnapshotEnd`, as its docs said. Previously it kept waiting on a snapshot TWS had finished, and a later reconnect sent the snapshot request again. The same holds for `historical_data(..).subscribe()`, which it now accepts, after `End` (#1246).
 - Code 10349 "Order TIF was set to DAY based on order preset" is a `NoticeCategory::Warning` on any order. TWS goes on with the order after it. It arrives on every `exercise_options` request, where it ended the subscription with an error before the exercise's open order and executions arrived. It now arrives as a notice and the subscription keeps reading (#1210).
 
