@@ -402,3 +402,22 @@ fn what_to_show_trades_for_security_type() {
         assert_eq!(WhatToShow::trades_for(&security_type), expected, "{security_type:?}");
     }
 }
+
+#[test]
+fn what_to_show_trades_for_stream_security_type() {
+    let cases = [
+        (SecurityType::Crypto, Some(WhatToShow::Trades)),
+        (SecurityType::ForexPair, None),
+        (SecurityType::Commodity, None),
+        (SecurityType::CFD, None),
+        (SecurityType::Stock, Some(WhatToShow::Trades)),
+        (SecurityType::Future, Some(WhatToShow::Trades)),
+        (SecurityType::Option, Some(WhatToShow::Trades)),
+        (SecurityType::FuturesOption, Some(WhatToShow::Trades)),
+        (SecurityType::Index, Some(WhatToShow::Trades)),
+        (SecurityType::Other("XYZ".into()), Some(WhatToShow::Trades)),
+    ];
+    for (security_type, expected) in cases {
+        assert_eq!(WhatToShow::trades_for_stream(&security_type), expected, "{security_type:?}");
+    }
+}
