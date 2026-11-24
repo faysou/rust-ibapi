@@ -88,7 +88,9 @@ sequenceDiagram
 3. **Order-based requests**: Routed by order id, with copies to the order update stream:
    - Every subscription opened on an order id (`place_order`, a modify, `cancel_order`)
      receives each of that order's frames once and yields the types its decoder declares, so a
-     cancel or modify takes nothing from the subscription that placed the order.
+     cancel or modify takes nothing from the subscription that placed the order. A TWS error on
+     the order id ends only the newest subscription, whose request drew it; the others receive it
+     as a notice.
    - A live execution carries request id -1. It goes to its order's subscriptions and to the
      order update stream, and its commission report follows it there once by execution id,
      also when a reply listing the execution arrives first. That report is also copied to any

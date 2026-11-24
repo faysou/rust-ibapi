@@ -1302,16 +1302,19 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug> SenderHash<K, RoutedItem> {
     }
 
     /// Deliver `item` to each of `id`'s routes and run `then` on each, all
-    /// under the read lock.
+    /// under the read lock. Routes older than the newest receive
+    /// [`RoutedItem::for_earlier_subscription`].
     fn deliver_then(&self, id: &K, item: RoutedItem, then: impl Fn(&Entry<RoutedItem>)) -> Result<(), RoutedItem> {
         let senders = self.read();
-        let Some(registered) = senders.get(id).filter(|registered| !registered.is_empty()) else {
+        let Some((newest, earlier)) = senders.get(id).and_then(|registered| registered.split_last()) else {
             return Err(item);
         };
-        for entry in registered {
-            entry.deliver(id, item.clone());
+        for entry in earlier {
+            entry.deliver(id, item.for_earlier_subscription());
             then(entry);
         }
+        newest.deliver(id, item);
+        then(newest);
         Ok(())
     }
 

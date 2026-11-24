@@ -1132,6 +1132,10 @@ now stays live and receives each of the order's frames once.
   because it ended, and read the outcome from the cancel, can read both from it.
 - **After a modify**: the earlier `place_order` subscription keeps yielding the order's events
   beside the new one. Drop the subscription you no longer read.
+- **A refused modify or cancel**: its error (105, 104, 10148, ...) ends only the subscription of
+  that request. The order's earlier subscriptions yield it as `SubscriptionItem::Notice` and keep
+  going. Code that read the refusal from the `place_order` subscription as an `Err` reads it as a
+  notice there, or from the modify's or cancel's own subscription.
 
 ### 49. `executions()` replies no longer reach order subscriptions or `order_update_stream`
 
