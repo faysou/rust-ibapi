@@ -763,7 +763,8 @@ pub enum WhatToShow {
     /// `AGGTRADES` with error 321, so a crypto stream needs
     /// [`Trades`](Self::Trades). On stocks and futures `AGGTRADES` draws 10299
     /// and the `TRADES` bars; on forex, 10299 then 162.
-    /// [`trades_for`](Self::trades_for) picks between the two.
+    /// [`trades_for`](Self::trades_for) and [`trades_for_stream`](Self::trades_for_stream) pick
+    /// between the two.
     AggTrades,
     /// Historical volatility computed by IB.
     HistoricalVolatility,
@@ -784,8 +785,7 @@ impl WhatToShow {
     /// - Crypto: [`AggTrades`](Self::AggTrades). TWS serves `TRADES` bars too, the same data, after
     ///   notice 10299; it refuses `TRADES` historical ticks with 10299. A keep-up-to-date
     ///   [`stream`](HistoricalDataBuilder::stream) on crypto must use [`Trades`](Self::Trades)
-    ///   instead: TWS refuses `AGGTRADES` there with error 321, and streams the `TRADES` request
-    ///   after the 10299 notice (which ended the stream in clients before #1298).
+    ///   instead, which [`trades_for_stream`](Self::trades_for_stream) returns.
     /// - Forex pairs, commodities (`XAUUSD`) and CFDs: `None`. TWS answers `TRADES` with error 162
     ///   ("No historical market data"); request [`MidPoint`](Self::MidPoint), [`Bid`](Self::Bid)
     ///   or [`Ask`](Self::Ask) instead.
@@ -810,6 +810,34 @@ impl WhatToShow {
             SecurityType::Crypto => Some(Self::AggTrades),
             SecurityType::ForexPair | SecurityType::Commodity | SecurityType::CFD => None,
             _ => Some(Self::Trades),
+        }
+    }
+
+    /// The `whatToShow` that streams trade-price bars for `security_type` with keep-up-to-date
+    /// ([`stream`](HistoricalDataBuilder::stream)), or `None` where TWS has no trade data for it.
+    ///
+    /// The same as [`trades_for`](Self::trades_for) except for crypto, which takes
+    /// [`Trades`](Self::Trades): TWS refuses `AGGTRADES` with keep-up-to-date (error 321, "Source
+    /// price not supported with live updates") and streams a crypto `TRADES` request after notice
+    /// 10299, which clients before #1298 took as the end of the stream.
+    ///
+    /// Live-checked for crypto, stocks, futures and forex
+    /// (`docs/wire-facts/market-data.md#trade-price-whattoshow-by-security-type`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::SecurityType;
+    /// use ibapi::market_data::historical::WhatToShow;
+    ///
+    /// assert_eq!(WhatToShow::trades_for_stream(&SecurityType::Crypto), Some(WhatToShow::Trades));
+    /// assert_eq!(WhatToShow::trades_for_stream(&SecurityType::Future), Some(WhatToShow::Trades));
+    /// assert_eq!(WhatToShow::trades_for_stream(&SecurityType::ForexPair), None);
+    /// ```
+    pub fn trades_for_stream(security_type: &SecurityType) -> Option<Self> {
+        match security_type {
+            SecurityType::Crypto => Some(Self::Trades),
+            _ => Self::trades_for(security_type),
         }
     }
 }
