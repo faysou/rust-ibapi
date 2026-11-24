@@ -85,10 +85,16 @@ sequenceDiagram
 
 1. **Requests with IDs**: MessageBus creates dedicated channels for responses
 2. **Requests without IDs**: MessageBus uses shared channels for responses
-3. **Order-based requests**: Routed by order id. Every subscription opened on an order id
-   (`place_order`, a modify, `cancel_order`) receives each of that order's frames once and yields
-   the types its decoder declares, so a cancel or modify takes nothing from the subscription
-   that placed the order.
+3. **Order-based requests**: Routed by order id, with copies to the order update stream:
+   - Every subscription opened on an order id (`place_order`, a modify, `cancel_order`)
+     receives each of that order's frames once and yields the types its decoder declares, so a
+     cancel or modify takes nothing from the subscription that placed the order.
+   - A live execution carries request id -1. It goes to its order's subscriptions and to the
+     order update stream, and its commission report follows it there once by execution id,
+     also when a reply listing the execution arrives first. That report is also copied to any
+     request that listed the execution.
+   - A reply to `executions` carries that request's id. The reply, its commission reports, and
+     its end marker go only to that request, whatever order subscriptions are open.
 
 ## Module Structure
 

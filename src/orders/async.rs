@@ -54,6 +54,10 @@ impl Client {
     /// [`FillMatcher`]: they share `execution_id`, and the
     /// matcher joins them in either arrival order.
     ///
+    /// The stream carries what TWS reports as it happens. A reply to
+    /// [`executions`](Self::executions), with its commission reports, goes only
+    /// to the request that asked and never appears here.
+    ///
     /// # Gaps and recovery
     ///
     /// TWS does not replay order events, so two situations leave a gap the
@@ -716,6 +720,15 @@ impl Client {
     /// [`CommissionAndFeesReport`] are delivered on this
     /// stream. To join each commission to its execution, read the reply with
     /// `collect_to_end_within` and pass it to [`FillMatcher::pair_executions`].
+    ///
+    /// The reply reaches only this subscription. An open
+    /// [`place_order`](Self::place_order) subscription or
+    /// [`order_update_stream`](Self::order_update_stream) neither receives it
+    /// nor takes rows from it. A reply that TWS sends between one of this
+    /// client's fills and the fill's commission report lists the fill without
+    /// the report; the live report follows on the order's streams, and is
+    /// copied here too, so a reply can carry a fill's report twice. Key
+    /// commissions by `execution_id`.
     ///
     /// # Examples
     ///

@@ -2341,7 +2341,7 @@ fn execution_data_routes_to_order_channel() -> Result<(), Error> {
     let (stream, bus) = make_bus();
     let sub = bus.send_order_request(OrderId::from(7), &[])?;
 
-    stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 7, "exec-1"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-1"));
     bus.dispatch()?;
 
     let msg = sub.next_timeout(TICK).expect("order sub got no message")?;
@@ -2351,7 +2351,7 @@ fn execution_data_routes_to_order_channel() -> Result<(), Error> {
 }
 
 #[test]
-fn execution_data_falls_back_to_request_channel() -> Result<(), Error> {
+fn execution_reply_routes_to_request_channel() -> Result<(), Error> {
     let (stream, bus) = make_bus();
     let request_id = RequestId::nth(99);
     let sub = bus.send_request(request_id, &[])?;
@@ -2361,6 +2361,108 @@ fn execution_data_falls_back_to_request_channel() -> Result<(), Error> {
 
     let msg = sub.next_timeout(TICK).expect("request sub got no message")?;
     assert_eq!(msg.request_id(), Some(request_id.raw()));
+    Ok(())
+}
+
+/// An `executions` reply carries its request's id: it and its commission
+/// report reach the request that asked, never the order route that got the
+/// live fill, nor the update stream, which already saw that fill.
+#[test]
+fn execution_reply_reaches_request_while_order_route_is_open() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let order_route = bus.send_order_request(OrderId::from(7), &[])?;
+    let updates = bus.create_order_update_subscription()?;
+    let request_id = RequestId::nth(99);
+    let request = bus.send_request(request_id, &[])?;
+
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-1"));
+    stream.push_inbound(commission_frame("exec-1"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, request_id.raw(), 7, "exec-1"));
+    stream.push_inbound(commission_frame("exec-1"));
+    stream.push_inbound(binary_proto(
+        IncomingMessages::ExecutionDataEnd as i32,
+        &crate::proto::ExecutionDetailsEnd {
+            req_id: Some(request_id.raw()),
+        },
+    ));
+    for _ in 0..5 {
+        bus.dispatch()?;
+    }
+
+    let live = [
+        (IncomingMessages::ExecutionData, Some(-1)),
+        (IncomingMessages::CommissionsAndFeesReport, None),
+    ];
+    assert_eq!(frames(&order_route), live, "order route");
+    assert_eq!(frames(&updates), live, "update stream");
+    assert_eq!(
+        frames(&request),
+        [
+            (IncomingMessages::ExecutionData, Some(request_id.raw())),
+            (IncomingMessages::CommissionsAndFeesReport, None),
+            (IncomingMessages::ExecutionDataEnd, Some(request_id.raw())),
+        ],
+        "request"
+    );
+    Ok(())
+}
+
+/// Every frame queued on `sub`, as message type and request id.
+fn frames(sub: &InternalSubscription) -> Vec<(IncomingMessages, Option<i32>)> {
+    std::iter::from_fn(|| sub.next_timeout(TICK))
+        .map(|m| m.unwrap())
+        .map(|m| (m.message_type(), m.request_id()))
+        .collect()
+}
+
+/// TWS sends one commission report per live fill and one per `executions`
+/// reply that lists it. A reply sent before the live report lists the fill
+/// without one, so the live report reaches the update stream and the order
+/// route exactly once, whatever the order, and is copied to the request; the
+/// request may then see the fill's report twice.
+#[test]
+fn commission_reports_follow_live_fills_and_replies() -> Result<(), Error> {
+    let request_id = RequestId::nth(99);
+    let live_exec = || execution_data_frame(CLIENT_ID, -1, 7, "exec-1");
+    let reply_exec = || execution_data_frame(CLIENT_ID, request_id.raw(), 7, "exec-1");
+    let report = || commission_frame("exec-1");
+    let cases: [(&str, Vec<Vec<u8>>, usize); 4] = [
+        ("live exec, reply exec, report", vec![live_exec(), reply_exec(), report()], 1),
+        ("reply exec, live exec, report", vec![reply_exec(), live_exec(), report()], 1),
+        (
+            "live exec, live report, reply exec, reply report",
+            vec![live_exec(), report(), reply_exec(), report()],
+            1,
+        ),
+        (
+            "live exec, reply exec, two reports",
+            vec![live_exec(), reply_exec(), report(), report()],
+            2,
+        ),
+    ];
+    for (name, inbound, request_reports) in cases {
+        let (stream, bus) = make_bus();
+        let order_route = bus.send_order_request(OrderId::from(7), &[])?;
+        let updates = bus.create_order_update_subscription()?;
+        let request = bus.send_request(request_id, &[])?;
+        let count = inbound.len();
+        for frame in inbound {
+            stream.push_inbound(frame);
+        }
+        for _ in 0..count {
+            bus.dispatch()?;
+        }
+
+        let live = vec![
+            (IncomingMessages::ExecutionData, Some(-1)),
+            (IncomingMessages::CommissionsAndFeesReport, None),
+        ];
+        let mut reply = vec![(IncomingMessages::ExecutionData, Some(request_id.raw()))];
+        reply.extend(std::iter::repeat_n((IncomingMessages::CommissionsAndFeesReport, None), request_reports));
+        assert_eq!(frames(&order_route), live, "{name}: order route");
+        assert_eq!(frames(&updates), live, "{name}: update stream");
+        assert_eq!(frames(&request), reply, "{name}: request");
+    }
     Ok(())
 }
 
@@ -2409,7 +2511,7 @@ fn commission_and_fees_report_routes_via_execution_id_mapping() -> Result<(), Er
     let (stream, bus) = make_bus();
     let sub = bus.send_order_request(OrderId::from(7), &[])?;
 
-    stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 7, "exec-abc"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-abc"));
     stream.push_inbound(binary_proto(
         crate::messages::IncomingMessages::CommissionsAndFeesReport as i32,
         &crate::proto::CommissionAndFeesReport {
@@ -2894,16 +2996,23 @@ fn execution_aliases_pruned_when_subscriptions_drop() -> Result<(), Error> {
     stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 0, "exec-request"));
     bus.dispatch()?;
     bus.dispatch()?;
-    assert_eq!(bus.executions.len(), 2, "both executions mapped");
+    assert!(bus.executions.contains(&"exec-order".to_string()), "order execution not mapped");
+    assert!(
+        bus.executions_requested.contains(&"exec-request".to_string()),
+        "request execution not mapped"
+    );
 
     drop(order);
     drain_cleanup_signals(&bus);
-    assert!(!bus.executions.contains(&"exec-order".to_string()), "order alias leaked");
-    assert!(bus.executions.contains(&"exec-request".to_string()), "live request alias pruned");
+    assert_eq!(bus.executions.len(), 0, "order alias leaked");
+    assert!(
+        bus.executions_requested.contains(&"exec-request".to_string()),
+        "live request alias pruned"
+    );
 
     drop(executions);
     drain_cleanup_signals(&bus);
-    assert_eq!(bus.executions.len(), 0, "request alias leaked");
+    assert_eq!(bus.executions_requested.len(), 0, "request alias leaked");
 
     bus.request_shutdown();
     handle.join().expect("cleanup thread join");
@@ -4402,10 +4511,7 @@ fn foreign_execution_answers_requests_only() -> Result<(), Error> {
         .collect();
     assert_eq!(types, [IncomingMessages::ExecutionData, IncomingMessages::CommissionsAndFeesReport]);
     assert!(order_route.next_timeout(TICK).is_none(), "order route got it");
-    let updates: Vec<_> = std::iter::from_fn(|| updates.next_timeout(TICK))
-        .map(|m| m.unwrap().message_type())
-        .collect();
-    assert!(!updates.contains(&IncomingMessages::ExecutionData), "update stream got {updates:?}");
+    assert!(updates.next_timeout(TICK).is_none(), "update stream got it");
     Ok(())
 }
 
