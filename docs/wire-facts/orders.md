@@ -111,6 +111,35 @@ paper Gateway, server 220 (#841, closed, not a bug).*
 - `seek_price_improvement` unset → open order reports `Some(false)`: TWS sends an explicit
   false.
 
+### What-if answer frames
+
+*Live 2026-11-24 off-hours (04:15 ET), paper TWS, server 223; raw capture of `openOrder`
+frames; #PR.*
+
+| Order (what-if)                                              | Frames | Margin fields           | Commission             | Then    |
+| ------------------------------------------------------------ | ------ | ----------------------- | ---------------------- | ------- |
+| AAPL BUY 10 LMT 100, SELL 5 LMT 900                          | 2      | 1st absent, 2nd present | 1st `0`, 2nd `1.00003` | nothing |
+| AAPL BUY 5 MKT; ES H7 LMT; EUR.USD LMT and MKT; SAP IBIS LMT | 1      | present                 | present                | nothing |
+| AAPL BUY 10,000,000 LMT 1                                    | 2      | 1st absent, 2nd present | 1st `0`, 2nd absent    | 201     |
+| AAPL BUY 10,000,000 MKT; ES H7 BUY or SELL 100,000           | 1      | present                 | absent                 | 201     |
+
+- The first frame of a two-frame answer carries only `status` (PreSubmitted), `commission_and_fees
+  = 0` and `warning_text` (the limit-price collar warning, "If your order is not immediately
+  executable..."): no margin fields, no currencies. The second, 0 to 80 ms later (three runs),
+  carries the margins, commission and currencies and no `warning_text`. A consumer that
+  takes the first frame reports no margins and a zero commission. A stock market order drew no
+  warning and one frame.
+- An order the account's margin cannot carry: the frame with margins has `suggested_size` set
+  (`"4000"`, `"14"`, `"16"`) and no commission or commission currency; an error 201 "YOUR ORDER
+  IS NOT ACCEPTED. IN ORDER TO OBTAIN THE DESIRED POSITION ... MUST EXCEED ..." follows within
+  1 ms. No accepted what-if carried `suggested_size`.
+- No `orderStatus`, `openOrderEnd` or other end marker follows any what-if answer; the reply
+  stays silent for the 6 to 10 s read.
+- Rejected before any frame: unknown symbol, 200; EUR.USD LMT -1, 110; EUR.USD 500,000,000,
+  201 "Order size is not within the limits".
+- **Not probed:** RTH (the US stock frames may differ at the open); options, combos and other
+  warnings; Gateway (the 2026-10-27 SPY probe above ran on Gateway 226 and did not count frames).
+
 ### IBKRATS PEG BEST / PEG MID
 
 *Live 2026-10-04 (Sunday), paper Gateway, AAPL on IBKRATS, BUY 100 @ $1; #936.*
