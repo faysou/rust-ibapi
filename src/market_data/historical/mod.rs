@@ -787,9 +787,13 @@ pub enum WhatToShow {
     BidAsk,
     /// Aggregated trade data (wire value `AGGTRADES`).
     ///
-    /// Required for crypto contracts: TWS rejects `TRADES` for crypto with
-    /// error 10299, so crypto trade-price series must be requested as `AGGTRADES`.
-    /// Other security types reject `AGGTRADES` with 10299.
+    /// The trade-price series for crypto. A crypto `TRADES` bar request draws
+    /// notice 10299 ("Expected what to show is AGGTRADES") and is then served
+    /// this series; historical ticks are refused with 10299. With
+    /// `keepUpToDate` ([`stream`](HistoricalDataBuilder::stream)) TWS refuses
+    /// `AGGTRADES` with error 321, so a crypto stream needs
+    /// [`Trades`](Self::Trades). On stocks and futures `AGGTRADES` draws 10299
+    /// and the `TRADES` bars; on forex, 10299 then 162.
     /// [`trades_for`](Self::trades_for) picks between the two.
     AggTrades,
     /// Historical volatility computed by IB.
@@ -808,7 +812,11 @@ impl WhatToShow {
     /// The `whatToShow` that requests trade prices for `security_type`, or `None` where TWS has
     /// no trade data for it.
     ///
-    /// - Crypto: [`AggTrades`](Self::AggTrades). TWS rejects `TRADES` with error 10299.
+    /// - Crypto: [`AggTrades`](Self::AggTrades). TWS serves `TRADES` bars too, the same data, after
+    ///   notice 10299; it refuses `TRADES` historical ticks with 10299. A keep-up-to-date
+    ///   [`stream`](HistoricalDataBuilder::stream) on crypto must use [`Trades`](Self::Trades)
+    ///   instead: TWS refuses `AGGTRADES` there with error 321, and streams the `TRADES` request
+    ///   after the 10299 notice (which ended the stream in clients before #1298).
     /// - Forex pairs, commodities (`XAUUSD`) and CFDs: `None`. TWS answers `TRADES` with error 162
     ///   ("No historical market data"); request [`MidPoint`](Self::MidPoint), [`Bid`](Self::Bid)
     ///   or [`Ask`](Self::Ask) instead.
