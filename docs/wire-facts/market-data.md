@@ -278,8 +278,8 @@ Accepted trade-price `whatToShow`, or the error a rejected one drew:
   updates" and nothing else, so TRADES is the only way to stream crypto trade bars. AAPL, ES and
   EUR.USD AGGTRADES with `keepUpToDate` draw 10299, then 321 (2026-11-24, #1298).
 - Historical ticks TRADES on EUR.USD: TWS answers with one `HistoricalTicks` frame (midpoint
-  ticks, size `"0"`, `done`), not `HistoricalTicksLast`. `historical_ticks(..).last()` does not
-  read it and waits until its deadline. XAUUSD and IBUS500 drew no ticks and no error in 30 s, and were not
+  ticks, size `"0"`, `done`), not `HistoricalTicksLast`. `historical_ticks(..).last()` ends
+  with `Error::UnexpectedTickKind` on it ([another kind](#historical-ticks-of-another-kind)). XAUUSD and IBUS500 drew no ticks and no error in 30 s, and were not
   captured raw.
 - A stock CFD (AAPL, rerouted on `reqMktData`) drew no answer to TRADES or MIDPOINT historical
   bars within 40 s; realtime bars drew notice 2127 and no bars.
