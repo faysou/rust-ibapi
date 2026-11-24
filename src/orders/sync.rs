@@ -399,8 +399,14 @@ impl Client {
     /// - accepts a new limit price, quantity or time in force;
     /// - refuses another action or contract with 105, and another order type with 329;
     /// - refuses a zero quantity with 321, so send every field, not only the changed ones;
+    /// - reads the quantity as the order's total, filled shares included: on a partly filled
+    ///   order it refuses the filled quantity with 434, and a smaller one with 355 sent under
+    ///   order ID 0, which reaches no subscription on the order, only
+    ///   [`order_update_stream`](Self::order_update_stream);
     /// - refuses the ID of a filled, cancelled or rejected order with 104, and of an order it
-    ///   has not acknowledged yet with 103;
+    ///   has not acknowledged yet with 103. A modify that a fill overtakes draws 201 ("Order is
+    ///   already filled") after the `Filled` status; until then the order echoes the new terms
+    ///   with status `PendingSubmit` while it fills on the old ones;
     /// - sends nothing for a modify of a held order (`transmit` false); the modify that sets
     ///   `transmit` releases it with the new terms.
     ///
