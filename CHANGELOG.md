@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `Currency::default()`, and so the currency of `Contract::default()` and of a `Contract` struct literal ending in `..Default::default()`, is empty instead of `"USD"`. TWS resolves an empty currency when the other fields name one listing, so a non-USD future, index or stock built that way (HSI on HKFE, `700` on SEHK) no longer fails with error 200. A stock on `SMART` listed in several currencies now needs its currency set for market data and orders. The builders still default to USD. See `docs/migration-6.0.md` §44 (#PR).
 - `ContractDetails::under_security_type` is `Option<SecurityType>` instead of `String`, `None` where TWS sends nothing. JSON written by 5.x (`"STK"`, `""`) no longer deserializes. See `docs/migration-6.0.md` §41 (#1254).
 - `OptionChain::expirations` is `Vec<Expiry>` instead of `Vec<String>`. TWS sends each expiration as a `YYYYMMDD` date, now an `Expiry::Date(ExpirationDate)` that goes straight into `Contract::option`; a `YYYYMM` entry is an `Expiry::Month`, other text is kept as `Expiry::Unknown`, and an empty entry is dropped. `Expiry` has no order; the new `Expiry::date()` and `Expiry::month()` return the inner date or month by value, which do. See `docs/migration-6.0.md` §40 (#1253).
 - `ContractDescription::derivative_security_types` is `Vec<SecurityType>` instead of `Vec<String>`. A code the crate doesn't model is `SecurityType::Other`, and an empty entry is dropped. See `docs/migration-6.0.md` §42 (#1261).
