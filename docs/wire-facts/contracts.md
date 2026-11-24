@@ -41,9 +41,74 @@ Contract details and option chains. Format: [README](README.md).
   OSE.JPN (N225 → `Japan`), HKFE (HSI → `Hongkong`); FOP ES 202612 (6943 contracts); OPT SPX
   (`US/Central`) and SAP on EUREX. AAPL OPT on SMART sends the date alone (`20261218`), no time
   or zone. So dropping the zone loses nothing.
+- *Live 2026-11-23, paper TWS, server 223:* the label still matches `time_zone_id` when the
+  clock does not: AAPL options on CBOE carry New York times under `US/Central`
+  ([last trade time](#last-trade-time-and-the-expiry-session)).
 - **Not probed:** the gateway build behind server 226 (the handshake doesn't report it), so
   an NT adapter note of 10372 on Gateway 10.51 is neither confirmed nor ruled out; live
   (non-what-if) orders; bonds.
+
+### `GB-Eire` last trade dates
+
+*Live 2026-11-23 18:45 ET off-hours, paper TWS, server 223; contract_details.*
+
+- ICE Europe sends tag 4 with a hyphenated zone: `20261218 16:30:00 GB-Eire` (VOD options,
+  144 contracts), `20261218 10:15:00 GB-Eire` (Z 202612), `20270325 11:00:00 GB-Eire` (R
+  202703), `20270315 10:00:00 GB-Eire` (I 202703). `time_zone_id` is `GB-Eire`, and an LSE
+  stock (VOD, BARC, HSBA) carries it too.
+- C#'s `SetLastTradeDate` splits on `-` whenever the text holds one, so it cuts these inside the
+  zone name: date `20261218 16:30:00 GB`, time `Eire`. The decoder splits text holding
+  whitespace on whitespace and keeps the `-` split for text without it.
+- **Not probed:** whether TWS ever sends the `YYYYMMDD-HH:MM:SS` form the `-` split exists for.
+
+### Last trade time and the expiry session
+
+*Live 2026-11-23 18:45-19:00 ET off-hours (Thanksgiving week), paper TWS, server 223;
+contract_details.*
+
+| Contract | Exchange | Tag 4 | `timeZoneId` | `realExpirationDate` | Session on the expiry date |
+| --- | --- | --- | --- | --- | --- |
+| AAPL OPT weekly 20261127 | SMART | `20261127 13:15:00 US/Eastern` | `US/Eastern` | 20261127 | `0930-1315` |
+| AAPL OPT weekly 20261127 | CBOE | `20261127 13:15:00 US/Central` | `US/Central` | 20261127 | `0830-1215` |
+| AAPL OPT weekly 20261204 | SMART | `20261204 16:15:00 US/Eastern` | `US/Eastern` | 20261204 | not listed |
+| AAPL OPT 20261218, 20270115 | SMART, CBOE | `20261218` (date alone) | `US/Eastern`, `US/Central` | same date | not listed |
+| SPXW OPT 20261124 | CBOE | `20261124 15:00:00 US/Central` | `US/Central` | 20261124 | `0830-1500` |
+| SPXW OPT 20261218 | CBOE | `20261218 15:00:00 US/Central` | `US/Central` | 20261218 | not listed |
+| SPX OPT (AM) Dec 2026 | CBOE | `20261217 16:00:00 US/Central` | `US/Central` | 20261218 | not listed |
+| ES FUT, ES FOP 202612 | CME | `20261218 08:30:00 US/Central` | `US/Central` | 20261218 | not listed |
+| ES FOP weekly EW4 | CME | `20261127 12:00:00 US/Central` | `US/Central` | 20261127 | `1700-1200` |
+| CL FUT 202701 | NYMEX | `20261221 14:30:00 US/Eastern` | `US/Eastern` | 20261221 | not listed |
+| ZC FUT 202703 | CBOT | `20270312 12:01:00 US/Central` | `US/Central` | 20270312 | not listed |
+| FESX, OESX 202612 | EUREX | `20261218 12:00:00 MET` | `MET` | 20261218 | not listed |
+| FDAX 202612 | EUREX | `20261218 13:00:00 MET` | `MET` | 20261218 | not listed |
+| N225 FUT 202612 | OSE.JPN | `20261210 15:45:00 Japan` | `Japan` | 20261211 | not listed |
+| HSI FUT 202612 | HKFE | `20261230 16:00:00 Hongkong` | `Hongkong` | 20261230 | not listed |
+| Z FUT 202612 | ICEEU | `20261218 10:15:00 GB-Eire` | `GB-Eire` | 20261218 | not listed |
+
+- A time comes with every future, futures option, index option, EUREX, OSE, HKFE and ICE
+  Europe contract seen, and with US equity weeklies. Standard monthly US equity options send
+  the date alone.
+- The zone in tag 4 always equalled `timeZoneId`, but for US equity options the clock does not
+  follow it: on CBOE, AAPL and MSFT 20261127 send `13:15:00 US/Central` while CBOE's session
+  that day ends at `12:15` Central, and AAPL 20261204 sends `16:15:00 US/Central`. The time is
+  the contract's New York time under the requested exchange's zone label. SPX on CBOE and
+  SPXW on SMART carry Central times under `US/Central`.
+- Zone names seen: `US/Eastern`, `US/Central`, `MET`, `GB-Eire`, `Japan`, `Hongkong`. All are
+  legacy aliases, none a canonical IANA name.
+- A contract's own `tradingHours` end on its expiry date when that date falls in the listed
+  week, and that last session closes at the last trade time (SPXW 20261124 closes at 15:00
+  against 16:00 on other days; AAPL 20261125 lists nothing after it). Later expiries have no
+  session in the list, and a regular session's close is not the last trade time: ES trades to
+  16:00 Central on other days but stops at 08:30 on its last day, CL at 14:30 against 17:00,
+  FESX at 12:00 against 22:05.
+- An AM-settled SPX option's tag 4 is its last trading day, a Thursday (20261217), and
+  `realExpirationDate` holds the Friday. Querying it by 20261218 draws 200. N225 has the
+  same shape (trades to 20261210, expires 20261211).
+- AAPL OPT sessions on SMART run to 16:15 New York and its weeklies carry `16:15:00`: the
+  time matches IB's session close. Compared with no exchange's published hours.
+- **Not probed:** UK or HK stock options (VOD options on ICEEU answered; `700` on HKFE drew
+  200), bonds, and whether a date-alone contract gains a time once its expiry enters the
+  listed week.
 
 ### Open-order echo of `lastTradeDateOrContractMonth` (tag 4)
 
