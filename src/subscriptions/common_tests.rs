@@ -245,6 +245,7 @@ fn rejection_ends_request_only_for_verified_codes() {
         case("TickMidpoint", rejection_ends::<TickMidpoint>, Some(200), 10197),
         case("MarketDepths", rejection_ends::<MarketDepths>, Some(200), 10197),
         case("HistoricalBarUpdate", rejection_ends::<HistoricalBarUpdate>, Some(200), 162),
+        case("HistoricalBarUpdate", rejection_ends::<HistoricalBarUpdate>, Some(321), 162),
         case("PnL", rejection_ends::<PnL>, Some(321), 200),
         case("PnLSingle", rejection_ends::<PnLSingle>, Some(321), 200),
         case("Vec<ScannerData>", rejection_ends::<Vec<ScannerData>>, Some(162), 309),
@@ -265,4 +266,19 @@ fn rejection_ends_request_only_for_verified_codes() {
     }
     // A one-shot query has nothing to continue after any error.
     assert!(rejection_ends::<HistoricalDataFrame>(10197));
+}
+
+/// Only the historical bar decoders read on after 10299: TWS sends their series anyway. Another
+/// terminal code still ends them, and other decoders still end on 10299.
+#[test]
+fn error_continues_request_only_for_10299_on_historical_bars() {
+    use crate::market_data::historical::{HistoricalBarUpdate, HistoricalDataFrame};
+    use crate::market_data::realtime::TickTypes;
+
+    let continues = |hook: fn(&Notice) -> bool, code| hook(&Notice::synthesized(code, String::new()));
+    assert!(continues(HistoricalDataFrame::error_continues_request, 10299));
+    assert!(continues(HistoricalBarUpdate::error_continues_request, 10299));
+    assert!(!continues(HistoricalDataFrame::error_continues_request, 162));
+    assert!(!continues(HistoricalBarUpdate::error_continues_request, 162));
+    assert!(!continues(TickTypes::error_continues_request, 10299));
 }
