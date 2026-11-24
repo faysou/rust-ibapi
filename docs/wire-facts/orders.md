@@ -137,6 +137,9 @@ frames; #1289.*
   stays silent for the 6 to 10 s read.
 - Rejected before any frame: unknown symbol, 200; EUR.USD LMT -1, 110; EUR.USD 500,000,000,
   201 "Order size is not within the limits".
+- The answer's frames reach `order_update_stream` as well as the place-order reply, each with
+  `order.what_if = true` (live 2026-11-24 10:59 UTC, `Client::analyze_order`: AAPL BUY 10 LMT
+  100 two frames 33 ms apart, EUR.USD BUY 20,000 LMT 1.0 one frame with commission `2`).
 - **Not probed:** RTH (the US stock frames may differ at the open); options, combos and other
   warnings; Gateway (the 2026-10-27 SPY probe above ran on Gateway 226 and did not count frames).
 
