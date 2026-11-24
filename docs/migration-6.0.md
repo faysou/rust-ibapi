@@ -1028,3 +1028,18 @@ and no longer matches. A serialized `Contract` with one of these types writes `"
 or `"EventContract"` where it wrote `{"Other":"IOPT"}`, and JSON written by 5.x for them still
 deserializes as `Other`, which compares unequal to the new variant; re-parse with
 `t.as_str().parse()` to normalize.
+
+### 45. Error 10089 ends the subscription
+
+5.x treated 10089 ("Requested market data requires additional subscription for API ... Delayed
+market data is available") as a data advisory (#677): a `market_data`, `realtime_bars` or
+`tick_by_tick` stream yielded it as `SubscriptionItem::Notice` and stayed open. TWS sends
+nothing after it, whatever the market data type, so the stream waited forever, and its drop sent
+a cancel TWS answered with 300 (`docs/wire-facts/market-data.md#market-data-type-and-permission-notices`).
+
+It is now the stream's terminal error, `Err(Error::Notice)` with code 10089, and no cancel is
+sent. `Notice::category()` returns `NoticeCategory::Error` for it, `is_informational()` is
+`false`, and `DATA_ADVISORY_CODES` no longer lists it. Code that waited for delayed data after
+10089 should instead set a delayed market data type (`switch_market_data_type`); TWS then sends
+10167, which stays an advisory, before the delayed ticks.
+
