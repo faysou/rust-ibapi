@@ -433,6 +433,28 @@ notice carried the order id as its request id and reached both the `place_order`
   [cash quantity](#cash-quantity).
 - **Not probed:** 10244 on other stocks; the same codes on IB Gateway or a live account.
 
+### Orders TWS discards (461 and 10311)
+
+*Live 2026-11-24 22:03-22:23 UTC (SEHK and TSE closed), paper TWS, server 223.*
+
+| Code | Order | Message |
+| ---- | ----- | ------- |
+| 461 | 700 SEHK BUY 150 LMT 320; 7203 SMART BUY 150 LMT 2000 (board lot 100) | "BUY 150 700 SEHK @ 320.00: Order size 150 is not correct; it should be a multiple of 100" |
+| 10311 | 7203 TSEJ BUY 100 LMT 2000 | "This order will be directly routed to TSEJ. Direct routed orders may result in higher trade fees. Restriction is specified in Precautionary Settings of Global Configuration/API." |
+
+- Each notice carried the order id and came on the `place_order` reply with no OpenOrder or
+  OrderStatus before it, 0.2 s (10311) to 2.4 s (461) after the order was sent.
+  `all_open_orders` afterwards listed neither order.
+- A `cancel_order` sent at once drew OrderStatus `Cancelled`, 202 "Order Canceled - reason:Order
+  was discarded." and 161 "Cancel attempted when order is not in a cancellable state", for both
+  codes. An order TWS never created draws 10147 instead: TWS assigned a perm id and discarded
+  the order, as it does with a 201.
+- The same 7203 order with `SMART` and 100 shares rested (Submitted) and was cancelled normally.
+  A size below the lot drew 388 and an off-tick price 110, both before the routing check.
+- 10311 names a TWS setting, so whether it fires depends on the TWS configuration.
+- **Not probed:** other exchanges for 10311; the other precautionary codes; TWS with the setting
+  off; 461 on a modify.
+
 ### Refused modifies leave the order working
 
 *Live 2026-11-23 23:12-23:23Z, paper TWS, server 223. AAPL BUY 1 LMT 1.00 resting off-hours

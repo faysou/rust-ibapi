@@ -257,7 +257,7 @@ fn notice_is_order_rejection() {
     let start = *ORDER_REJECTION_CODE_RANGE.start();
     let end = *ORDER_REJECTION_CODE_RANGE.end();
 
-    for code in [201, 203, 355, end - 1, end, 103, 110, 10244, 10317] {
+    for code in [201, 203, 355, end - 1, end, 103, 110, 461, 10244, 10311, 10317] {
         assert!(
             helpers::test_notice(code, "").is_order_rejection(),
             "code {code} should be order rejection"
@@ -367,6 +367,8 @@ fn notice_category_partition() {
         (110, NoticeCategory::OrderRejection),            // price off the minimum tick
         (10244, NoticeCategory::OrderRejection),          // cash quantity not allowed
         (10317, NoticeCategory::OrderRejection),          // cash quantity off its minimum variation
+        (461, NoticeCategory::OrderRejection),            // size not a multiple of the board lot
+        (10311, NoticeCategory::OrderRejection),          // direct routing refused by a precautionary setting
         (104, NoticeCategory::OrderChangeRejection),      // modify of a finished order
         (105, NoticeCategory::OrderChangeRejection),      // modify changes side or contract
         (10067, NoticeCategory::OrderChangeRejection),    // trailing stop price changed alone

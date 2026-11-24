@@ -1192,7 +1192,7 @@ Each was verified against a paper account (`docs/wire-facts/orders.md`):
 
 | Codes | Category | Meaning |
 | ----- | -------- | ------- |
-| 103, 110, 10244, 10317 | `OrderRejection` | TWS rejected a new order and created none |
+| 103, 110, 461, 10244, 10311, 10317 | `OrderRejection` | TWS rejected a new order and created none |
 | 104, 105, 10067, 10147, 10148, 10241, 10242 | `OrderChangeRejection` (new) | TWS refused a cancel or modify, and the request changed nothing |
 
 `NoticeCategory` is `#[non_exhaustive]`, so a `match` compiles unchanged, but a
