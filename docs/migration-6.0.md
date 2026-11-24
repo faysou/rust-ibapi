@@ -1043,3 +1043,7 @@ on both clients.
   answered a reply, including one for another client's execution, no longer arrives here.
 - **`place_order`**: no longer yields a second copy of an execution, with its commission report,
   when any `executions()` call runs while the subscription is open.
+- **`executions()`**: a reply TWS sends between one of this client's fills and the fill's
+  commission report lists the fill without the report. The live report still reaches the
+  order's streams and is copied to the request, so a reply can carry a fill's report twice.
+  Key commissions by `execution_id`.
