@@ -2,9 +2,7 @@ use super::order_builder::{AttachedOrdersBuilder, BracketOrderBuilder, ClientBou
 use super::types::{AttachedOrderIds, BracketOrderIds};
 use crate::client::sync::Client;
 use crate::errors::Error;
-use crate::orders::common::what_if::WhatIfReply;
 use crate::orders::OrderId;
-use crate::orders::PlaceOrder;
 impl OrderBuilder<ClientBound<'_, Client>> {
     /// Submit the order synchronously
     /// Returns the order ID assigned to the submitted order
@@ -26,7 +24,8 @@ impl OrderBuilder<ClientBound<'_, Client>> {
     /// Returns the order state that carries the margins and commission. TWS answers some orders
     /// (live: US stock limit orders) with a warning-only frame first; the returned state keeps
     /// that frame's [`warning_text`](crate::orders::OrderState::warning_text) (live: 2026-11-24,
-    /// server 223; `docs/wire-facts/orders.md#what-if-answer-frames`).
+    /// server 223; `docs/wire-facts/orders.md#what-if-answer-frames`). For an order built
+    /// elsewhere, use [`Client::analyze_order`].
     ///
     /// # Errors
     /// [`Error::Validation`] if the builder's inputs fail validation, before anything is sent;
@@ -49,28 +48,10 @@ impl OrderBuilder<ClientBound<'_, Client>> {
     ///     state.initial_margin_before, state.initial_margin_after, state.commission_and_fees, state.commission_and_fees_currency
     /// );
     /// ```
-    pub fn analyze(mut self) -> Result<crate::orders::OrderState, Error> {
-        self.what_if = true;
+    pub fn analyze(self) -> Result<crate::orders::OrderState, Error> {
         let ClientBound { client, contract } = self.target;
-        let order_id = client.next_order_id();
         let order = self.build()?;
-
-        let responses = client.place_order(order_id, contract, &order)?;
-
-        // `?` propagates a rejected what-if order (#735), including the 201 that follows the
-        // margins of an order the account cannot carry.
-        let mut reply = WhatIfReply::default();
-        for response in responses.iter_data() {
-            if let PlaceOrder::OpenOrder(order_data) = response? {
-                if order_data.order_id == order_id {
-                    if let Some(state) = reply.observe(order_data.order_state) {
-                        return Ok(state);
-                    }
-                }
-            }
-        }
-
-        Err(Error::UnexpectedEndOfStream)
+        client.analyze_order(contract, &order)
     }
 }
 
