@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Show first 5 and last 5 bars
         for (i, bar) in historical_data.bars.iter().take(5).enumerate() {
             println!(
-                "Bar {}: {} - O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}, V: {:.0}",
+                "Bar {}: {} - O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}, V: {:.0?}",
                 i + 1,
                 format_time(&bar.date),
                 bar.open,
@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let start_idx = historical_data.bars.len() - 5;
             for (i, bar) in historical_data.bars.iter().skip(start_idx).enumerate() {
                 println!(
-                    "Bar {}: {} - O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}, V: {:.0}",
+                    "Bar {}: {} - O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}, V: {:.0?}",
                     start_idx + i + 1,
                     format_time(&bar.date),
                     bar.open,
@@ -170,13 +170,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Daily bars received: {}", daily_data.bars.len());
         for bar in daily_data.bars.iter().take(5) {
             println!(
-                "{}: O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}, V: {:.0}K",
+                "{}: O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}, V: {:.0?}K",
                 format_time(&bar.date),
                 bar.open,
                 bar.high,
                 bar.low,
                 bar.close,
-                bar.volume / 1000.0
+                bar.volume.map(|volume| volume / 1000.0)
             );
         }
 
@@ -256,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(HistoricalBarUpdate::Update(bar)) => {
                 println!(
-                    "UPDATE: {} - O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}, V: {:.0}",
+                    "UPDATE: {} - O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}, V: {:.0?}",
                     format_time(&bar.date),
                     bar.open,
                     bar.high,

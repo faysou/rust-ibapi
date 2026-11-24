@@ -55,7 +55,10 @@ fn historical_data_daily() {
         .expect("historical_data failed");
 
     assert!(!data.bars.is_empty(), "expected non-empty bars");
-    assert!(data.bars[0].volume >= 0.0, "volume should be non-negative");
+    assert!(
+        data.bars[0].volume.is_some_and(|volume| volume >= 0.0),
+        "a TRADES bar has a non-negative volume"
+    );
 }
 
 #[test]
