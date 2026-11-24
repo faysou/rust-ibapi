@@ -306,7 +306,7 @@ and EUR.USD BUY 20,000 MKT cancelled right after placing.*
 ### Modifying an order
 
 *Live 2026-11-24 off-hours (04:25-04:36 ET), paper TWS, server 223; EUR.USD BUY 20,000 LMT 0.95
-(Submitted), modified with `place_order` on the same id; #PR.*
+(Submitted), modified with `place_order` on the same id; #1282.*
 
 | Modify sent                                                       | Reply                                                                                |
 | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
