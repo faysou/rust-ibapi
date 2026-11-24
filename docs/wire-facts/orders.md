@@ -145,7 +145,23 @@ fills, each read on `place_order`, `order_update_stream` and `executions`. Guard
   for the fill came 8 s later with `last_fill_price` 0, and `executions` afterwards listed all
   three. A raw capture of the next order (3 fills) showed the normal shape, so whether TWS
   skipped the frames or the client dropped them is not settled.
-- **Not probed:** US equity option combos (market closed), SMART-routed combos, more than two
+- **US option combos on `SMART`** (*live 2026-11-24 16:06-16:09 UTC, US market open, paper
+  TWS, server 223; AAPL Dec 2026 350/355 call vertical, BAG on `SMART` with `SMART` legs,
+  market orders of 1, sold then bought back*): the same shape and order as on CME. Combo-level
+  execution first, then both legs within 14 ms, the higher con id first (the 355 call,
+  927346994, before the 350 call, 692808279); execution ids `.01.01`, `.02.01`, `.03.01`; one
+  commission report per leg (1.03 to 1.05 USD) 1 to 9 ms after the second leg, none for the combo.
+  The combo-level contract id was 28812380 for both fills and for another client's AAPL combo
+  that executed on BOX.
+- **Executing venue, not `SMART`**: each fill's three executions carry the venue that executed
+  it as the contract's exchange, `PHLX` for the sale and `EDGX` for the buy-back, so
+  `Fill::combo_legs` gave the legs with `PHLX` and then `EDGX`. `completed_orders` echoed both
+  orders' legs with exchange `SMART`, contract ids sorted, ratio 1, `Buy` 350 and `Sell` 355,
+  which match the derived legs except for the exchange.
+- A `SMART` combo buy sent while a single-leg sell of one of its legs was still working drew 201
+  "Order rejected - reason:Cannot have open orders on both sides of the same US Option
+  contract." (Inactive, then the 201).
+- **Not probed:** SMART-routed futures combos, more than two
   legs, a leg execution before its combo-level execution, a combo-level report, execution
   corrections (an id ending `.02`), several combo fills interleaved, Gateway.
 
