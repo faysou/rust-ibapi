@@ -71,6 +71,30 @@ of `"0"`:
   delayed ticks carry no attributes); empty sides in tick-by-tick bid/ask or last (no real-time
   data on an illiquid contract); RTH equity and option quotes.
 
+### Option computation ticks during US hours
+
+*Live 2026-11-24 15:57-16:04 UTC, US market open, paper TWS, server 223; streaming `reqMktData`
+for 30 s on AAPL Dec 2026 350 call and put, Nov 27 350 call and Dec 500 call, and ES Dec 2026
+7500 call and put; raw capture decoded.*
+
+- Delayed data (type 3): `DelayedBidOption` (80), `DelayedAskOption` (81), `DelayedLastOption`
+  (82) and `DelayedModelOption` (83), 172 frames in all. Bid, ask and last arrived 6 to 12 times
+  per contract in 30 s, the model 1 to 4 times. No real-time computation tick (10 to 13) came.
+- Real-time data (type 1) on the AAPL options and the ES option: 354, and no computation tick.
+- A field TWS has not computed is sent as a value, never left out: `-1` for implied volatility
+  and the option price, `-2` for delta, gamma, vega and theta. Every frame carried all eleven
+  fields. 20 of the 158 bid, ask and last frames carried `-1` and `-2` for implied volatility
+  and every greek, 11 of them also `-1` for the price (a side with no quote); the other 138
+  carried them all. The first model frame of the AAPL 350 call sent present value of dividends
+  `-1`, its later ones `0`; bid, ask and last sent `0` there every time.
+- A real value can equal a sentinel of the other group: `DelayedLastOption` on the ES 7500 put
+  sent theta `-1.0`, then `-1.25`, `-0.5` and `-0.0` as its last price aged (the other
+  computations of that put had theta about `-1.9`). Theta `-1` is a value; only `-2` means not
+  computed for a greek.
+- `tick_attribute` was `0` (return based) on every frame. `underlying_price` was always set.
+- **Not probed:** real-time computations (no option data permission); snapshots during US
+  hours; index options.
+
 ### TickEFP is never sent
 
 *Live 2026-05-27, paper Gateway, server 220+; removed in v3.0 (#651).*

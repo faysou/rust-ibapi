@@ -548,8 +548,23 @@ with `override_natural_action`.*
   day.
 - The open order has no field marking it as an exercise; only the shared `permId` links it to the
   executions.
-- **Not probed:** lapse, assignment, automatic exercise at expiry, puts, futures options, and
-  exercising from a client other than the one that bought.
+- **Again during US hours** (*live 2026-11-24 16:23 and 16:31 UTC, paper TWS, server 223;
+  AAPL Nov 27 2026 calls, bought by one client and exercised by another*): the same frames and
+  order. The 340 call (in the money, AAPL at 352): 10349, OpenOrder and OrderStatus
+  `PreSubmitted`, 6 ms later ExecutionData BOT 100 AAPL at 340, OpenOrder and OrderStatus Filled
+  with 100, then ExecutionData SLD 1 call at 0 and Filled with 1, all within 20 ms. The two
+  execution ids share their first two fields and differ in the third (`.01.01` stock, `.02.01`
+  option), like a combo's. No commission report for either, live or in `executions` 3 minutes
+  later. An exercise of the out-of-the-money 380 call (AAPL at 351) went through the same way,
+  buying 100 AAPL at 380.
+- Lapse before the last trading day: 10349, OpenOrder and OrderStatus `Inactive`, 201 "Order
+  rejected - reason:trade date must match last trade date of the contract", then 322
+  "Error processing request.Exercise/Lapse failed due to server rejection." on the same id.
+- Futures option (ES Dec 2026 6800 put, held): 10349, `Inactive`, 201 "Order rejected -
+  reason:Real time exercise of FOP is not available. Please send TMS ticket to request this
+  exercise.", then 322. The position was unchanged.
+- **Not probed:** a lapse on the last trading day, assignment, automatic exercise at expiry,
+  puts, and the Gateway.
 
 ### Cancel replies, and a cancel that races a fill
 
