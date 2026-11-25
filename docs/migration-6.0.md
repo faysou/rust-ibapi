@@ -1406,3 +1406,28 @@ match item {
 
 The compiler catches none of this. Code that stopped or re-requested on `Err` for 10197 sees a
 notice instead; `iter_data` and `filter_data` drop it.
+### 59. Client-synthesized notices classify as `NoticeCategory::ClientSynthesized`
+
+A notice with a negative code is raised by this client, not TWS: `TRANSPORT_RECONNECT_CODE`,
+`SUBSCRIPTION_LAG_CODE`, `NOTICE_STREAM_LAG_CODE`, `UNKNOWN_MESSAGE_TYPE_CODE`,
+`HANDSHAKE_UNKNOWN_FRAME_CODE` and `HANDSHAKE_DECODE_FAILURE_CODE`. They classified as
+`NoticeCategory::Error`, so `is_error()` was true and `is_informational()` false. They now classify
+as `NoticeCategory::ClientSynthesized`, ahead of every other rule, and are informational: none of
+them ends a request or stream.
+
+```rust,ignore
+// 5.x: client-synthesized notices reached the is_error() branch
+if notice.is_error() { /* TWS errors, plus reconnect, lag and desync notices */ }
+
+// 6.0: they need their own branch
+if notice.is_error() { /* TWS errors only */ }
+if notice.is_client_synthesized() { /* match notice.code: reconnect, lag, desync */ }
+```
+
+The compiler catches none of this. Code that relied on `is_error()` or `NoticeCategory::Error`
+to see these notices must match their codes or `NoticeCategory::ClientSynthesized`. This matters
+most for the notice stream: `UNKNOWN_MESSAGE_TYPE_CODE` (a frame with an unknown message id, the
+sign of a desynchronized stream) and `HANDSHAKE_DECODE_FAILURE_CODE` no longer reach an
+`is_error()` arm. `Notice::is_client_synthesized()` is true for the same codes as before. A match
+on `NoticeCategory` with a wildcard arm sees the new variant there; the enum is
+`#[non_exhaustive]`, so no new arm is required.

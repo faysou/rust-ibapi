@@ -188,8 +188,24 @@ fn notice_is_system_message() {
 
 #[test]
 fn notice_is_informational() {
-    // Informational includes cancellations, warnings, and system messages
-    let informational_codes = [202, 1100, 1101, 1102, 1300, *WARNING_CODE_RANGE.start(), 2107, *WARNING_CODE_RANGE.end()];
+    // Informational includes cancellations, warnings, system messages, and
+    // client-synthesized notices, none of which ends a request or stream.
+    let informational_codes = [
+        202,
+        1100,
+        1101,
+        1102,
+        1300,
+        *WARNING_CODE_RANGE.start(),
+        2107,
+        *WARNING_CODE_RANGE.end(),
+        TRANSPORT_RECONNECT_CODE,
+        SUBSCRIPTION_LAG_CODE,
+        NOTICE_STREAM_LAG_CODE,
+        UNKNOWN_MESSAGE_TYPE_CODE,
+        HANDSHAKE_UNKNOWN_FRAME_CODE,
+        HANDSHAKE_DECODE_FAILURE_CODE,
+    ];
     for code in informational_codes {
         let notice = helpers::test_notice(code, "");
         assert!(notice.is_informational(), "Code {} should be informational", code);
@@ -325,6 +341,7 @@ fn notice_category_predicates_are_disjoint() {
                 (notice.is_request_error(), NoticeCategory::RequestError),
                 (notice.is_order_rejection(), NoticeCategory::OrderRejection),
                 (notice.is_order_change_rejection(), NoticeCategory::OrderChangeRejection),
+                (notice.is_client_synthesized(), NoticeCategory::ClientSynthesized),
             ]
             .into_iter()
             .filter_map(|(hit, category)| hit.then_some(category))
@@ -341,6 +358,11 @@ fn notice_category_predicates_are_disjoint() {
 #[test]
 fn notice_category_partition() {
     let cases: &[(i32, NoticeCategory)] = &[
+        (TRANSPORT_RECONNECT_CODE, NoticeCategory::ClientSynthesized),
+        (SUBSCRIPTION_LAG_CODE, NoticeCategory::ClientSynthesized),
+        (NOTICE_STREAM_LAG_CODE, NoticeCategory::ClientSynthesized),
+        (UNKNOWN_MESSAGE_TYPE_CODE, NoticeCategory::ClientSynthesized),
+        (-1, NoticeCategory::ClientSynthesized),
         (ORDER_CANCELLED_CODE, NoticeCategory::Cancellation), // 202 — precedence over OrderRejection
         (0, NoticeCategory::Warning),                         // code-less frame: error_code absent on the wire
         (*WARNING_CODE_RANGE.start(), NoticeCategory::Warning),
@@ -645,6 +667,7 @@ fn log_level_follows_category() {
     .into_iter()
     .chain(farm_codes(ConnectivityStatus::Broken))
     .chain(DATA_ADVISORY_CODES.iter().copied())
+    .chain([TRANSPORT_RECONNECT_CODE, SUBSCRIPTION_LAG_CODE, NOTICE_STREAM_LAG_CODE])
     {
         assert_eq!(Notice::synthesized(code, String::new()).log_level(), log::Level::Warn, "code {code}");
     }
