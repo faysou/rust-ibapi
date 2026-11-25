@@ -238,13 +238,13 @@ fn rejection_ends_request_only_for_verified_codes() {
     // independently of the names. `other` is the code a leak would come from
     // where one is known (10197 on market data).
     let cases = [
-        case("TickTypes", rejection_ends::<TickTypes>, &[200, 354, 10168], 10197),
-        case("Bar", rejection_ends::<Bar>, &[200, 354], 10197),
-        case("TickLast", rejection_ends::<TickLast>, &[200, 10189], 10197),
-        case("TickBidAsk", rejection_ends::<TickBidAsk>, &[200, 10189], 10197),
-        case("TickMidpoint", rejection_ends::<TickMidpoint>, &[200, 10189], 10197),
+        case("TickTypes", rejection_ends::<TickTypes>, &[200, 354, 10168, 10089], 10197),
+        case("Bar", rejection_ends::<Bar>, &[200, 354, 10089], 10197),
+        case("TickLast", rejection_ends::<TickLast>, &[200, 10189, 10089], 10197),
+        case("TickBidAsk", rejection_ends::<TickBidAsk>, &[200, 10189, 10089], 10197),
+        case("TickMidpoint", rejection_ends::<TickMidpoint>, &[200, 10189, 10089], 10197),
         case("MarketDepths", rejection_ends::<MarketDepths>, &[200, 354], 10197),
-        case("HistoricalBarUpdate", rejection_ends::<HistoricalBarUpdate>, &[200], 162),
+        case("HistoricalBarUpdate", rejection_ends::<HistoricalBarUpdate>, &[200, 321], 162),
         case("PnL", rejection_ends::<PnL>, &[321], 200),
         case("PnLSingle", rejection_ends::<PnLSingle>, &[321], 200),
         case("Vec<ScannerData>", rejection_ends::<Vec<ScannerData>>, &[162], 309),
