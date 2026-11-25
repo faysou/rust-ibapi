@@ -28,7 +28,7 @@ use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
 use crate::contracts::SecurityType;
 use crate::messages::{
-    IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE, WHAT_TO_SHOW_SUBSTITUTED_CODE,
+    IncomingMessages, Notice, ResponseMessage, HMDS_ERROR_CODE, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE, WHAT_TO_SHOW_SUBSTITUTED_CODE,
 };
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
@@ -594,10 +594,11 @@ impl StreamDecoder<HistoricalBarUpdate> for HistoricalBarUpdate {
         cancel_historical_data(request_id)
     }
 
-    /// Live: after 200, or 321 ("Source price not supported with live updates", AGGTRADES), TWS
+    /// Live: after 200, 162 (no market data permissions, invalid step) or
+    /// 321 (end date or source price not supported with live updates) TWS
     /// answers the cancel with 366 (no query found).
     fn rejection_ends_request(notice: &Notice) -> bool {
-        matches!(notice.code, NO_SECURITY_DEFINITION_CODE | REQUEST_VALIDATION_CODE)
+        matches!(notice.code, NO_SECURITY_DEFINITION_CODE | HMDS_ERROR_CODE | REQUEST_VALIDATION_CODE)
     }
 
     /// Live: after 10299 TWS streams the series the error names (AGGTRADES

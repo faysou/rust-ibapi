@@ -244,7 +244,7 @@ fn rejection_ends_request_only_for_verified_codes() {
         case("TickBidAsk", rejection_ends::<TickBidAsk>, &[200, 10189, 10089], 10197),
         case("TickMidpoint", rejection_ends::<TickMidpoint>, &[200, 10189, 10089], 10197),
         case("MarketDepths", rejection_ends::<MarketDepths>, &[200, 354], 10197),
-        case("HistoricalBarUpdate", rejection_ends::<HistoricalBarUpdate>, &[200, 321], 162),
+        case("HistoricalBarUpdate", rejection_ends::<HistoricalBarUpdate>, &[200, 162, 321], 10197),
         case("PnL", rejection_ends::<PnL>, &[321], 200),
         case("PnLSingle", rejection_ends::<PnLSingle>, &[321], 200),
         case("Vec<ScannerData>", rejection_ends::<Vec<ScannerData>>, &[162], 309),
