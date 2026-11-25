@@ -625,6 +625,12 @@ pub struct ContractDetails {
     /// The market name for this product.
     pub market_name: String,
     /// The minimum allowed price variation. Note that many securities vary their minimum tick size according to their price. This value will only show the smallest of the different minimum tick sizes regardless of the product's price. Full information about the minimum increment price structure can be obtained with the reqMarketRule function or the IB Contract and Security Search site.
+    ///
+    /// It is the increment of the market rule's first band, whatever the price: CTXR (rule 557:
+    /// 0.0001 below 1 USD, 0.01 from 1 USD) reports 0.0001, and ES options (rule 235: 0.05 below 5,
+    /// up to 0.5 from 100) report 0.05. To check a price, use the band for that price in the rule
+    /// from [`market_rule_id`](Self::market_rule_id) (live: 2026-11-25, server 223;
+    /// `docs/wire-facts/contracts.md#market-rule-ids-align-with-valid-exchanges`).
     pub min_tick: f64,
     /// Allows execution and strike prices to be reported consistently with market data, historical data and the order price, i.e. Z on LIFFE is reported in Index points and not GBP. In TWS versions prior to 972, the price magnifier is used in defining future option strike prices (e.g. in the API the strike is specified in dollars, but in TWS it is specified in cents). In TWS versions 972 and higher, the price magnifier is not used in defining futures option strike prices so they are consistent in TWS and the API.
     pub price_magnifier: i32,
@@ -796,6 +802,11 @@ pub struct ContractDetails {
 impl ContractDetails {
     /// The market rule id for `exchange`, one of [`valid_exchanges`](Self::valid_exchanges);
     /// pass it to `market_rule` for that exchange's price increments.
+    ///
+    /// Pass the exchange the order is sent to. TWS checks an order's price against that
+    /// exchange's rule, and SMART can have its own: 7203 LMT 2000.1 was accepted on SMART (rule
+    /// 3407, 0.1 below 10,000 JPY) and refused with 110 on TSEJ (rule 1460, 0.5 above 1,000) (live:
+    /// 2026-11-25, server 223; `docs/wire-facts/contracts.md#market-rule-ids-align-with-valid-exchanges`).
     ///
     /// `None` when `exchange` is not a valid exchange, or when the two lists
     /// differ in length, so the ids can't be matched to exchanges (TWS sends

@@ -15,6 +15,15 @@ Placement, echoes, status, executions and completed orders. Format: [README](REA
 - An untransmitted order gets no open-order or status frames, so a TWS-derived value (e.g. a
   VOL order's limit) is only visible once transmitted.
 
+*Live 2026-11-25 19:12 UTC (US RTH), paper TWS, server 223.*
+
+- An AAPL BUY 1 LMT with `transmit=false`, then an unrelated AAPL BUY 1 LMT with `transmit=true`
+  on the same client: the second went `PreSubmitted` and `Submitted`; the held one stayed held.
+  Eight seconds later it had still sent no frame on its own stream and `all_open_orders` did not
+  list it. Only a child that names it as `parent_id` releases a held order (see
+  [Bracket child quantity](#bracket-child-quantity-follows-the-parent)). Its cancel drew
+  `Cancelled`, 202 "Order was discarded" and 161, as above.
+
 ### Attached orders (`attached_orders`)
 
 *Live 2026-09-27, paper Gateway, server 220; #842.*
@@ -163,6 +172,13 @@ Placement, echoes, status, executions and completed orders. Format: [README](REA
 - `specific_dates` one day at a time, 2026-10-26 to 2026-11-16: 2026-11-11 and 2026-11-15
   returned their fills; every other day, including each day 8 to 21 days back, returned none,
   no error, only the end message.
+*Live 2026-11-25 19:15 UTC, paper TWS, server 223; `time` with `last_n_days = 7`.*
+
+- `time` from 1978-01-01 00:00 UTC to the present was accepted: each date from one day to
+  48 years back (1978-01-01, 1980, 2002, 30, 60, 365 and 3,650 days back) returned the same 317
+  executions as the 7-day window. 1977-12-31 and earlier (1977-08-14, 1975, 1970-01-02, 1970-01-01)
+  drew 10314 "The date, time, or time-zone entered is invalid." A `time` one day ahead returned
+  no executions and no error.
 - **Not probed:** a `specific_dates` day older than a week that has executions. None was
   reachable (`last_n_days` above 7 returns nothing), so whether TWS applies the "within the
   past week" in IB's `ExecutionFilter.proto` to `specific_dates` is not known.
@@ -516,3 +532,64 @@ permission, so an order that passes every other check is rejected for that.*
   here.
 - **Not probed:** fills and the 5-minute cancel of a `Minutes` order (needs crypto permission);
   ZEROHASH; other crypto symbols; GTD and OPG.
+
+### OCA groups
+
+*Live 2026-11-25 19:12-19:14 UTC (US RTH), paper TWS, server 223; AAPL limits far below the
+market, EUR.USD market orders.*
+
+- Cancelling one member cancels the others: with two AAPL BUY limits in one group (`ocaType` 1),
+  a cancel of the first sent the second `PendingCancel`, then `Cancelled` with 202, on its own
+  stream; `all_open_orders` no longer listed it.
+- A member placed after another member filled is rejected: EUR.USD BUY 20,000 MKT in a group
+  filled at once; a second BUY 20,000 MKT in the same group went `Inactive`, then drew 201 "Order
+  rejected - reason:OCA group is already filled".
+- **Not probed:** `ocaType` 2 (reduce with block) and 3. Reported downstream the same day: type 2
+  reduces the remaining members by the filled quantity, with block.
+
+### Bracket child quantity follows the parent
+
+*Live 2026-11-25 19:12 UTC (US RTH), paper TWS, server 223.*
+
+- Parent AAPL BUY 1 LMT with `transmit=false`, then a child SELL 5,000,000 LMT with `parent_id` set
+  to the parent and `transmit=true`: TWS echoed the child with `totalQuantity` 1 and `remaining` 1,
+  `PreSubmitted` with `whyHeld` `child`, and no error. The child released the parent, which went
+  `Submitted`.
+- Cancelling the parent removed the child: `all_open_orders` listed neither afterwards.
+- So TWS cuts a child's quantity to the parent's without telling the caller. Compare the echo with
+  what was sent.
+
+### Modify and directed routing refusals
+
+*Live 2026-11-25 19:13 UTC (US RTH), paper TWS, server 223; AAPL BUY 1 LMT far below the market.*
+
+| Request | Reply |
+| ------- | ----- |
+| Modify a working SMART order with the exchange changed to ARCA | 105 "Order being modified does not match original order." The order kept working. |
+| Modify the same order's price, exchange unchanged | `PreSubmitted`, `Submitted` |
+| New order directed to LSE, which does not list AAPL | 200 "No security definition has been found for the request" |
+| New order directed to IEX | `PreSubmitted`, `Submitted`, no 10311 |
+| Cancel of the order rejected with 200 | 10147 "OrderId 6 that needs to be cancelled is not found." |
+| Second cancel of an order cancelled 3 s before | 10148 "OrderId 5 that needs to be cancelled cannot be cancelled, state: Cancelled." |
+
+- 10311 ("This order will be directly routed to ...") did not appear because the TWS API
+  precautionary setting allowed direct routes. With the setting off, a downstream adapter saw
+  10311 for directed orders.
+- Reported downstream the same day: 10147 for cancels of orders it had cancelled earlier. Not
+  reproduced here: a second cancel within the session drew 10148.
+- **Not probed:** a modify that changes the exchange of a held order.
+
+### Option orders acknowledged late
+
+*Live 2026-11-25 19:14 UTC (US RTH), paper TWS, server 223; AAPL 2026-12-18 245 call (deep in the
+money) BUY 1 LMT 0.05.*
+
+- The order's own stream received nothing from TWS for 13.1 s, then an `OpenOrder` past
+  `PendingSubmit` (`PreSubmitted` or `Submitted`; the log does not say which). Before that,
+  each `all_open_orders` request (at 5 s and 10 s) listed the order as `PendingSubmit`, and that
+  reply also reached the order's stream as an `OpenOrder` and an `OrderStatus` `PendingSubmit`.
+- A second order cancelled 3.5 s after placing went `PendingCancel` 1.7 s after the cancel, then
+  `Cancelled`.
+- A downstream adapter reported delays from 1.5 s to 60 s on the same paper TWS. Treat an option
+  order without an acknowledgement as pending, not lost.
+- **Not probed:** option orders on IB Gateway or a live account; other option roots.

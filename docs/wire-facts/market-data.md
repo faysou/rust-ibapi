@@ -230,3 +230,40 @@ December future (HKFE), both with real-time permission.*
 - **Not probed:** the SEHK closing auction (08:00-08:10 UTC); RTH-only realtime bars;
   keep-up-to-date historical bars across the same break (historical requests went unanswered
   from 00:55 UTC that night, with no error, while market data kept working).
+
+### Market depth rows are fixed positions
+
+*Live 2026-11-25 19:16-19:19 UTC, paper TWS, server 223; EUR.USD on IDEALPRO, 5 rows, 150 s.
+Reported downstream the same day: a 3-minute recording with 10 rows.*
+
+- 12,336 row operations: 73 inserts, 12,139 updates and 124 deletes. The downstream recording had
+  46,775.
+- An update replaces the price and size of the row at `position`: 2,052 of the updates changed
+  the row's price, so a row is a slot, not a price level.
+- Every insert after the first dump landed above every row present on its side, that is at the
+  end of the side (73 here, all 1,322 downstream).
+- Deletes target the last row and arrive with price 0 and size 0 (124 of 124). Here 64 removed
+  the side's last row and 60 repeated a delete of a row already gone, at the same position.
+  Downstream, 1,292 removed the last row, 17 a lower row and 18 an absent one.
+- Read the operations as fixed slots: insert and update set row `position`, delete clears it and
+  the rows after it. Downstream, a model that shifts rows on insert and delete left a side
+  unsorted after 31,049 of the operations, against 3,775 transient states for fixed slots. In
+  this run both models gave the same book, because no delete hit a lower row.
+- **Not probed:** depth of other instruments (no CME or US stock depth permission); SMART depth
+  (`MarketDepthL2`).
+
+### Long historical bar requests take minutes
+
+*Live 2026-11-25 19:12-19:16 UTC, paper TWS, server 223; one request at a time. ES `CONTFUT`
+reported downstream the same day.*
+
+| Request | Time | Bars |
+| ------- | ---- | ---- |
+| EUR.USD MIDPOINT, 1-minute bars, 30 D | 102.8 s | 42,583 |
+| EUR.USD MIDPOINT, 1-hour bars, 5 Y | 138.0 s | 31,072 |
+| ES `CONTFUT` TRADES, 1-minute bars, 30 D (downstream) | 107.6 s | 40,877 |
+| ES `CONTFUT` TRADES, 1-hour bars, 5 Y (downstream) | 161.8 s | 16,121 |
+
+- A `one_shot_timeout` of 60 s ends each of these with `Error::Timeout` before the bars arrive.
+  Size the timeout to the longest request, or split the range.
+- **Not probed:** other bar sizes and instruments; how the time grows with concurrent requests.

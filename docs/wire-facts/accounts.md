@@ -79,5 +79,9 @@ Positions, PnL and account updates by model. End-marker behavior for account str
 - An execution's `contract.exchange` equalled `execution.exchange` (the venue that filled) in all
   129. The pair from an exercise of an AAPL 2026-11-27 340 call (the option sold at 0, 100 AAPL
   bought at 340) reported `SMART` in both.
+- 2026-11-25 (US RTH): AAPL echoes for orders sent to SMART and IEX carried that exchange and an
+  empty `primaryExchange`; EUR.USD fills reported `IDEALPRO` in both exchange fields. A downstream
+  adapter reported stock executions on `EUDARK`, `TGATE`, `FWB`, `IEX` and `ARCA` the same day;
+  not re-probed (no stock fills placed).
 - **Not probed:** positions in non-US contracts (none held); a stock whose primary listing is
   not its usual SMART destination.
