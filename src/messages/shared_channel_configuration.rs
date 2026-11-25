@@ -79,9 +79,13 @@ pub(crate) const CHANNEL_MAPPINGS: &[ChannelMapping] = &[
         one_shot: false,
         reply_end: Some(IncomingMessages::OpenOrderEnd),
     },
+    // TWS draws no reply to `reqAutoOpenOrders` and the stream has no end
+    // marker, so `OpenOrderEnd` is not among its responses: every one that
+    // arrives ends another request's reply (`open_orders`, `all_open_orders`).
+    // See `docs/wire-facts/orders.md#auto_open_orders-draws-no-reply`.
     ChannelMapping {
         request: OutgoingMessages::RequestAutoOpenOrders,
-        responses: &[IncomingMessages::OpenOrder, IncomingMessages::OrderStatus, IncomingMessages::OpenOrderEnd],
+        responses: &[IncomingMessages::OpenOrder, IncomingMessages::OrderStatus],
         one_shot: false,
         reply_end: None,
     },
