@@ -78,7 +78,7 @@ fn place_order() {
     let notifications = result.unwrap();
 
     if let Some(Ok(PlaceOrder::OpenOrder(open_order))) = notifications.next_data() {
-        assert_eq!(open_order.order_id, 13, "open_order.order_id");
+        assert_eq!(open_order.order.order_id, 13, "open_order.order.order_id");
         assert_eq!(open_order.order_state.status, OrderStatusKind::PreSubmitted, "order_state.status");
     } else {
         assert!(false, "message[0] expected an open order notification");
@@ -447,7 +447,7 @@ fn auto_open_orders() {
     assert_request(&message_bus, 0, &auto_open_orders_request().auto_bind(true));
     let subscription = results.expect("auto_open_orders");
     match subscription.next() {
-        Some(Ok(SubscriptionItem::Data(Orders::OrderData(order)))) => assert_eq!(order.order_id, 7),
+        Some(Ok(SubscriptionItem::Data(Orders::OrderData(order)))) => assert_eq!(order.order.order_id, 7),
         other => panic!("expected the bound order, got {other:?}"),
     }
 }
@@ -831,7 +831,7 @@ fn order_update_stream() {
     let notifications = stream.unwrap();
 
     if let Some(Ok(OrderUpdate::OpenOrder(open_order))) = notifications.next_data() {
-        assert_eq!(open_order.order_id, 13, "open_order.order_id");
+        assert_eq!(open_order.order.order_id, 13, "open_order.order.order_id");
         assert_eq!(open_order.contract.symbol, Symbol::from("TSLA"), "contract.symbol");
         assert_eq!(open_order.order.action, Action::Buy, "order.action");
         assert_eq!(open_order.order.total_quantity, 100.0, "order.total_quantity");
@@ -934,7 +934,7 @@ fn order_update_stream_survives_unknown_condition() {
         other => panic!("expected OpenOrder, got {other:?}"),
     }
     match stream.next_data() {
-        Some(Ok(OrderUpdate::OpenOrder(o))) => assert_eq!(o.order_id, 2),
+        Some(Ok(OrderUpdate::OpenOrder(o))) => assert_eq!(o.order.order_id, 2),
         other => panic!("stream did not survive the unknown condition, got {other:?}"),
     }
 }
@@ -1045,7 +1045,7 @@ fn order_update_stream_survives_unknown_security_id_type() {
         other => panic!("expected OpenOrder with Unknown security_id_type, got {other:?}"),
     }
     match stream.next_data() {
-        Some(Ok(OrderUpdate::OpenOrder(o))) => assert_eq!(o.order_id, 2),
+        Some(Ok(OrderUpdate::OpenOrder(o))) => assert_eq!(o.order.order_id, 2),
         other => panic!("stream did not survive the unknown security_id_type, got {other:?}"),
     }
 }

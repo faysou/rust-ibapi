@@ -481,7 +481,7 @@ impl Client {
         let mut data = subscription.filter_data();
         while let Some(response) = data.next().await {
             if let PlaceOrder::OpenOrder(order_data) = response? {
-                if order_data.order_id == order_id.value() {
+                if order_data.order.order_id == order_id.value() {
                     if let Some(state) = reply.observe(order_data.order_state) {
                         return Ok(state);
                     }
@@ -692,7 +692,9 @@ impl Client {
     /// ordered: `0` for a filled order. The size ordered is `total_quantity + filled_quantity`.
     /// [`OrderData::completed_order_status`](crate::orders::OrderData::completed_order_status)
     /// gives the record's status with `filled` and `remaining` set this way.
-    /// `OrderData::order_id` is the order's id, the same as `order.order_id`.
+    /// The order's id is `order.order_id`. A record can carry `0` there (seen for
+    /// cancelled orders, `docs/wire-facts/orders.md#completed-order-ids-can-be-0`); match on
+    /// `order.perm_id` to find one order.
     ///
     /// # Arguments
     /// * `api_only` - [`ApiOnly::Yes`] for only orders placed through the API, [`ApiOnly::No`] for orders submitted from TWS as well.

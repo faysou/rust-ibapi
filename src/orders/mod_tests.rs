@@ -599,7 +599,7 @@ fn completed_order_status_of_a_decoded_record() {
             why_held: String::new(),
             market_cap_price: None,
         };
-        assert_eq!(data.order_id, 13, "{name}: order_id");
+        assert_eq!(data.order.order_id, 13, "{name}: order_id");
         assert_eq!(data.completed_order_status(), expected, "{name}");
     }
 }
