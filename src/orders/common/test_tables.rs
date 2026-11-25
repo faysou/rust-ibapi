@@ -541,3 +541,48 @@ pub(crate) fn lookup_cases() -> Vec<LookupCase> {
         },
     ]
 }
+
+/// Ids of the parent and two children [`linked_orders`] returns.
+pub(crate) const LINKED_ORDER_IDS: [i32; 3] = [9400, 9401, 9402];
+
+/// A parent and two children, each with `transmit` set so that only `submit_linked_orders`
+/// clears it.
+pub(crate) fn linked_orders() -> Vec<(Contract, Order)> {
+    let [parent_id, take_profit_id, stop_loss_id] = LINKED_ORDER_IDS;
+    let contract = Contract::stock("AAPL").build();
+    let parent = crate::orders::order_builder::limit_order(crate::orders::Action::Buy, 1.0, 1.0);
+    let take_profit = crate::orders::order_builder::limit_order(crate::orders::Action::Sell, 1.0, 5000.0);
+    let stop_loss = crate::orders::order_builder::stop(crate::orders::Action::Sell, 1.0, 0.5);
+    [
+        (parent_id, 0, parent),
+        (take_profit_id, parent_id, take_profit),
+        (stop_loss_id, parent_id, stop_loss),
+    ]
+    .into_iter()
+    .map(|(order_id, parent_id, order)| {
+        let order = Order {
+            order_id,
+            parent_id,
+            transmit: true,
+            ..order
+        };
+        (contract.clone(), order)
+    })
+    .collect()
+}
+
+/// `orders` as `submit_linked_orders` sends them: `transmit` on the last one only.
+pub(crate) fn linked_orders_as_sent(orders: &[(Contract, Order)]) -> Vec<(Contract, Order)> {
+    let last = orders.len() - 1;
+    orders
+        .iter()
+        .enumerate()
+        .map(|(i, (contract, order))| {
+            let order = Order {
+                transmit: i == last,
+                ..order.clone()
+            };
+            (contract.clone(), order)
+        })
+        .collect()
+}
