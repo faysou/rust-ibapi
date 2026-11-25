@@ -213,3 +213,20 @@ hours, TRADES.*
   drops size-only updates here too.
 - ES and EUR.USD tick-by-tick sizes, all sent: [Size fields are always sent](#size-fields-are-always-sent).
 - **Not probed:** live stock ticks during RTH, live accounts, TWS rather than the Gateway.
+
+### Realtime bars across the SEHK and HKFE lunch break
+
+*Live 2026-11-25 01:38-05:00 UTC (SEHK and HKFE trading, lunch 04:00-05:00 UTC), paper TWS,
+server 223; `realtime_bars` (5-second TRADES bars, all trading hours) on 700 (SEHK) and the HSI
+December future (HKFE), both with real-time permission.*
+
+- During the session TWS sent a bar every 5 seconds, 5 to 6 s after the bar's start, including
+  bars with volume 0 at the last price (700 at 03:58:00, 03:58:15; HSI at 03:59:50, 03:59:55).
+- The last bar before the break, 03:59:55, arrived at 04:00:01.3 like any other. Then nothing,
+  no bar and no notice, for both contracts until 05:00:05.4, when the 05:00:00 bar arrived.
+  No bar was sent for the break.
+- The first 700 bar after the break carried 196,800 shares against hundreds to tens of thousands
+  per bar before it.
+- **Not probed:** the SEHK closing auction (08:00-08:10 UTC); RTH-only realtime bars;
+  keep-up-to-date historical bars across the same break (historical requests went unanswered
+  from 00:55 UTC that night, with no error, while market data kept working).
