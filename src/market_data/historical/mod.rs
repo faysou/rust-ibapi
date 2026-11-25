@@ -802,8 +802,11 @@ pub enum WhatToShow {
     BidAsk,
     /// Aggregated trade data (wire value `AGGTRADES`).
     ///
-    /// Required for crypto contracts: TWS rejects `TRADES` for crypto with
-    /// error 10299, so crypto trade-price series must be requested as `AGGTRADES`.
+    /// Crypto's trade-price series. A crypto `TRADES` bar request draws error 10299 and TWS
+    /// serves the AGGTRADES series anyway; `AGGTRADES` on a stock or future draws 10299 and TWS
+    /// serves TRADES. With live updates (`stream()`) crypto `AGGTRADES` draws 321, so crypto
+    /// bars stream only as `TRADES`. Historical ticks get nothing after 10299
+    /// (`docs/wire-facts/market-data.md#10299-whattoshow-substitution`).
     AggTrades,
     /// Historical volatility computed by IB.
     HistoricalVolatility,
