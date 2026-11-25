@@ -765,7 +765,9 @@ pub struct ContractDetails {
     pub market_rule_ids: Vec<i32>,
     /// Real expiration date. Requires TWS 968+ and API v973.04+. Python API specifically requires API v973.06+.
     pub real_expiration_date: String,
-    /// Last trade time.
+    /// The time trading ends on the last trading day, `HH:MM:SS`, wall clock in
+    /// [`last_trade_time_zone`](Self::last_trade_time_zone). Empty when TWS sends the expiry
+    /// date alone.
     pub last_trade_time: String,
     /// Stock type.
     pub stock_type: String,
@@ -955,6 +957,90 @@ impl ContractDetails {
     /// ```
     pub fn liquid_sessions(&self) -> Result<Vec<TradingSession>, Error> {
         parse_sessions(&self.liquid_hours)
+    }
+
+    /// The last trading day at [`last_trade_time`](Self::last_trade_time): the date of the
+    /// contract's [`last_trade_date_or_contract_month`](Contract::last_trade_date_or_contract_month)
+    /// with the time TWS sent beside it, as wall clock with no zone applied.
+    ///
+    /// `None` when TWS sent the date alone, as it does for standard monthly US equity options
+    /// (AAPL `20261218`; weeklies carry a time), or when the expiry is not a date. The trading
+    /// sessions don't fill that gap: they cover only the coming week, and a session's close is
+    /// not the last trade time (ES's last trading day ends at 08:30 Chicago time, its session
+    /// at 16:00).
+    ///
+    /// The time is wall clock in [`last_trade_time_zone`](Self::last_trade_time_zone), which
+    /// differs from [`time_zone_id`](Self::time_zone_id) for an option on a US stock requested
+    /// on a CBOE or PSE exchange. Resolving the zone is the caller's step.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Parse`] when `last_trade_time` is not `HH:MM:SS`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::ContractDetails;
+    /// use time::macros::datetime;
+    ///
+    /// // ESZ6 as TWS sends it: tag 4 `20261218 08:30:00 US/Central`.
+    /// let mut details = ContractDetails::default();
+    /// details.contract.last_trade_date_or_contract_month = Some("20261218".parse()?);
+    /// details.last_trade_time = "08:30:00".into();
+    /// details.time_zone_id = "US/Central".into();
+    /// assert_eq!(details.last_trade_date_time()?, Some(datetime!(2026-12-18 08:30)));
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    pub fn last_trade_date_time(&self) -> Result<Option<time::PrimitiveDateTime>, Error> {
+        let Some(date) = self.contract.last_trade_date_or_contract_month.as_ref().and_then(Expiry::date) else {
+            return Ok(None);
+        };
+        if self.last_trade_time.is_empty() {
+            return Ok(None);
+        }
+        let text = format!("{date} {}", self.last_trade_time);
+        time::PrimitiveDateTime::parse(&text, time::macros::format_description!("[year][month][day] [hour]:[minute]:[second]"))
+            .map(Some)
+            .map_err(|_| Error::parse_field(&self.last_trade_time, "expected last trade time HH:MM:SS"))
+    }
+
+    /// The zone [`last_trade_time`](Self::last_trade_time) is stated in: `"US/Eastern"` for an
+    /// option on a stock whose [`time_zone_id`](Self::time_zone_id) is a `US/` zone, otherwise
+    /// `time_zone_id`.
+    ///
+    /// TWS labels the last trade time with the requested exchange's zone, but for an option on
+    /// a US stock or ETF it sends the New York time whatever the exchange. Requested on CBOE,
+    /// AAPL's 2026-11-27 weekly carries `13:15:00` under `US/Central` while CBOE's session that
+    /// day closes at 12:15 Central (13:15 New York); on PSE it carries `13:15:00` under
+    /// `US/Pacific`. Localizing it with `time_zone_id` puts the expiry one or three hours late. Index options (SPXW, XSP, RUT, OEX and VIX on CBOE, OESX on EUREX)
+    /// and futures options state their time in `time_zone_id`
+    /// (`docs/wire-facts/contracts.md#last-trade-time-and-the-expiry-session`).
+    ///
+    /// The zone is passed through as IB names it; resolving it to an offset is the caller's
+    /// step.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::{ContractDetails, SecurityType};
+    ///
+    /// // AAPL OPT 20261127 requested on CBOE: tag 4 `20261127 13:15:00 US/Central`.
+    /// let mut details = ContractDetails::default();
+    /// details.contract.security_type = SecurityType::Option;
+    /// details.under_security_type = Some(SecurityType::Stock);
+    /// details.last_trade_time = "13:15:00".into();
+    /// details.time_zone_id = "US/Central".into();
+    /// assert_eq!(details.last_trade_time_zone(), "US/Eastern");
+    /// ```
+    pub fn last_trade_time_zone(&self) -> &str {
+        let us_stock_option = self.contract.security_type == SecurityType::Option
+            && self.under_security_type == Some(SecurityType::Stock)
+            && self.time_zone_id.starts_with("US/");
+        if us_stock_option {
+            "US/Eastern"
+        } else {
+            &self.time_zone_id
+        }
     }
 }
 

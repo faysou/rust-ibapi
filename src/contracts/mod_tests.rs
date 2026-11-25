@@ -674,3 +674,72 @@ fn spread_from_legs_rejects_invalid_legs() {
         }
     }
 }
+
+#[test]
+fn last_trade_date_time_joins_expiry_date_and_time() {
+    use time::macros::datetime;
+
+    // Values from contract details, paper TWS, server 223, 2026-11-23.
+    let details = |expiry: Option<&str>, time: &str| ContractDetails {
+        contract: Contract {
+            last_trade_date_or_contract_month: expiry.map(|raw| Expiry::from_wire(raw).unwrap()),
+            ..Default::default()
+        },
+        last_trade_time: time.into(),
+        ..Default::default()
+    };
+    let cases = [
+        ("AAPL weekly", details(Some("20261127"), "13:15:00"), Some(datetime!(2026-11-27 13:15))),
+        ("N225 future", details(Some("20261210"), "15:45:00"), Some(datetime!(2026-12-10 15:45))),
+        ("AAPL monthly sends the date alone", details(Some("20261218"), ""), None),
+        ("contract month", details(Some("202612"), "08:30:00"), None),
+        (
+            "zoned bond text stays unknown",
+            details(Some("20430504 16:00 Europe/London"), "16:00"),
+            None,
+        ),
+        ("no expiry", details(None, "08:30:00"), None),
+    ];
+    for (label, details, expected) in cases {
+        assert_eq!(details.last_trade_date_time().unwrap(), expected, "{label}");
+    }
+
+    let bad = details(Some("20261218"), "8:30");
+    assert!(matches!(bad.last_trade_date_time(), Err(Error::Parse(_, value, _)) if value == "8:30"));
+}
+
+#[test]
+fn last_trade_time_zone_is_new_york_for_us_stock_options() {
+    // Values from contract details, paper TWS, server 223, 2026-11-24.
+    let details = |security_type: SecurityType, under: Option<SecurityType>, zone: &str| ContractDetails {
+        contract: Contract {
+            security_type,
+            ..Default::default()
+        },
+        under_security_type: under,
+        time_zone_id: zone.into(),
+        ..Default::default()
+    };
+    let (option, stock) = (SecurityType::Option, Some(SecurityType::Stock));
+    let cases = [
+        ("AAPL on CBOE", details(option.clone(), stock.clone(), "US/Central"), "US/Eastern"),
+        ("AAPL on PSE", details(option.clone(), stock.clone(), "US/Pacific"), "US/Eastern"),
+        ("AAPL on SMART", details(option.clone(), stock.clone(), "US/Eastern"), "US/Eastern"),
+        ("SAP on EUREX", details(option.clone(), stock.clone(), "MET"), "MET"),
+        (
+            "SPXW on CBOE",
+            details(option.clone(), Some(SecurityType::Index), "US/Central"),
+            "US/Central",
+        ),
+        (
+            "ES FOP on CME",
+            details(SecurityType::FuturesOption, Some(SecurityType::Future), "US/Central"),
+            "US/Central",
+        ),
+        ("ES future", details(SecurityType::Future, None, "US/Central"), "US/Central"),
+        ("expired VIXW sends no zone", details(option, Some(SecurityType::Index), ""), ""),
+    ];
+    for (label, details, expected) in cases {
+        assert_eq!(details.last_trade_time_zone(), expected, "{label}");
+    }
+}
