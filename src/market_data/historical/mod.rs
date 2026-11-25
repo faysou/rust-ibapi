@@ -39,6 +39,9 @@ pub use builder::{
     TicksBetweenError,
 };
 
+mod completion;
+pub use completion::{BarCompletion, StreamedBar};
+
 pub use super::{QuoteSide, TickAttributeBidAsk, TickAttributeLast, TickBidAsk, TickLast, TickMidpoint};
 
 #[doc(hidden)]
@@ -543,9 +546,10 @@ impl HistoricalData {
 /// When requesting historical data with `keepUpToDate=true`, IBKR first sends
 /// the initial historical bars as a `Historical` variant, then an `End`
 /// variant with the requested window, then continues streaming real-time
-/// updates for the current bar as `Update` variants. The current bar is
-/// updated approximately every 4-6 seconds until a new bar begins. The
-/// subscription has no end marker; it runs until cancelled.
+/// updates for the current bar as `Update` variants. TWS sends an update just
+/// after each 5-second boundary of the wall clock, changed or not, and never
+/// marks a bar as final; [`BarCompletion`] turns the updates into completed
+/// bars. The subscription has no end marker; it runs until cancelled.
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HistoricalBarUpdate {
