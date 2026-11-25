@@ -1034,7 +1034,9 @@ impl<S: Stream> TcpMessageBus<S> {
             }
             self.write_now(message)
         };
-        let ticket = self.shared_channels.subscribe(message_type, account, sender.clone(), lease.downgrade(), write)?;
+        let ticket = self
+            .shared_channels
+            .subscribe(message_type, account, sender.clone(), lease.downgrade(), write)?;
 
         // The lease is the drop signal's identity: `Signal::Shared` removes
         // exactly this registration.

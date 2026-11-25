@@ -365,7 +365,7 @@ impl Client {
     /// earlier caller reads the current values and `End` a second time, and
     /// the notice stream gets TWS's 2100 "API client has been unsubscribed
     /// from account data". A subscription made while an earlier dump is still
-    /// arriving reads that dump's remainder and its `End` before its own.
+    /// arriving passes over that dump's remainder and reads only its own.
     ///
     /// # Arguments
     /// * `account` - The account id (i.e. U1234567) for which the information is requested.

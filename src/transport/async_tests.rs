@@ -1290,42 +1290,69 @@ async fn account_updates_same_account_shares() {
     assert_eq!(account_updates_slot(&bus).await, None);
 }
 
-/// The dump TWS sends after the second subscription's resubscribe reaches
-/// both subscriptions, so the second caller gets the initial values and the
-/// end marker too.
+/// TWS answers each subscribe, a repeated one included, with a full dump and its end marker, in
+/// the order sent. A second subscription made while the first dump is still arriving passes over
+/// the rest of that dump and reads only its own; the first reads both.
 #[tokio::test]
-async fn account_updates_second_subscription_reads_the_dump() {
-    use crate::accounts::AccountUpdate;
-
+async fn account_updates_second_subscription_reads_only_its_own_dump() {
     let (stream, bus) = make_bus();
     let mut first = account_updates_subscription(&bus, "DU1").await.unwrap();
+    stream.push_inbound(account_value_frame("NetLiquidation", "100000"));
+    bus.read_and_route_message().await.unwrap();
     let mut second = account_updates_subscription(&bus, "DU1").await.unwrap();
-    stream.push_inbound(binary_proto(
+    stream.push_inbound(account_value_frame("TotalCashValue", "50000"));
+    stream.push_inbound(account_end_frame());
+    stream.push_inbound(account_value_frame("NetLiquidation", "100001"));
+    stream.push_inbound(account_end_frame());
+    for _ in 0..4 {
+        bus.read_and_route_message().await.unwrap();
+    }
+
+    let mut first_read = Vec::new();
+    for _ in 0..5 {
+        first_read.push(account_update_text(next_item(&mut first).await.expect("first ended")));
+    }
+    let mut second_read = Vec::new();
+    for _ in 0..2 {
+        second_read.push(account_update_text(next_item(&mut second).await.expect("second ended")));
+    }
+    let more = tokio::time::timeout(TICK, second.next()).await;
+
+    assert_eq!(
+        first_read,
+        ["NetLiquidation=100000", "TotalCashValue=50000", "End", "NetLiquidation=100001", "End"]
+    );
+    assert_eq!(second_read, ["NetLiquidation=100001", "End"]);
+    assert!(more.is_err(), "second read past its own dump: {more:?}");
+}
+
+fn account_value_frame(key: &str, value: &str) -> Vec<u8> {
+    binary_proto(
         crate::messages::IncomingMessages::AccountValue as i32,
         &crate::proto::AccountValue {
-            key: Some("NetLiquidation".to_string()),
-            value: Some("100000".to_string()),
+            key: Some(key.to_string()),
+            value: Some(value.to_string()),
             currency: Some("USD".to_string()),
             account_name: Some("DU1".to_string()),
         },
-    ));
-    stream.push_inbound(binary_proto(
+    )
+}
+
+fn account_end_frame() -> Vec<u8> {
+    binary_proto(
         crate::messages::IncomingMessages::AccountDownloadEnd as i32,
         &crate::proto::AccountDataEnd {
             account_name: Some("DU1".to_string()),
         },
-    ));
-    bus.read_and_route_message().await.unwrap();
-    bus.read_and_route_message().await.unwrap();
+    )
+}
 
-    for (name, subscription) in [("first", &mut first), ("second", &mut second)] {
-        let value = next_item(subscription).await.expect("no account value").unwrap();
-        assert!(
-            matches!(&value, SubscriptionItem::Data(AccountUpdate::AccountValue(v)) if v.key == "NetLiquidation" && v.value == "100000"),
-            "{name}: {value:?}"
-        );
-        let end = next_item(subscription).await.expect("no end marker").unwrap();
-        assert!(matches!(end, SubscriptionItem::Data(AccountUpdate::End)), "{name}: {end:?}");
+fn account_update_text(item: Result<SubscriptionItem<crate::accounts::AccountUpdate>, Error>) -> String {
+    use crate::accounts::AccountUpdate;
+    match item {
+        Ok(SubscriptionItem::Data(AccountUpdate::AccountValue(v))) => format!("{}={}", v.key, v.value),
+        Ok(SubscriptionItem::Data(AccountUpdate::End)) => "End".to_string(),
+        other => format!("{other:?}"),
     }
 }
 
