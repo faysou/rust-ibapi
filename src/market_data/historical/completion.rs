@@ -226,6 +226,11 @@ impl BarCompletion {
     /// for the bar after `expire` completed it is dropped, so no bar is completed twice. Daily
     /// and longer bars have no end to expire at ([`forming_end`](Self::forming_end) is `None`).
     ///
+    /// On a stream read through [`Client::resubscribing`](crate::client::Client::resubscribing),
+    /// stop calling `expire` at a 10182 notice until the reopened stream's first bars arrive. The
+    /// wrapper waits for the HMDS farm meanwhile, often for minutes, and a bar `expire` completes
+    /// then rests on bars from before the outage.
+    ///
     /// # Examples
     ///
     /// ```
