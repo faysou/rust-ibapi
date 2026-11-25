@@ -1158,3 +1158,31 @@ enum rejects a name or a tagged object. An open string enum (`SecurityType`, `Se
 unrecognized code. A `Contract` stored by 5.x with `"security_type":"Stock"` loads as
 `SecurityType::Other("Stock")`, and a request built from it sends `Stock` to TWS. Convert stored JSON before loading it, by mapping each variant name to
 its code (`as_str()` lists the codes for the string enums, `i32::from` for the integer ones).
+
+### 48. 10197 continues a `market_data` subscription
+
+During an internet outage TWS sends error 10197 ("No market data during competing live session")
+on a `reqMktData` request and keeps the request: its ticks resume on the same request id once the
+farms are back. 5.x ended the subscription with `Err(Error::Notice)` for 10197 and sent the
+cancel, so the caller lost a request TWS would have resumed.
+
+A `market_data` subscription now yields 10197 as `SubscriptionItem::Notice` and keeps reading.
+Dropping or cancelling it still sends `cancelMktData`, since the request is live. Tick-by-tick,
+depth, realtime bars and the other request types still end on 10197.
+
+```rust,ignore
+// 5.x: the stream ended on 10197; the caller re-requested
+match item {
+    Err(Error::Notice(n)) if n.code == 10197 => { /* re-request market data */ }
+    // ...
+}
+
+// 6.0: a notice; keep reading the same subscription
+match item {
+    Ok(SubscriptionItem::Notice(n)) if n.code == 10197 => { /* no data until the farms are back */ }
+    // ...
+}
+```
+
+The compiler catches none of this. Code that stopped or re-requested on `Err` for 10197 sees a
+notice instead; `iter_data` and `filter_data` drop it.

@@ -1,13 +1,25 @@
 //! Resubscribe a stream across transport reconnects: the packaged form of the
-//! `is_connection_lost` → `wait_connected` → resubscribe loop.
+//! `is_connection_lost` → `wait_connected` → resubscribe loop. Also reopens a
+//! keep-up-to-date bar request that 10182 ended once the historical-data farms
+//! are back.
 //!
 //! Entry points are `Client::resubscribing` (sync and async). Only types marked
 //! [`Resubscribable`] are accepted, so the helper can't re-send a request that
 //! places, cancels or exercises.
 
+use std::time::Duration;
+
 use crate::errors::Error;
-use crate::messages::resubscribed_notice;
+use crate::messages::{resubscribed_notice, Notice, SUBSCRIPTION_DISCONNECTED_CODE};
 use crate::subscriptions::{StreamDecoder, SubscriptionItem};
+use crate::transport::farm_watch::{FarmMark, FarmRecovery};
+
+/// The longest wait for the historical-data farms after a 10182 before
+/// reopening anyway, in case TWS never reports the farm back. Reopening early
+/// is harmless: TWS holds a request sent during an outage and answers it once
+/// the farm is back, and a 10182 on it starts another wait. Live, the farm
+/// came back 2 s to 6 min after the 10182, with the outage.
+const FARM_RECOVERY_LIMIT: Duration = Duration::from_secs(15 * 60);
 
 /// Stream item types that are safe to resubscribe after a reconnect.
 ///
@@ -51,7 +63,18 @@ enum State<S> {
         gap: bool,
     },
     Reading(S),
+    /// A 10182 ended the request: waiting for the historical-data farms from `mark`.
+    Waiting(FarmMark),
     Done,
+}
+
+/// Whether `error` is the 10182 TWS sends when it ends a keep-up-to-date bar
+/// request because its historical-data farm broke.
+fn farm_disconnected(error: &Error) -> Option<&Notice> {
+    match error {
+        Error::Notice(notice) if notice.code == SUBSCRIPTION_DISCONNECTED_CODE => Some(notice),
+        _ => None,
+    }
 }
 
 /// What to do with an `open()` result.
@@ -82,6 +105,8 @@ pub use sync_impl::Resubscribing;
 
 #[cfg(feature = "sync")]
 mod sync_impl {
+    use std::time::Instant;
+
     use super::*;
     use crate::client::sync::Client;
     use crate::subscriptions::sync::Subscription;
@@ -145,9 +170,29 @@ mod sync_impl {
                             self.state = State::Reading(subscription);
                             return Some(Ok(item));
                         }
-                        Some(Err(e)) => return Some(Err(e)),
+                        Some(Err(e)) => match farm_disconnected(&e) {
+                            Some(notice) => {
+                                let notice = notice.clone();
+                                drop(subscription);
+                                self.state = State::Waiting(self.client.message_bus.farm_watch().mark());
+                                return Some(Ok(SubscriptionItem::Notice(notice)));
+                            }
+                            None => return Some(Err(e)),
+                        },
                         None => return None,
                     },
+                    State::Waiting(mark) => {
+                        let deadline = Instant::now() + FARM_RECOVERY_LIMIT;
+                        match self.client.message_bus.farm_watch().wait(mark, deadline) {
+                            FarmRecovery::Recovered | FarmRecovery::TimedOut => self.state = State::Opening { gap: false },
+                            FarmRecovery::SessionEnded => {
+                                if let Err(e) = self.client.wait_connected() {
+                                    return Some(Err(e));
+                                }
+                                self.state = State::Opening { gap: true };
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -203,9 +248,29 @@ mod async_impl {
                             state = State::Opening { gap: true };
                         }
                         Some(Ok(item)) => return Some((Ok(item), (State::Reading(subscription), open))),
-                        Some(Err(e)) => return Some((Err(e), (State::Done, open))),
+                        Some(Err(e)) => match farm_disconnected(&e) {
+                            Some(notice) => {
+                                let notice = notice.clone();
+                                drop(subscription);
+                                let waiting = State::Waiting(client.message_bus.farm_watch().mark());
+                                return Some((Ok(SubscriptionItem::Notice(notice)), (waiting, open)));
+                            }
+                            None => return Some((Err(e), (State::Done, open))),
+                        },
                         None => return None,
                     },
+                    State::Waiting(mark) => {
+                        let deadline = tokio::time::Instant::now() + FARM_RECOVERY_LIMIT;
+                        state = match client.message_bus.farm_watch().wait(mark, deadline).await {
+                            FarmRecovery::Recovered | FarmRecovery::TimedOut => State::Opening { gap: false },
+                            FarmRecovery::SessionEnded => {
+                                if let Err(e) = client.wait_connected().await {
+                                    return Some((Err(e), (State::Done, open)));
+                                }
+                                State::Opening { gap: true }
+                            }
+                        };
+                    }
                 }
             }
         })

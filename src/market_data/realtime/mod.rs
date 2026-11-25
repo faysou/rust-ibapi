@@ -18,7 +18,7 @@ use time::OffsetDateTime;
 
 use crate::common::error_helpers;
 use crate::contracts::OptionComputation;
-use crate::messages::{IncomingMessages, Notice, ResponseMessage, MARKET_DEPTH_RESET_CODE, NO_SECURITY_DEFINITION_CODE};
+use crate::messages::{IncomingMessages, Notice, ResponseMessage, COMPETING_LIVE_SESSION_CODE, MARKET_DEPTH_RESET_CODE, NO_SECURITY_DEFINITION_CODE};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::Error;
 
@@ -456,6 +456,12 @@ impl StreamDecoder<TickTypes> for TickTypes {
     /// Live: after 200 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice) -> bool {
         notice.code == NO_SECURITY_DEFINITION_CODE
+    }
+
+    /// Live: after 10197 during an internet outage TWS resumed ticks on the
+    /// same request once its farms were back.
+    fn error_continues_request(notice: &Notice) -> bool {
+        notice.code == COMPETING_LIVE_SESSION_CODE
     }
 
     fn is_snapshot_end(&self) -> bool {
