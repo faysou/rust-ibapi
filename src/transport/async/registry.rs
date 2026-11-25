@@ -342,12 +342,13 @@ impl SharedChannels {
     /// receiver passes over. The count lock spans the write so the count and
     /// the wire agree; the receiver is created under it, before the write, so
     /// unanswered requests are counted in wire order. `account` is the
-    /// account-updates account, checked before the write.
+    /// account-updates account, checked before the write; `write` is told
+    /// whether that account's updates are live already.
     pub(super) async fn subscribe<F: Future<Output = Result<(), Error>>>(
         &self,
         message_type: OutgoingMessages,
         account: Option<&AccountId>,
-        write: impl FnOnce() -> F,
+        write: impl FnOnce(bool) -> F,
     ) -> Result<(broadcast::Receiver<RoutedItem>, SharedTicket, ReplySkip), Error> {
         let mut counts = self.counts.lock().await;
         counts.check_account_updates(account)?;
@@ -360,7 +361,8 @@ impl SharedChannels {
                 .ok_or_else(|| Error::InvalidArgument(format!("No shared channel configured for message type: {message_type:?}")))?;
             (receiver, unanswered.add(message_type))
         };
-        if let Err(e) = write().await {
+        let live = account.is_some_and(|account| counts.is_account_updates_live(account));
+        if let Err(e) = write(live).await {
             lock(&self.unanswered).withdraw(message_type);
             return Err(e);
         }

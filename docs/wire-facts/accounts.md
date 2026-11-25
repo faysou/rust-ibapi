@@ -84,12 +84,25 @@ Positions, PnL and account updates by model. End-marker behavior for account str
 
 ### A second `reqAccountUpdates` for the subscribed account draws no reply
 
-*Live 2026-11-25 off-hours, paper TWS, server 223.*
+*Live 2026-11-25 10:20-10:28 UTC off-hours, paper TWS, server 223, single account, sync.*
 
-- `reqAccountUpdates(true, account)` while the first subscription for that account was live,
-  written after the first dump's `AccountDownloadEnd`: no frame in the next 6 s. TWS does not
-  send a second dump, unlike `reqPositions`, `reqOpenOrders` and `reqCompletedOrders`
-  ([overlapping open-order requests](orders.md#overlapping-open-order-requests)). A second
-  `account_updates` caller gets only later periodic updates, never the initial values.
-- **Not probed:** a second request written before the first dump ends, and how long until the
-  next periodic update reaches it.
+- `reqAccountUpdates(true, account)` gets the initial dump: 242 `AccountValue`, 12
+  `PortfolioValue`, 13 `AccountUpdateTime`, then `AccountDownloadEnd`.
+- The same request again on the same connection while the first is live, after its
+  `AccountDownloadEnd`: no frame in the next 6 s. Two written back to back (the second before
+  the first dump ends): one dump only.
+- `reqAccountUpdates(false)` then `true` back to back while subscribed: TWS sends a request-less
+  2100 "API client has been unsubscribed from account data.", then the full dump again with its
+  `AccountDownloadEnd` (same counts). Written right after the first `true`, before its dump
+  ended: two full dumps, each with its end marker.
+- `false`, a 5 s wait, then `true`: 2100, nothing during the wait, then the full dump.
+- `true` for another account code (`DU0000000`) while subscribed: no frame and no error; `true`
+  for the subscribed account after it: no frame either, so TWS still counted that account as
+  subscribed.
+- So a second `account_updates` caller for the same account is sent as `false` then `true`;
+  the dump that follows reaches every subscription of the account. Live with that change, the
+  first caller read 242 / 12 / 13 and `End`, the second caller the same 100 ms after its
+  request, and the first caller the dump and `End` again.
+- **Not probed:** updates for the subscribed account after the other-account request (the
+  account has no second account to switch to, and no change happened in the window), an FA
+  account, RTH.
