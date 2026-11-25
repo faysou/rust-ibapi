@@ -1395,6 +1395,7 @@ match item {
 
 The compiler catches none of this. Code that stopped or re-requested on `Err` for 10197 sees a
 notice instead; `iter_data` and `filter_data` drop it.
+
 ### 58. Client-synthesized notices classify as `NoticeCategory::ClientSynthesized`
 
 A notice with a negative code is raised by this client, not TWS: `TRANSPORT_RECONNECT_CODE`,
@@ -1420,3 +1421,24 @@ sign of a desynchronized stream) and `HANDSHAKE_DECODE_FAILURE_CODE` no longer r
 `is_error()` arm. `Notice::is_client_synthesized()` is true for the same codes as before. A match
 on `NoticeCategory` with a wildcard arm sees the new variant there; the enum is
 `#[non_exhaustive]`, so no new arm is required.
+
+### 59. `Quote` reads `None` for a side with no quote
+
+TWS reports a side with no quote as a price tick with size `0` and a placeholder price: `-1` for
+options and indices, `-1` times the price magnifier (`-100`) for a magnified contract, and `0`
+for combos. `Quote::apply` stored it, so `quote.bid` read `Some(-1.0)` although the field's
+`Option` says "no bid" with `None`. Such a tick now sets the side's price and size to `None`.
+The placeholder can't be filtered by price, since a calendar spread's real bid can be `-71`.
+
+```rust,ignore
+// 5.x
+let bid = quote.bid.filter(|_| quote.bid_size > Some(0.0));
+
+// 6.0
+let bid = quote.bid;               // None while TWS reports no bid
+let side = quote.bid_side();       // price and size, None also after a later size tick of 0
+```
+
+The compiler catches none of this. Code that read the placeholder from `Quote` to detect an empty
+side sees `None` instead. `last` and `last_size` keep what TWS sent, a price with size `0`
+included. To see the placeholder, read the `TickPrice` and `TickPriceSize` ticks.
