@@ -27,7 +27,9 @@ use time::{Date, OffsetDateTime};
 use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
 use crate::contracts::SecurityType;
-use crate::messages::{IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE};
+use crate::messages::{
+    IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE, WHAT_TO_SHOW_SUBSTITUTED_CODE,
+};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
@@ -592,9 +594,16 @@ impl StreamDecoder<HistoricalBarUpdate> for HistoricalBarUpdate {
         cancel_historical_data(request_id)
     }
 
-    /// Live: after 200 TWS answers the cancel with 366 (no query found).
+    /// Live: after 200, or 321 ("Source price not supported with live updates", AGGTRADES), TWS
+    /// answers the cancel with 366 (no query found).
     fn rejection_ends_request(notice: &Notice) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(notice.code, NO_SECURITY_DEFINITION_CODE | REQUEST_VALIDATION_CODE)
+    }
+
+    /// Live: after 10299 TWS streams the series the error names (AGGTRADES
+    /// for crypto `TRADES`), updates included, and a later cancel draws 162.
+    fn error_continues_request(notice: &Notice) -> bool {
+        notice.code == WHAT_TO_SHOW_SUBSTITUTED_CODE
     }
 }
 
@@ -697,6 +706,13 @@ impl StreamDecoder<HistoricalDataFrame> for HistoricalDataFrame {
     /// cancel with 366 (no query found).
     fn rejection_ends_request(_notice: &Notice) -> bool {
         true
+    }
+
+    /// Live: after 10299 TWS sends the bars of the series the error names
+    /// (AGGTRADES for crypto `TRADES`, TRADES for AGGTRADES on stocks and
+    /// futures), then the window.
+    fn error_continues_request(notice: &Notice) -> bool {
+        notice.code == WHAT_TO_SHOW_SUBSTITUTED_CODE
     }
 }
 
