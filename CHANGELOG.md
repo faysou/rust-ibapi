@@ -83,6 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `auto_open_orders` (sync and async) no longer ends when an `open_orders` or `all_open_orders` reply on the same connection ends with `OpenOrderEnd`. TWS sends no reply and no end marker for `reqAutoOpenOrders`, so the stream now runs until dropped, and the overlapping request still reads its own reply (#PR).
 - Code 10349 "Order TIF was set to DAY based on order preset" is a `NoticeCategory::Warning` on any order. TWS goes on with the order after it. It arrives on every `exercise_options` request, where it ended the subscription with an error before the exercise's open order and executions arrived. It now arrives as a notice and the subscription keeps reading (#1210).
 - `open_orders`, `all_open_orders`, `completed_orders` and `positions` called while another such request on the client is still being answered get their own complete reply. TWS answers each request with a full reply and end marker, in order, but every reply went to every live subscription, so the later caller read the tail of the earlier reply and ended at its end marker: a truncated or empty list with no error, and `all_open_orders` overlapping `open_orders` (either order) could read the other call's result set. A caller now passes over the replies still outstanding when its request was sent (#1312).
 
