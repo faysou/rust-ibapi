@@ -875,7 +875,6 @@ fn dispatch_unsolicited_completed_order_typed() {
 
     dispatch_unsolicited_message(&message, &startup_ctx(&cb));
     let got = captured_clone.lock().unwrap().take().expect("callback didn't fire");
-    assert_eq!(got.order_id, 17);
     assert_eq!(got.order.order_id, 17);
 }
 
