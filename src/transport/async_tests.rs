@@ -245,11 +245,11 @@ async fn order_id_correlation_with_interleaved_responses() {
     assert!(sub_b.try_next_routed().is_none(), "sub_b received an extra message");
 }
 
-/// Shared-channel fan-out: `RequestOpenOrders`, `RequestAllOpenOrders`, and
-/// `RequestAutoOpenOrders` all map to `[OpenOrder, OrderStatus, OpenOrderEnd]`
-/// in `CHANNEL_MAPPINGS`. The `OrderAndShared` strategy fans every `OpenOrder`
-/// out to each shared subscriber, with or without an order id, once none is
-/// passing over an earlier request's reply.
+/// Shared-channel fan-out: `RequestOpenOrders` and `RequestAllOpenOrders` map
+/// to `[OpenOrder, OrderStatus, OpenOrderEnd]` in `CHANNEL_MAPPINGS`,
+/// `RequestAutoOpenOrders` to `[OpenOrder, OrderStatus]`. The `OrderAndShared`
+/// strategy fans every `OpenOrder` out to each shared subscriber, with or
+/// without an order id, once none is passing over an earlier request's reply.
 #[tokio::test]
 async fn shared_channel_fan_out_for_open_orders() {
     use crate::messages::IncomingMessages as M;
@@ -262,9 +262,8 @@ async fn shared_channel_fan_out_for_open_orders() {
     // The end of the open-orders reply, which `sub_all` passes over.
     stream.push_inbound(binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {}));
     bus.read_and_route_message().await.unwrap();
-    for (name, sub) in [("open", &mut sub_open), ("auto", &mut sub_auto)] {
-        assert_eq!(next_message(sub).await.message_type(), M::OpenOrderEnd, "sub_{name}");
-    }
+    assert_eq!(next_message(&mut sub_open).await.message_type(), M::OpenOrderEnd);
+    assert!(sub_auto.try_next_routed().is_none(), "sub_auto read another request's end marker");
 
     for order_id in [Some(42), None] {
         stream.push_inbound(binary_proto(
@@ -1153,6 +1152,44 @@ async fn overlapping_open_orders_and_all_open_orders_read_own_result_sets() {
         [(M::OpenOrder, Some(1)), (M::OpenOrder, Some(2)), (M::OpenOrderEnd, None)]
     );
     assert!(all.try_next_routed().is_none(), "all_open_orders read past its reply");
+}
+
+/// TWS draws no reply to `reqAutoOpenOrders` and its stream has no end
+/// marker: an `open_orders` reply on the same client ends only that request,
+/// and the auto stream reads on.
+#[tokio::test]
+async fn auto_open_orders_survives_open_orders_reply() {
+    use crate::messages::IncomingMessages as M;
+    let (stream, bus) = make_bus();
+    let open_order = |order_id| {
+        binary_proto(
+            M::OpenOrder as i32,
+            &crate::proto::OpenOrder {
+                order_id: Some(order_id),
+                ..Default::default()
+            },
+        )
+    };
+    let end = || binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {});
+
+    let mut auto = bus.send_shared_request(OutgoingMessages::RequestAutoOpenOrders, vec![]).await.unwrap();
+    let mut own = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, vec![]).await.unwrap();
+    for frame in [open_order(1), end(), open_order(2)] {
+        stream.push_inbound(frame);
+        bus.read_and_route_message().await.unwrap();
+    }
+
+    async fn read(sub: &mut AsyncInternalSubscription, count: usize) -> Vec<(M, Option<i32>)> {
+        let mut items = Vec::new();
+        for _ in 0..count {
+            let message = next_message(sub).await;
+            items.push((message.message_type(), message.order_id()));
+        }
+        items
+    }
+    assert_eq!(read(&mut own, 2).await, [(M::OpenOrder, Some(1)), (M::OpenOrderEnd, None)]);
+    assert_eq!(read(&mut auto, 2).await, [(M::OpenOrder, Some(1)), (M::OpenOrder, Some(2))]);
+    assert!(auto.try_next_routed().is_none(), "auto_open_orders read an end marker");
 }
 
 /// A reset ends every unanswered request with its session: a request made

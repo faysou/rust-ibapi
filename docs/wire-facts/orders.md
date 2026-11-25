@@ -422,8 +422,31 @@ second client with 1, other clients' orders resting too.*
   when its request was written (`ChannelMapping::reply_end`). Without that, a second
   `open_orders` made mid-reply read 4 of 6 frames and ended, and `all_open_orders` written
   after `open_orders` read the 3 own orders instead of all of them.
-- **Not probed:** `reqAutoOpenOrders` (needs client id 0), whether a busier account ever
-  interleaves two replies, an unsolicited `OpenOrderEnd` while a request is outstanding.
+- **Not probed:** whether a busier account ever interleaves two replies, an unsolicited
+  `OpenOrderEnd` while a request is outstanding. `reqAutoOpenOrders`: see
+  [`auto_open_orders` draws no reply](#auto_open_orders-draws-no-reply).
+
+### `auto_open_orders` draws no reply
+
+*Live 2026-11-25 10:09-10:11 UTC off-hours, paper TWS, server 223, client id 0, async client
+with `IBAPI_RECORDING_DIR`.*
+
+- `reqAutoOpenOrders(autoBind=true)` drew no frame at all in the next 5 to 6 s, with no open
+  order on the account, and again with a resting EUR.USD limit of client 0 and one of another
+  client. No `OpenOrder`, no `OrderStatus`, no `OpenOrderEnd`: the request has no reply and
+  no end marker.
+- A far EUR.USD limit placed by another API client while the request was live sent client 0
+  nothing.
+- `reqAllOpenOrders` on client 0 while the request was live drew `5 3 53` (the other client's
+  order). The client fanned that reply out to the `auto_open_orders` stream as well, which
+  yielded the order and its status and then ended at the `53`. `reqOpenOrders` on client 0
+  (with its own resting order) did the same. So every `OpenOrderEnd` a client 0 connection
+  sees ends some other request's reply, and the auto stream now ignores it
+  (`ChannelMapping` for `RequestAutoOpenOrders` lists no `OpenOrderEnd`).
+- At connect, TWS sent client 0 its resting order, its status and an `OpenOrderEnd` before
+  `nextValidId`; a connection whose client had no open order got none of the three.
+- **Not probed:** an order placed in the TWS window, the case `autoBind` exists for (no manual
+  order was placed); `autoBind=false`.
 
 ### Executions: `last_n_days` and `specific_dates`
 

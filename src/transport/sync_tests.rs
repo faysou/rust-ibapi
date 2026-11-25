@@ -919,11 +919,12 @@ fn order_id_correlation_with_interleaved_responses() -> Result<(), Error> {
     Ok(())
 }
 
-/// Shared-channel fan-out: `RequestOpenOrders`, `RequestAllOpenOrders`, and
-/// `RequestAutoOpenOrders` all map to `[OpenOrder, OrderStatus, OpenOrderEnd]`
-/// in `CHANNEL_MAPPINGS`. The `OrderAndShared` strategy in `process_orders`
-/// fans every `OpenOrder` out to each shared subscriber, with or without an
-/// order id, once none is passing over an earlier request's reply.
+/// Shared-channel fan-out: `RequestOpenOrders` and `RequestAllOpenOrders` map
+/// to `[OpenOrder, OrderStatus, OpenOrderEnd]` in `CHANNEL_MAPPINGS`,
+/// `RequestAutoOpenOrders` to `[OpenOrder, OrderStatus]`. The `OrderAndShared`
+/// strategy in `process_orders` fans every `OpenOrder` out to each shared
+/// subscriber, with or without an order id, once none is passing over an
+/// earlier request's reply.
 #[test]
 fn shared_channel_fan_out_for_open_orders() -> Result<(), Error> {
     use crate::messages::IncomingMessages as M;
@@ -936,11 +937,10 @@ fn shared_channel_fan_out_for_open_orders() -> Result<(), Error> {
     // The end of the open-orders reply, which `sub_all` passes over.
     stream.push_inbound(binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {}));
     bus.dispatch()?;
-    for (name, sub) in [("open", &sub_open), ("auto", &sub_auto)] {
-        let msg = sub.next_timeout(TICK).unwrap_or_else(|| panic!("sub_{name} got no end"))?;
-        assert_eq!(msg.message_type(), M::OpenOrderEnd, "sub_{name}");
-    }
+    let msg = sub_open.next_timeout(TICK).expect("sub_open got no end")?;
+    assert_eq!(msg.message_type(), M::OpenOrderEnd);
     assert!(sub_all.try_next_routed().is_none(), "sub_all read the open-orders reply");
+    assert!(sub_auto.try_next_routed().is_none(), "sub_auto read another request's end marker");
 
     for order_id in [Some(42), None] {
         stream.push_inbound(binary_proto(
@@ -1931,6 +1931,45 @@ fn overlapping_open_orders_and_all_open_orders_read_own_result_sets() -> Result<
     assert_eq!(read(&own, 2), [(M::OpenOrder, Some(1)), (M::OpenOrderEnd, None)]);
     assert_eq!(read(&all, 3), [(M::OpenOrder, Some(1)), (M::OpenOrder, Some(2)), (M::OpenOrderEnd, None)]);
     assert!(all.try_next_routed().is_none(), "all_open_orders read past its reply");
+    Ok(())
+}
+
+/// TWS draws no reply to `reqAutoOpenOrders` and its stream has no end
+/// marker: an `open_orders` reply on the same client ends only that request,
+/// and the auto stream reads on.
+#[test]
+fn auto_open_orders_survives_open_orders_reply() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
+    let (stream, bus) = make_bus();
+    let open_order = |order_id| {
+        binary_proto(
+            M::OpenOrder as i32,
+            &crate::proto::OpenOrder {
+                order_id: Some(order_id),
+                ..Default::default()
+            },
+        )
+    };
+    let end = || binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {});
+
+    let auto = bus.send_shared_request(OutgoingMessages::RequestAutoOpenOrders, &[])?;
+    let own = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
+    for frame in [open_order(1), end(), open_order(2)] {
+        stream.push_inbound(frame);
+        bus.dispatch()?;
+    }
+
+    let read = |sub: &InternalSubscription, count| -> Vec<(M, Option<i32>)> {
+        (0..count)
+            .map(|_| {
+                let message = sub.next_timeout(TICK).expect("stream cut short").unwrap();
+                (message.message_type(), message.order_id())
+            })
+            .collect()
+    };
+    assert_eq!(read(&own, 2), [(M::OpenOrder, Some(1)), (M::OpenOrderEnd, None)]);
+    assert_eq!(read(&auto, 2), [(M::OpenOrder, Some(1)), (M::OpenOrder, Some(2))]);
+    assert!(auto.try_next_routed().is_none(), "auto_open_orders read an end marker");
     Ok(())
 }
 
