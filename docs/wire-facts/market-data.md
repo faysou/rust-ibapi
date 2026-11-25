@@ -213,5 +213,6 @@ IDEALPRO; Wi-Fi off for 15 s, 2 min and 6 min; one client never cancelled or re-
   on the same id at restore (2233 to the end). Tick-by-tick, depth and realtime bars got no 10197.
   A market data subscription yields it as a notice and keeps reading
   (`TickTypes::error_continues_request`).
-- **Not probed:** 1101; stocks, futures, RTH; insert or update rows after restore; 10197 during a
-  real competing session.
+- **Not probed:** 1101, and whether streams resume on their own ids after it (a reopen after 1101
+  loses the realtime bar back-fill if they do); stocks, futures, RTH; insert or update rows after
+  restore; 10197 during a real competing session.
