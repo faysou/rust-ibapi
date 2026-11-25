@@ -313,7 +313,10 @@ impl Client {
     /// breaks. The wrapper yields that 10182 as a `SubscriptionItem::Notice`, the gap marker,
     /// waits until no HMDS farm reports broken (or TWS reports connectivity restored with 1101
     /// or 1102, or 15 minutes pass), then calls `open` again. A 10182 on the reopened request
-    /// starts another wait, and a reconnect during the wait reopens as above.
+    /// starts another wait, and a reconnect during the wait reopens as above. The wait can last
+    /// minutes with no bars. A consumer that completes a forming bar on a timer must treat the
+    /// 10182 notice as the signal to stop until the reopened stream's first bars arrive; a bar
+    /// completed during the wait rests on bars from before the outage.
     ///
     /// TWS sends 1101 ("connectivity restored, data lost") when its own link to IB comes back
     /// and it no longer serves the requests open before the loss. On a 1101 while the stream is
