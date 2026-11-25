@@ -1,7 +1,7 @@
 //! Resubscribe a stream across transport reconnects: the packaged form of the
 //! `is_connection_lost` → `wait_connected` → resubscribe loop. Also reopens a
 //! keep-up-to-date bar request that 10182 ended once the historical-data farms
-//! are back.
+//! are back, and any stream after a 1101 (connectivity restored, data lost).
 //!
 //! Entry points are `Client::resubscribing` (sync and async). Only types marked
 //! [`Resubscribable`] are accepted, so the helper can't re-send a request that
@@ -62,7 +62,8 @@ enum State<S> {
     Opening {
         gap: bool,
     },
-    Reading(S),
+    /// Reading `S`, whose request went out after `FarmMark`: a 1101 since voids it.
+    Reading(S, FarmMark),
     /// A 10182 ended the request: waiting for the historical-data farms from `mark`.
     Waiting(FarmMark),
     Done,
@@ -110,6 +111,7 @@ mod sync_impl {
     use super::*;
     use crate::client::sync::Client;
     use crate::subscriptions::sync::Subscription;
+    use crate::transport::farm_watch::sync_impl::DataLostSignal;
 
     /// Blocking iterator returned by
     /// [`Client::resubscribing`](crate::client::blocking::Client::resubscribing).
@@ -118,6 +120,8 @@ mod sync_impl {
         client: &'a Client,
         open: F,
         state: State<Subscription<T>>,
+        /// Wakes a read blocked on the subscription when a 1101 arrives.
+        data_lost: DataLostSignal,
     }
 
     impl<'a, T: Resubscribable, F> Resubscribing<'a, T, F> {
@@ -126,6 +130,7 @@ mod sync_impl {
                 client,
                 open,
                 state: State::Opening { gap: false },
+                data_lost: client.message_bus.farm_watch().data_lost_signal(),
             }
         }
     }
@@ -142,45 +147,61 @@ mod sync_impl {
                 // Done unless an arm puts a live state back.
                 match std::mem::replace(&mut self.state, State::Done) {
                     State::Done => return None,
-                    State::Opening { gap } => match Opened::from((self.open)()) {
-                        Opened::Subscribed(subscription) => {
-                            self.state = State::Reading(subscription);
-                            if gap {
-                                return Some(Ok(gap_notice()));
+                    State::Opening { gap } => {
+                        // Before the request goes out, so a 1101 while it does counts.
+                        let mark = self.client.message_bus.farm_watch().mark();
+                        match Opened::from((self.open)()) {
+                            Opened::Subscribed(subscription) => {
+                                self.state = State::Reading(subscription, mark);
+                                if gap {
+                                    return Some(Ok(gap_notice()));
+                                }
                             }
-                        }
-                        Opened::Lost => {
-                            if let Err(e) = self.client.wait_connected() {
-                                return Some(Err(e));
+                            Opened::Lost => {
+                                if let Err(e) = self.client.wait_connected() {
+                                    return Some(Err(e));
+                                }
+                                self.state = State::Opening { gap };
                             }
-                            self.state = State::Opening { gap };
+                            Opened::Failed(e) => return Some(Err(e)),
                         }
-                        Opened::Failed(e) => return Some(Err(e)),
-                    },
-                    State::Reading(subscription) => match subscription.next() {
-                        Some(Err(e)) if e.is_connection_lost() => {
-                            // Its request died with the old session; dropping it sends no cancel.
-                            drop(subscription);
-                            if let Err(e) = self.client.wait_connected() {
-                                return Some(Err(e));
-                            }
-                            self.state = State::Opening { gap: true };
+                    }
+                    State::Reading(subscription, mark) => {
+                        if let Some(notice) = self.client.message_bus.farm_watch().data_lost_since(mark) {
+                            // Written on this thread, so before the reopen's request.
+                            subscription.cancel();
+                            self.state = State::Opening { gap: false };
+                            return Some(Ok(SubscriptionItem::Notice(notice)));
                         }
-                        Some(Ok(item)) => {
-                            self.state = State::Reading(subscription);
-                            return Some(Ok(item));
-                        }
-                        Some(Err(e)) => match farm_disconnected(&e) {
-                            Some(notice) => {
-                                let notice = notice.clone();
+                        let Some(next) = subscription.next_unless(self.data_lost.receiver()) else {
+                            self.state = State::Reading(subscription, mark);
+                            continue;
+                        };
+                        match next {
+                            Some(Err(e)) if e.is_connection_lost() => {
+                                // Its request died with the old session; dropping it sends no cancel.
                                 drop(subscription);
-                                self.state = State::Waiting(self.client.message_bus.farm_watch().mark());
-                                return Some(Ok(SubscriptionItem::Notice(notice)));
+                                if let Err(e) = self.client.wait_connected() {
+                                    return Some(Err(e));
+                                }
+                                self.state = State::Opening { gap: true };
                             }
-                            None => return Some(Err(e)),
-                        },
-                        None => return None,
-                    },
+                            Some(Ok(item)) => {
+                                self.state = State::Reading(subscription, mark);
+                                return Some(Ok(item));
+                            }
+                            Some(Err(e)) => match farm_disconnected(&e) {
+                                Some(notice) => {
+                                    let notice = notice.clone();
+                                    drop(subscription);
+                                    self.state = State::Waiting(self.client.message_bus.farm_watch().mark());
+                                    return Some(Ok(SubscriptionItem::Notice(notice)));
+                                }
+                                None => return Some(Err(e)),
+                            },
+                            None => return None,
+                        }
+                    }
                     State::Waiting(mark) => {
                         let deadline = Instant::now() + FARM_RECOVERY_LIMIT;
                         match self.client.message_bus.farm_watch().wait(mark, deadline) {
@@ -223,42 +244,63 @@ mod async_impl {
             loop {
                 match state {
                     State::Done => return None,
-                    State::Opening { gap } => match Opened::from(open().await) {
-                        Opened::Subscribed(subscription) => {
-                            state = State::Reading(subscription);
-                            if gap {
-                                return Some((Ok(gap_notice()), (state, open)));
+                    State::Opening { gap } => {
+                        // Before the request goes out, so a 1101 while it does counts.
+                        let mark = client.message_bus.farm_watch().mark();
+                        match Opened::from(open().await) {
+                            Opened::Subscribed(subscription) => {
+                                state = State::Reading(subscription, mark);
+                                if gap {
+                                    return Some((Ok(gap_notice()), (state, open)));
+                                }
                             }
-                        }
-                        Opened::Lost => {
-                            if let Err(e) = client.wait_connected().await {
-                                return Some((Err(e), (State::Done, open)));
+                            Opened::Lost => {
+                                if let Err(e) = client.wait_connected().await {
+                                    return Some((Err(e), (State::Done, open)));
+                                }
+                                // `state` is still `Opening { gap }`: the match only copied `gap`.
                             }
-                            // `state` is still `Opening { gap }`: the match only copied `gap`.
+                            Opened::Failed(e) => return Some((Err(e), (State::Done, open))),
                         }
-                        Opened::Failed(e) => return Some((Err(e), (State::Done, open))),
-                    },
-                    State::Reading(mut subscription) => match subscription.next().await {
-                        Some(Err(e)) if e.is_connection_lost() => {
-                            // Its request died with the old session; dropping it sends no cancel.
-                            drop(subscription);
-                            if let Err(e) = client.wait_connected().await {
-                                return Some((Err(e), (State::Done, open)));
+                    }
+                    State::Reading(mut subscription, mark) => {
+                        let next = tokio::select! {
+                            // A 1101 first: the old request's queued items are void with it.
+                            biased;
+                            notice = client.message_bus.farm_watch().data_lost(mark) => Err(notice),
+                            item = subscription.next() => Ok(item),
+                        };
+                        let next = match next {
+                            Ok(next) => next,
+                            Err(notice) => {
+                                // Awaited: a dropped subscription's cancel is spawned, and
+                                // could reach TWS after the reopen's request.
+                                subscription.cancel().await;
+                                return Some((Ok(SubscriptionItem::Notice(notice)), (State::Opening { gap: false }, open)));
                             }
-                            state = State::Opening { gap: true };
-                        }
-                        Some(Ok(item)) => return Some((Ok(item), (State::Reading(subscription), open))),
-                        Some(Err(e)) => match farm_disconnected(&e) {
-                            Some(notice) => {
-                                let notice = notice.clone();
+                        };
+                        match next {
+                            Some(Err(e)) if e.is_connection_lost() => {
+                                // Its request died with the old session; dropping it sends no cancel.
                                 drop(subscription);
-                                let waiting = State::Waiting(client.message_bus.farm_watch().mark());
-                                return Some((Ok(SubscriptionItem::Notice(notice)), (waiting, open)));
+                                if let Err(e) = client.wait_connected().await {
+                                    return Some((Err(e), (State::Done, open)));
+                                }
+                                state = State::Opening { gap: true };
                             }
-                            None => return Some((Err(e), (State::Done, open))),
-                        },
-                        None => return None,
-                    },
+                            Some(Ok(item)) => return Some((Ok(item), (State::Reading(subscription, mark), open))),
+                            Some(Err(e)) => match farm_disconnected(&e) {
+                                Some(notice) => {
+                                    let notice = notice.clone();
+                                    drop(subscription);
+                                    let waiting = State::Waiting(client.message_bus.farm_watch().mark());
+                                    return Some((Ok(SubscriptionItem::Notice(notice)), (waiting, open)));
+                                }
+                                None => return Some((Err(e), (State::Done, open))),
+                            },
+                            None => return None,
+                        }
+                    }
                     State::Waiting(mark) => {
                         let deadline = tokio::time::Instant::now() + FARM_RECOVERY_LIMIT;
                         state = match client.message_bus.farm_watch().wait(mark, deadline).await {
