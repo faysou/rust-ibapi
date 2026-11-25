@@ -1,5 +1,6 @@
 //! Common utilities shared between sync and async transport implementations
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::Duration;
 
@@ -230,6 +231,69 @@ impl FibonacciBackoff {
             self.current = next;
         }
         Duration::from_secs(self.current)
+    }
+}
+
+/// How many live executions can wait for their commission report. Past it the
+/// oldest mark is dropped: some executions (an option exercise) never get one.
+pub(crate) const LIVE_EXECUTIONS_CAPACITY: usize = 10_000;
+
+/// Execution ids of this client's live fills whose commission report has not
+/// arrived yet.
+///
+/// TWS sends one commission report per live fill, and one more for each
+/// `executions` reply that lists the fill, so the report alone cannot say which
+/// it answers. One for a marked id is the live fill's, whatever requests have
+/// aliased the id: an `executions` reply sent between the fill and its report
+/// lists the fill without it. Any other report answers a reply.
+#[derive(Debug, Default)]
+pub(crate) struct LiveExecutions {
+    state: Mutex<LiveExecutionsState>,
+}
+
+#[derive(Debug, Default)]
+struct LiveExecutionsState {
+    ids: HashSet<String>,
+    /// `ids` in arrival order, oldest first, for eviction.
+    order: VecDeque<String>,
+}
+
+impl LiveExecutions {
+    /// Mark `execution_id` as waiting for its live commission report.
+    pub(crate) fn insert(&self, execution_id: &str) {
+        let mut state = lock(&self.state);
+        if !state.ids.insert(execution_id.to_owned()) {
+            return;
+        }
+        state.order.push_back(execution_id.to_owned());
+        while state.order.len() > LIVE_EXECUTIONS_CAPACITY {
+            if let Some(oldest) = state.order.pop_front() {
+                state.ids.remove(&oldest);
+            }
+        }
+    }
+
+    /// Clear `execution_id`'s mark; returns whether it was marked.
+    pub(crate) fn take(&self, execution_id: &str) -> bool {
+        let mut state = lock(&self.state);
+        let marked = state.ids.remove(execution_id);
+        if marked {
+            state.order.retain(|id| id != execution_id);
+        }
+        marked
+    }
+
+    /// Clear every mark. A commission report TWS did not send before a
+    /// connection dropped never arrives.
+    pub(crate) fn clear(&self) {
+        let mut state = lock(&self.state);
+        state.ids.clear();
+        state.order.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        lock(&self.state).ids.len()
     }
 }
 
