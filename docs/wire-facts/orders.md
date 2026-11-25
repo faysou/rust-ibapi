@@ -1141,9 +1141,9 @@ permission, so an order that passes every other check is rejected for that.*
   0.1 to 33 ms apart; the open order and status were then sent again. A downstream run reported
   the 201 first in some orders, 0.1 to 0.7 s apart; this run did not reproduce it.
 - The 10052, 10289 and 10244 refusals came within 4 ms, with no open order: these orders are not
-  in completed orders either. Each order that drew a 201 is in `completed_orders` with status
-  `Cancelled`, order id -1, and `completed_status` "Rejected by System:" followed by the 201
-  text. A market order shows the price cap IB set (`lmt` 58796.25 on a SELL, 58798 on a 10 USD
+  in completed orders either. Each order that drew a 201 is in `completed_orders` with its order
+  id and perm id, status `Cancelled`, and `completed_status` "Rejected by System:" followed by
+  the 201 text. A market order shows the price cap IB set (`lmt` 58796.25 on a SELL, 58798 on a 10 USD
   BUY, whose quantity became 0.00017006).
 - Observed once, in a downstream run on 2026-11-25: an order with a refused time in force drew no
   frame at all for 55 minutes and then appeared in completed orders as rejected. Not reproduced
