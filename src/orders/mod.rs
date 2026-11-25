@@ -1283,12 +1283,11 @@ pub struct SoftDollarTier {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct OrderData {
-    /// The order's id, the same as `order.order_id`. Ids are per API client:
-    /// pair it with `order.client_id` to identify an order across clients.
-    pub order_id: i32,
     /// The order's Contract.
     pub contract: Contract,
-    /// The currently active order
+    /// The order. Its `order_id` is per API client: pair it with `order.client_id` to
+    /// identify an order across clients. A completed order can carry `order_id` `0`;
+    /// `order.perm_id` identifies it.
     pub order: Order,
     /// The order's OrderState
     pub order_state: OrderState,
