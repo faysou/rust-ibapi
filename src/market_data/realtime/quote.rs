@@ -17,9 +17,13 @@ use crate::market_data::{MarketDataType, QuoteSide};
 /// String, generic, snapshot-end, request-parameter and reroute ticks, and tick types without a
 /// field here, are ignored.
 ///
-/// Values are stored as TWS sends them, including the placeholder price and zero size TWS sends
-/// for a side with no quote. [`bid_side`](Self::bid_side) and [`ask_side`](Self::ask_side) return
-/// a side only when it has a quote.
+/// A bid or ask price tick that reports no quote, with size `0` and a placeholder price (`-1`,
+/// `-1` times the price magnifier, or `0`), sets that side's price and size to `None`; see
+/// [`QuoteSide::new`]. Other values are stored as TWS sends them: `last` keeps a price that
+/// arrives with size `0`, since EUR.USD sends a real last price that way. The
+/// [`TickPrice`](super::TickPrice) and [`TickPriceSize`](super::TickPriceSize) ticks keep the
+/// placeholder. [`bid_side`](Self::bid_side) and [`ask_side`](Self::ask_side) return a side only
+/// when it has both a price and a positive size, so they also cover a later size tick of `0`.
 ///
 /// The struct is `#[non_exhaustive]` so fields can be added; outside this crate, build one with
 /// [`Quote::default`] plus [`apply`](Self::apply), or with [`from_ticks`](Self::from_ticks).
@@ -27,9 +31,9 @@ use crate::market_data::{MarketDataType, QuoteSide};
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Quote {
-    /// Highest bid price.
+    /// Highest bid price. `None` while TWS reports no bid.
     pub bid: Option<f64>,
-    /// Lowest ask price.
+    /// Lowest ask price. `None` while TWS reports no ask.
     pub ask: Option<f64>,
     /// Last traded price.
     pub last: Option<f64>,
@@ -41,9 +45,9 @@ pub struct Quote {
     pub low: Option<f64>,
     /// Previous session's closing price.
     pub close: Option<f64>,
-    /// Size at the bid.
+    /// Size at the bid. `None` while TWS reports no bid.
     pub bid_size: Option<f64>,
-    /// Size at the ask.
+    /// Size at the ask. `None` while TWS reports no ask.
     pub ask_size: Option<f64>,
     /// Attributes of the latest bid price tick: whether it can auto-execute, is past the limit, or
     /// is a pre-open price.
@@ -125,6 +129,9 @@ impl Quote {
             TickTypes::PriceSize(tick) => {
                 self.set_price(tick.price_tick_type, tick.price, tick.attributes);
                 self.set_size(tick.size_tick_type, tick.size);
+                if QuoteSide::new(tick.price, tick.size).is_none() {
+                    self.clear_side(tick.price_tick_type);
+                }
             }
             TickTypes::OptionComputation(computation) => self.set_greeks(computation),
             TickTypes::MarketDataType(market_data_type) => self.market_data_type = Some(*market_data_type),
@@ -135,8 +142,9 @@ impl Quote {
     /// The bid with its size, or `None` while the quote has no bid.
     ///
     /// TWS reports an empty side with size `0` and a placeholder price (`-1`, `-1` times the
-    /// price magnifier, or `0`); see [`QuoteSide::new`]. [`bid`](Self::bid) and
-    /// [`bid_size`](Self::bid_size) keep those values.
+    /// price magnifier, or `0`); see [`QuoteSide::new`]. Such a tick sets [`bid`](Self::bid)
+    /// and [`bid_size`](Self::bid_size) to `None`. This is also `None` when a later size tick
+    /// reports `0` while the bid price stays.
     ///
     /// # Examples
     ///
@@ -205,6 +213,17 @@ impl Quote {
             _ => return,
         };
         *slot = Some(price);
+    }
+
+    /// Clear the side a bid or ask price tick that reports no quote names.
+    fn clear_side(&mut self, price_tick_type: TickType) {
+        let (price, size) = match price_tick_type {
+            TickType::Bid | TickType::DelayedBid => (&mut self.bid, &mut self.bid_size),
+            TickType::Ask | TickType::DelayedAsk => (&mut self.ask, &mut self.ask_size),
+            _ => return,
+        };
+        *price = None;
+        *size = None;
     }
 
     fn set_size(&mut self, tick_type: TickType, size: f64) {
