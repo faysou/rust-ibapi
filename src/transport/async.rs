@@ -44,7 +44,7 @@ use super::routing::{
     classify_error, determine_routing, is_foreign, order_routing_strategy, order_update_notice, DecodedError, ErrorDisposition, OrderRoutingStrategy,
     RoutingDecision,
 };
-use super::{BufferBound, RoutedItem, SharedTicket};
+use super::{BufferBound, ReplySkip, RoutedItem, SharedTicket};
 
 /// Default capacity for broadcast channels. Market-data channels take the
 /// per-client override from `ClientBuilder::channel_capacity`; the notice
@@ -277,6 +277,9 @@ pub struct AsyncInternalSubscription {
     lease: Option<(Lease, RouteKey)>,
     /// The shared-channel ticket, for a shared-channel subscription.
     shared: Option<SharedTicket>,
+    /// The earlier replies a shared-channel subscription passes over; see
+    /// `UnansweredReplies`.
+    skip: ReplySkip,
     /// The bus session generation the request was sent in; see
     /// [`AsyncMessageBus::session_generation`].
     session: u64,
@@ -306,6 +309,9 @@ impl Clone for AsyncInternalSubscription {
             // no-op while another clone still holds the lease.
             lease: self.lease.clone(),
             shared: self.shared,
+            // Counts end markers relative to the original's position, which
+            // a clone starting at the tail is already past.
+            skip: ReplySkip::default(),
             session: self.session,
             reads: None,
             class: self.class,
@@ -334,6 +340,7 @@ impl AsyncInternalSubscription {
             cleanup_sender: None,
             lease: None,
             shared: None,
+            skip: ReplySkip::default(),
             session: 0,
             reads: None,
             class: ChannelClass::default(),
@@ -348,6 +355,7 @@ impl AsyncInternalSubscription {
             cleanup_sender: Some(cleanup_sender),
             lease: None,
             shared: None,
+            skip: ReplySkip::default(),
             session: 0,
             reads: None,
             class: ChannelClass::default(),
@@ -360,9 +368,11 @@ impl AsyncInternalSubscription {
         self
     }
 
-    /// Mark this a subscription to the shared channel `ticket` names.
-    fn shared(mut self, ticket: SharedTicket) -> Self {
+    /// Mark this a subscription to the shared channel `ticket` names, which
+    /// passes over the earlier replies `skip` counts.
+    fn shared(mut self, ticket: SharedTicket, skip: ReplySkip) -> Self {
         self.shared = Some(ticket);
+        self.skip = skip;
         self
     }
 
@@ -391,22 +401,28 @@ impl AsyncInternalSubscription {
     /// consumer polls through here, so none can reintroduce a silent swallow.
     pub(crate) fn poll_next_routed(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<RoutedItem>> {
         use std::task::Poll;
-        match std::pin::Pin::new(&mut self.stream).poll_next(cx) {
-            Poll::Ready(Some(Ok(item))) => {
-                if let Some(reads) = &self.reads {
-                    reads.fetch_add(1, Ordering::Relaxed);
+        loop {
+            let item = match std::pin::Pin::new(&mut self.stream).poll_next(cx) {
+                Poll::Ready(Some(Ok(item))) => item,
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(skipped)))) => {
+                    let notice = match self.class {
+                        ChannelClass::MarketData => crate::messages::subscription_lag_notice(skipped),
+                        ChannelClass::Order | ChannelClass::OrderStream => crate::messages::order_lag_notice(skipped),
+                    };
+                    return Poll::Ready(Some(RoutedItem::Notice(notice)));
                 }
-                Poll::Ready(Some(item))
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            };
+            if let Some(reads) = &self.reads {
+                reads.fetch_add(1, Ordering::Relaxed);
             }
-            Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(skipped)))) => {
-                let notice = match self.class {
-                    ChannelClass::MarketData => crate::messages::subscription_lag_notice(skipped),
-                    ChannelClass::Order | ChannelClass::OrderStream => crate::messages::order_lag_notice(skipped),
-                };
-                Poll::Ready(Some(RoutedItem::Notice(notice)))
+            if let RoutedItem::Response(message) = &item {
+                if self.skip.skips(message.message_type()) {
+                    continue;
+                }
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            return Poll::Ready(Some(item));
         }
     }
 
@@ -1192,10 +1208,10 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         self.ensure_connected()?;
         self.throttle(&message).await;
 
-        let (receiver, ticket) = self.shared_channels.subscribe(message_type, account, || self.write_now(&message)).await?;
+        let (receiver, ticket, skip) = self.shared_channels.subscribe(message_type, account, || self.write_now(&message)).await?;
 
         Ok(AsyncInternalSubscription::with_cleanup(receiver, self.cleanup_sender.clone())
-            .shared(ticket)
+            .shared(ticket, skip)
             .in_session(session)
             .class(ChannelClass::of_shared(message_type)))
     }
