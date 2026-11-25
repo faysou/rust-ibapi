@@ -16,6 +16,8 @@ use crate::testdata::builders::market_data::{
 use crate::testdata::builders::ResponseProtoEncoder;
 use crate::Error;
 
+use super::FARM_RECOVERY_LIMIT;
+
 /// `open` call index, and the error it fails with before sending.
 type OpenFailure = (usize, fn() -> Error);
 
@@ -342,6 +344,8 @@ enum Step {
     Item(&'static str),
     /// `open` has been called exactly this often, also a moment later.
     Opens(usize),
+    /// The requests (`R`) and cancels (`C`) written so far, in order.
+    Wire(&'static str),
 }
 
 const LOST: (i32, &str) = (1100, "Connectivity between IBKR and Trader Workstation has been lost.");
@@ -353,6 +357,7 @@ const USHMDS_BROKEN: (i32, &str) = (2105, "HMDS data farm connection is broken:u
 const CASHHMDS_BROKEN: (i32, &str) = (2105, "HMDS data farm connection is broken:cashhmds");
 const USHMDS_OK: (i32, &str) = (2106, "HMDS data farm connection is OK:ushmds");
 const CASHHMDS_OK: (i32, &str) = (2106, "HMDS data farm connection is OK:cashhmds");
+const CASHHMDS_INACTIVE: (i32, &str) = (2107, "HMDS data farm connection is inactive but should be available upon demand.cashhmds");
 const JFARM_BROKEN: (i32, &str) = (2103, "Market data farm connection is broken:jfarm");
 const JFARM_INACTIVE: (i32, &str) = (2108, "Market data farm connection is inactive but should be available upon demand.jfarm");
 
@@ -405,6 +410,7 @@ fn reopens_after_last_hmds_ok() -> Vec<Step> {
         Step::Item("data"),
         notice(&RESTORED),
         Step::Opens(2),
+        Step::Wire("RCR"),
     ]);
     steps
 }
@@ -457,13 +463,123 @@ fn transport_loss_during_wait_reconnects() -> Vec<Step> {
     steps
 }
 
+/// The HMDS farm went inactive instead of reporting OK: the wrapper reopens,
+/// and when the farm reports OK before a bar arrives it cancels and reopens
+/// once more. A later 1102 reopens nothing.
+fn inactive_then_ok_reopens_again() -> Vec<Step> {
+    let mut steps = broken_with_10182(&[CASHHMDS_BROKEN]);
+    steps.extend([
+        notice(&CASHHMDS_INACTIVE),
+        Step::Opens(2),
+        Step::Wire("RCR"),
+        notice(&CASHHMDS_OK),
+        Step::Opens(3),
+        Step::Wire("RCRCR"),
+        bars(2),
+        Step::Item("data"),
+        notice(&RESTORED),
+        Step::Opens(3),
+    ]);
+    steps
+}
+
+/// As above, with a 1102 instead of the farm's OK.
+fn inactive_then_restored_reopens_again() -> Vec<Step> {
+    let mut steps = broken_with_10182(&[CASHHMDS_BROKEN]);
+    steps.extend([
+        notice(&CASHHMDS_INACTIVE),
+        Step::Opens(2),
+        notice(&RESTORED),
+        Step::Opens(3),
+        Step::Wire("RCRCR"),
+        bars(2),
+        Step::Item("data"),
+    ]);
+    steps
+}
+
+/// The outage outlasts the wait: the wrapper reopens at the limit, and again
+/// at the farm's OK, since no bar arrived in between.
+fn timeout_then_ok_reopens_again() -> Vec<Step> {
+    let mut steps = broken_with_10182(&[CASHHMDS_BROKEN]);
+    steps.extend([
+        Step::Opens(1),
+        Step::Opens(2),
+        Step::Wire("RCR"),
+        notice(&CASHHMDS_OK),
+        Step::Opens(3),
+        Step::Wire("RCRCR"),
+        bars(2),
+        Step::Item("data"),
+    ]);
+    steps
+}
+
+/// The request reopened at the limit delivers before the OK: the OK reopens
+/// nothing.
+fn timeout_then_data_keeps_request() -> Vec<Step> {
+    let mut steps = broken_with_10182(&[CASHHMDS_BROKEN]);
+    steps.extend([
+        Step::Opens(2),
+        bars(1),
+        Step::Item("data"),
+        notice(&CASHHMDS_OK),
+        Step::Opens(2),
+        Step::Wire("RCR"),
+    ]);
+    steps
+}
+
+/// Two HMDS farms down past the limit: the first OK leaves the other farm
+/// broken, the second confirms both and reopens once; a later 1102 does not.
+fn timeout_then_staggered_oks_reopen_once() -> Vec<Step> {
+    let mut steps = broken_with_10182(&[USHMDS_BROKEN, CASHHMDS_BROKEN]);
+    steps.extend([
+        Step::Opens(2),
+        notice(&USHMDS_OK),
+        Step::Opens(2),
+        notice(&CASHHMDS_OK),
+        Step::Opens(3),
+        Step::Wire("RCRCR"),
+        bars(2),
+        Step::Item("data"),
+        notice(&RESTORED),
+        Step::Opens(3),
+    ]);
+    steps
+}
+
 type Script = fn() -> Vec<Step>;
 
-const SCRIPTS: &[(&str, Script)] = &[
-    ("reopens after the last HMDS OK", reopens_after_last_hmds_ok),
-    ("market data farm without OK does not block", market_data_farm_without_ok_does_not_block),
-    ("repeated 10182 waits again", repeated_10182_waits_again),
-    ("transport loss during the wait reconnects", transport_loss_during_wait_reconnects),
+/// A wait limit the scripts that reach it pass in place of [`FARM_RECOVERY_LIMIT`].
+const SHORT_LIMIT: Duration = Duration::from_millis(500);
+
+const SCRIPTS: &[(&str, Duration, Script)] = &[
+    ("reopens after the last HMDS OK", FARM_RECOVERY_LIMIT, reopens_after_last_hmds_ok),
+    (
+        "market data farm without OK does not block",
+        FARM_RECOVERY_LIMIT,
+        market_data_farm_without_ok_does_not_block,
+    ),
+    ("repeated 10182 waits again", FARM_RECOVERY_LIMIT, repeated_10182_waits_again),
+    (
+        "transport loss during the wait reconnects",
+        FARM_RECOVERY_LIMIT,
+        transport_loss_during_wait_reconnects,
+    ),
+    ("inactive then OK reopens again", FARM_RECOVERY_LIMIT, inactive_then_ok_reopens_again),
+    (
+        "inactive then 1102 reopens again",
+        FARM_RECOVERY_LIMIT,
+        inactive_then_restored_reopens_again,
+    ),
+    ("timeout then OK reopens again", SHORT_LIMIT, timeout_then_ok_reopens_again),
+    ("timeout then data keeps the request", SHORT_LIMIT, timeout_then_data_keeps_request),
+    (
+        "timeout then staggered OKs reopen once",
+        SHORT_LIMIT,
+        timeout_then_staggered_oks_reopen_once,
+    ),
 ];
 
 /// How long a step waits for the wrapper, and how long `Opens` watches for an
@@ -493,7 +609,7 @@ fn resubscribing_across_farm_outage_sync() {
     use crate::connection::sync::Connection;
     use crate::transport::sync::{MemoryStream, TcpMessageBus};
 
-    for (name, script) in SCRIPTS {
+    for (name, limit, script) in SCRIPTS {
         let stream = MemoryStream::default();
         let connection = Connection::stubbed(stream.clone(), 28);
         connection.set_server_version_for_test(server_versions::PROTOBUF_REST_MESSAGES_3);
@@ -513,7 +629,7 @@ fn resubscribing_across_farm_outage_sync() {
                         .duration(1.days())
                         .subscribe_with_updates()
                 };
-                for item in client.resubscribing(open) {
+                for item in super::Resubscribing::within(&client, open, *limit) {
                     if items_send.send(label(item)).is_err() {
                         break;
                     }
@@ -542,6 +658,10 @@ fn resubscribing_across_farm_outage_sync() {
                         std::thread::sleep(SETTLE);
                         assert_eq!(opens.load(Ordering::SeqCst), expected, "{name}: open calls");
                     }
+                    Step::Wire(expected) => {
+                        wait_for("the writes", || wire(&stream.captured(), &KEEP_UP_TO_DATE).len() >= expected.len());
+                        assert_eq!(wire(&stream.captured(), &KEEP_UP_TO_DATE), expected, "{name}: requests and cancels");
+                    }
                 }
             }
         });
@@ -560,7 +680,7 @@ async fn resubscribing_across_farm_outage_async() {
     use crate::connection::r#async::AsyncConnection;
     use crate::transport::r#async::{AsyncTcpMessageBus, MemoryStream};
 
-    for (name, script) in SCRIPTS {
+    for (name, limit, script) in SCRIPTS {
         let stream = MemoryStream::default();
         let connection = AsyncConnection::stubbed(stream.clone(), 28);
         connection.set_server_version_for_test(server_versions::PROTOBUF_REST_MESSAGES_3);
@@ -577,7 +697,7 @@ async fn resubscribing_across_farm_outage_async() {
                 .duration(1.days())
                 .subscribe_with_updates()
         };
-        let mut items = std::pin::pin!(client.resubscribing(open));
+        let mut items = std::pin::pin!(super::async_impl::resubscribing_within(&client, open, *limit));
 
         for step in script() {
             match step {
@@ -608,6 +728,13 @@ async fn resubscribing_across_farm_outage_async() {
                         panic!("{name}: unexpected item: {:?}", item.map(label));
                     }
                     assert_eq!(opens.load(Ordering::SeqCst), expected, "{name}: open calls");
+                }
+                Step::Wire(expected) => {
+                    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+                    while wire(&stream.captured(), &KEEP_UP_TO_DATE).len() < expected.len() && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    assert_eq!(wire(&stream.captured(), &KEEP_UP_TO_DATE), expected, "{name}: requests and cancels");
                 }
             }
         }
@@ -647,7 +774,7 @@ async fn resubscribing_dropped_during_farm_wait_async() {
         match step {
             Step::Push(frame) => stream.push_inbound(frame),
             Step::Item(expected) => assert_eq!(items.next().await.map(label).as_deref(), Some(expected)),
-            Step::Opens(_) | Step::TransportLost => {}
+            Step::Opens(_) | Step::TransportLost | Step::Wire(_) => {}
         }
     }
     assert!(tokio::time::timeout(SETTLE, items.next()).await.is_err(), "the wrapper should be waiting");

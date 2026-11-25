@@ -318,7 +318,15 @@ impl Client {
     /// breaks. The wrapper yields that 10182 as a `SubscriptionItem::Notice`, the gap marker,
     /// waits until no HMDS farm reports broken (or TWS reports connectivity restored with 1101
     /// or 1102, or 15 minutes pass), then calls `open` again. A 10182 on the reopened request
-    /// starts another wait, and a reconnect during the wait reopens as above. The wait can last
+    /// starts another wait, and a reconnect during the wait reopens as above.
+    ///
+    /// TWS has confirmed the farms back when every HMDS farm that reported broken has reported
+    /// OK since, or a 1101 or 1102 arrived. The wait can also end unconfirmed: at the 15-minute
+    /// limit, or when the broken farms went inactive (2107) instead of reporting OK. TWS may
+    /// hold a request sent while its farm is down and never answer it. So after an unconfirmed
+    /// reopen, if TWS later confirms the farms back before the reopened request delivers a bar,
+    /// the wrapper writes that request's cancel and calls `open` once more, without a notice.
+    /// This happens at most once per 10182. The wait can last
     /// minutes with no bars. A consumer that completes a forming bar on a timer must treat the
     /// 10182 notice as the signal to stop until the reopened stream's first bars arrive; a bar
     /// completed during the wait rests on bars from before the outage.
@@ -331,7 +339,8 @@ impl Client {
     /// depth lines. An error TWS sends for the old request cannot end the new stream. Each 1101
     /// reopens once; 1101s that arrive before the wrapper next runs reopen once together. A 1101
     /// that ends a wait after 10182 reopens once, without a second notice. 1102 ("data
-    /// maintained") reopens nothing. A caller that re-requests on 1101 itself must stop, or it
+    /// maintained") reopens nothing, except the second reopen after an unconfirmed wait
+    /// described above. A caller that re-requests on 1101 itself must stop, or it
     /// opens a second request.
     ///
     /// It ends after yielding any other error, the error `wait_connected` returns when the

@@ -207,12 +207,15 @@ IDEALPRO; Wi-Fi off for 15 s, 2 min and 6 min; one client never cancelled or re-
   same millisecond as 2105 for `cashhmds`, after it, every run, every client (one also got 165).
   No frame followed in 270 s, 389 s, 635 s. A new request after the restore returned a batch
   covering every outage minute, 2.5 to 3.7 s after the 1102. `Client::resubscribing` reopens the
-  request once no HMDS farm reports broken.
+  request once no HMDS farm reports broken, and once more if TWS confirms the farms back later
+  and the reopened request has delivered no bar.
 - 10197 "No market data during competing live session" does not end a market data request: drawn
   51 s into the 6-minute outage on all clients; on the client that sent no cancel, ticks resumed
   on the same id at restore (2233 to the end). Tick-by-tick, depth and realtime bars got no 10197.
   A market data subscription yields it as a notice and keeps reading
   (`TickTypes::error_continues_request`).
 - **Not probed:** 1101, and whether streams resume on their own ids after it (a reopen after 1101
-  loses the realtime bar back-fill if they do); stocks, futures, RTH; insert or update rows after
-  restore; 10197 during a real competing session.
+  loses the realtime bar back-fill if they do); whether TWS answers a keep-up-to-date bar request
+  sent during the outage once its farm is back (every such request was replaced before the
+  restore); stocks, futures, RTH; insert or update rows after restore; 10197 during a real
+  competing session.
