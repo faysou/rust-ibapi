@@ -63,6 +63,18 @@ impl_str_partial_eq!(Symbol);
 ///
 /// IBKR supports 160+ exchanges worldwide. This type provides a lightweight wrapper
 /// around exchange codes.
+///
+/// The default is `SMART`, IB's smart router, which a `Contract` struct literal ending in
+/// `..Default::default()` takes for `exchange` (its `primary_exchange` stays empty).
+/// [`ContractBuilder::new`](crate::contracts::ContractBuilder::new) builds an empty exchange
+/// unless [`exchange`](crate::contracts::ContractBuilder::exchange) sets one.
+///
+/// ```
+/// use ibapi::contracts::{Contract, Exchange};
+///
+/// assert_eq!(Exchange::default().as_str(), "SMART");
+/// assert_eq!(Contract::default().exchange, Exchange::default());
+/// ```
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Exchange(pub String);
