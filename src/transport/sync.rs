@@ -1186,11 +1186,21 @@ struct Entry<V> {
     lease: LeaseRef,
     /// The unread-item cap of a route opened with a `send_request_capped` bound.
     bound: Option<BoundState>,
+    /// Another entry was registered under this entry's key after it, so an
+    /// error frame on the key may answer that later request: it reaches this
+    /// entry as [`RoutedItem::for_earlier_subscription`], also once the later
+    /// entry is gone.
+    superseded: bool,
 }
 
 impl<V> Entry<V> {
     fn new(sender: Sender<V>, lease: LeaseRef) -> Self {
-        Self { sender, lease, bound: None }
+        Self {
+            sender,
+            lease,
+            bound: None,
+            superseded: false,
+        }
     }
 
     fn closed(&self) -> bool {
@@ -1282,13 +1292,17 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         self.insert_entry(id, entry);
     }
 
-    /// Register `entry` under `id` beside the entries already there. An entry
-    /// with the same lease is replaced, so one subscription never holds two
-    /// entries under a key and never receives a frame twice.
+    /// Register `entry` under `id` beside the entries already there, which it
+    /// supersedes. An entry with the same lease is replaced, so one
+    /// subscription never holds two entries under a key and never receives a
+    /// frame twice.
     fn insert_entry(&self, id: K, entry: Entry<V>) {
         let mut senders = self.write();
         let registered = senders.entry(id).or_default();
         registered.retain(|other| !other.lease.is(&entry.lease));
+        for other in registered.iter_mut() {
+            other.superseded = true;
+        }
         registered.push(entry);
     }
 
@@ -1366,7 +1380,8 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug> SenderHash<K, RoutedItem> {
     }
 
     /// Deliver `item` to each of `id`'s routes and run `then` on each, all
-    /// under the read lock. Routes older than the newest receive
+    /// under the read lock. Superseded entries, every one but the newest and
+    /// the newest too once a later entry was removed, receive
     /// [`RoutedItem::for_earlier_subscription`].
     fn deliver_then(&self, id: &K, item: RoutedItem, then: impl Fn(&Entry<RoutedItem>)) -> Result<(), RoutedItem> {
         let senders = self.read();
@@ -1377,6 +1392,7 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug> SenderHash<K, RoutedItem> {
             entry.deliver(id, item.for_earlier_subscription());
             then(entry);
         }
+        let item = if newest.superseded { item.for_earlier_subscription() } else { item };
         newest.deliver(id, item);
         then(newest);
         Ok(())

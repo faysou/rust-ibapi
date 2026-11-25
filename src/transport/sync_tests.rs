@@ -2873,6 +2873,31 @@ fn order_error_ends_only_the_newest_subscription_on_the_order_id() -> Result<(),
     Ok(())
 }
 
+/// `let _ = client.cancel_order(id)?;` drops the cancel's subscription before
+/// TWS answers. Its refusal still reaches the `place_order` subscription as a
+/// notice: the later request superseded it, so it does not end on the error.
+#[test]
+fn order_error_after_the_newer_subscription_drops_is_a_notice() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let handle = bus.start_cleanup_thread();
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    let cancel = bus.send_order_request(OrderId::from(7), &[])?;
+    drop(cancel);
+    drain_cleanup_signals(&bus);
+
+    stream.push_inbound(error_frame(7, 10148, "OrderId 7 that needs to be cancelled can not be cancelled."));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Filled));
+    for _ in 0..2 {
+        bus.dispatch()?;
+    }
+
+    let place_items: Vec<String> = std::iter::from_fn(|| place.next_timeout_routed(TICK)).map(routed_label).collect();
+    bus.request_shutdown();
+    handle.join().expect("cleanup thread join");
+    assert_eq!(place_items, ["notice 10148", "OrderStatus"]);
+    Ok(())
+}
+
 fn routed_label(item: RoutedItem) -> String {
     match item {
         RoutedItem::Response(message) => format!("{:?}", message.message_type()),
