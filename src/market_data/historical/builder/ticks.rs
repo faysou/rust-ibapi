@@ -23,11 +23,12 @@ mod tests;
 /// [`mid_point`](Self::mid_point) or [`bid_ask`](Self::bid_ask) reply holds
 /// one tick of its earliest second; with [`starting`](Self::starting) that
 /// tick is stamped before the start. TWS rejects a request for more than
-/// 1000. For a forex pair TWS answers a trades request with midpoint
-/// ticks, which [`last`](Self::last) does not decode: the call then waits
-/// until `one_shot_timeout`, without a limit if it is unset. Use
-/// [`mid_point`](Self::mid_point) or [`bid_ask`](Self::bid_ask) (live
-/// 2026-11-16, paper; `docs/wire-facts/market-data.md#historical-ticks-reply`).
+/// 1000. For a contract without trade ticks, such as a forex pair, a spot
+/// metal or an index CFD, TWS answers a trades request with midpoint ticks
+/// and nothing more, and [`last`](Self::last) returns
+/// [`Error::UnexpectedTickKind`]. Use [`mid_point`](Self::mid_point) or
+/// [`bid_ask`](Self::bid_ask) there (live 2026-11-24, paper;
+/// `docs/wire-facts/market-data.md#historical-ticks-of-another-kind`).
 ///
 /// # Errors
 ///
@@ -37,6 +38,7 @@ mod tests;
 ///   marks the reply complete.
 /// - [`Error::Timeout`] if the reply isn't complete within the client's
 ///   `one_shot_timeout`.
+/// - [`Error::UnexpectedTickKind`] if TWS answers with ticks of another kind.
 ///
 /// Without a `one_shot_timeout`, a terminal waits without a time limit. Any
 /// error before the reply is complete cancels the request at TWS.

@@ -276,6 +276,28 @@ server 223.*
 - **Not probed:** real-time `Volume` (8) (no real-time US equity permission on this account);
   delayed volume during regular hours; other markets.
 
+### Historical ticks of another kind
+
+*Live 2026-11-24 00:46Z (Monday 19:46 ET, off-hours), paper TWS, server 223; raw capture.*
+
+- `reqHistoricalTicks` TRADES, 50 ticks ending 2026-11-23 20:00 UTC, for EUR.USD (IDEALPRO),
+  XAUUSD (CMDTY, SMART) and the IBUS500 CFD: one `HistoricalTick` (midpoint) frame each, with
+  `isDone` true, then nothing for 20 s. No `HistoricalTickLast` frame and no error. EUR.USD
+  sent the same 56 ticks for TRADES and for MIDPOINT (first tick 1.09043, `size` `"0"`).
+  1,000 ticks and a `startDateTime` request instead of an end date answered the same way.
+- AAPL TRADES got one `HistoricalTickLast` frame (114 ticks, `isDone` true). An AAPL TRADES
+  window with no ticks (start 2026-11-24 00:30 UTC, regular hours) got one
+  `HistoricalTickLast` frame with no ticks and `isDone` true: an empty answer keeps the
+  requested kind, so a frame of another kind means TWS has none of the requested kind.
+- BID_ASK and MIDPOINT were each answered with their own kind for all four contracts. Earlier
+  the same day (23:56Z), SPX index BID_ASK and MIDPOINT drew error 10187 and BTC (PAXOS)
+  TRADES drew 10299 ("Expected what to show is AGGTRADES"): errors, not another kind.
+- So `historical_ticks(..)` ends with `Error::UnexpectedTickKind` on a frame of another kind.
+  Skipping the frame waits forever, or until `one_shot_timeout`, because TWS sends nothing more.
+- **Not probed:** a BID_ASK or MIDPOINT request answered with another kind (none provoked);
+  futures, options and bonds TRADES without trades; whether the substitute frame is ever
+  split across several frames with `isDone` false.
+
 ### Tick-by-tick sizes and `IgnoreSize`
 
 *Live 2026-11-16 03:33Z (Sunday evening ET), paper Gateway, server 226, BTC/PAXOS; #1244.*
@@ -327,9 +349,9 @@ close (17:58-18:05 ET), paper Gateway, server 226; the first two runs AAPL with 
   (interactivebrokers.com/docs/tws-api/doc/md/historical-ticks.md) reads "Max is 1000 per
   request".
 - Trades asked for a forex pair (EUR.USD): no error, and the reply is a `HistoricalTick`
-  (midpoint) frame, not `HistoricalTickLast`. `last()` does not decode that frame, so the call
-  waits until `one_shot_timeout`; use `mid_point()` or `bid_ask(..)` for forex. BTC/PAXOS trades
-  → 10299 "Expected what to show is AGGTRADES".
+  (midpoint) frame, not `HistoricalTickLast`, so `last()` returns `Error::UnexpectedTickKind`
+  ([another kind](#historical-ticks-of-another-kind)); use `mid_point()` or `bid_ask(..)` for
+  forex. BTC/PAXOS trades → 10299 "Expected what to show is AGGTRADES".
 - The reply is finite and one frame here, which is why `historical_ticks` returns a `Vec`; the
   crate still reads frames until `is_done`, so a reply TWS split would be returned whole.
 - **Not probed:** whether the 1000 cap depends on the account or its market data subscriptions

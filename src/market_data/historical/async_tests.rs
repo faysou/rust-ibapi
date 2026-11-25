@@ -1265,6 +1265,36 @@ async fn historical_ticks_skips_undeclared_message() {
     assert_eq!(prices(&result.expect("the tick frame")), [1.0]);
 }
 
+/// A TRADES request for a contract without trades (EUR.USD, XAUUSD, an index
+/// CFD) is answered with one midpoint frame, `done` set, and nothing more: the
+/// call fails instead of waiting while the channel stays open.
+#[tokio::test]
+async fn historical_ticks_last_answered_with_midpoints_fails() {
+    let midpoints = proto_response(
+        IncomingMessages::HistoricalTick,
+        historical_ticks_response()
+            .tick(tick_midpoint(1_795_463_984, 1.09043))
+            .done(true)
+            .encode_proto(),
+    );
+    let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![midpoints]).keeping_channels_open());
+    let client = Client::stubbed(bus.clone(), server_versions::CANCEL_CONTRACT_DATA).with_one_shot_timeout(std::time::Duration::from_secs(5));
+
+    let result = client.historical_ticks(&Contract::forex("EUR", "USD").build(), 50).last().await;
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::UnexpectedTickKind {
+                requested: WhatToShow::Trades,
+                received: WhatToShow::MidPoint
+            })
+        ),
+        "{result:?}"
+    );
+    assert_eq!(tick_requests_and_cancels(&bus).await.0, 1);
+}
+
 /// A decode failure before the `done` frame cancels the request at TWS.
 #[tokio::test]
 async fn historical_ticks_local_error_cancels() {

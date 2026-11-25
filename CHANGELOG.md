@@ -90,6 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `Client::resubscribing` (sync and async) ends after a market data snapshot's `TickTypes::SnapshotEnd`, as its docs said. Previously it kept waiting on a snapshot TWS had finished, and a later reconnect sent the snapshot request again. The same holds for `historical_data(..).subscribe()`, which it now accepts, after `End` (#1246).
+- `historical_ticks(..).last()` (sync and async) returns the new `Error::UnexpectedTickKind` when TWS answers with ticks of another kind, which it does for contracts without trade ticks: forex pairs, spot metals and index CFDs get midpoint ticks. The call skipped that frame and then waited forever, or until `one_shot_timeout`, since TWS sends nothing more. `bid_ask()` and `mid_point()` treat a frame of another kind the same way. An empty answer of the requested kind still returns no ticks (#1287).
 - Code 10349 "Order TIF was set to DAY based on order preset" is a `NoticeCategory::Warning` on any order. TWS goes on with the order after it. It arrives on every `exercise_options` request, where it ended the subscription with an error before the exercise's open order and executions arrived. It now arrives as a notice and the subscription keeps reading (#1210).
 
 ## [5.8.0] - 2026-11-24

@@ -46,6 +46,13 @@ fn error_display() {
         (Error::Cancelled, "Cancelled"),
         (Error::Shutdown, "Shutdown"),
         (Error::UnexpectedEndOfStream, "UnexpectedEndOfStream"),
+        (
+            Error::UnexpectedTickKind {
+                requested: WhatToShow::Trades,
+                received: WhatToShow::MidPoint,
+            },
+            "historical ticks requested as TRADES, but TWS answered with MIDPOINT ticks",
+        ),
         (Error::Timeout, "timed out before the request ended"),
         (
             Error::BufferLimitExceeded { limit: 5 },
@@ -280,6 +287,10 @@ fn clone_preserves_payloaded_variants() {
         },
         Error::BufferLimitExceeded { limit: 5 },
         Error::OrderIdInRequestRange { order_id: 7 },
+        Error::UnexpectedTickKind {
+            requested: WhatToShow::BidAsk,
+            received: WhatToShow::Trades,
+        },
     ];
 
     for original in originals {

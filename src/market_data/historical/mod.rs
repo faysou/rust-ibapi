@@ -26,6 +26,7 @@ use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
 use crate::messages::{IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE};
 use crate::protocol::Features;
+use crate::subscriptions::common::is_undeclared;
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
@@ -830,9 +831,11 @@ impl_wire_string_serde!(WhatToShow as "HistoricalWhatToShow" {
 /// Implemented by the three historical tick types: how one reply frame decodes
 /// into ticks.
 pub(crate) trait TickDecoder<T> {
-    /// Message types this decoder consumes; [`TickFrame`] passes them on as its
-    /// `StreamDecoder::RESPONSE_MESSAGE_IDS`. A tick type declares exactly one.
+    /// Message types this decoder consumes. A tick type declares exactly one;
+    /// [`TickFrame`] ends the request on a frame of another tick kind.
     const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages];
+    /// The kind of tick this decoder reads, as the request names it.
+    const WHAT_TO_SHOW: WhatToShow;
     /// Decode a batch of ticks, returning the payload and an end-of-stream flag.
     ///
     /// Every impl narrows with `message.expect_type(..)?` first: it is the
@@ -843,6 +846,7 @@ pub(crate) trait TickDecoder<T> {
 
 impl TickDecoder<TickBidAsk> for TickBidAsk {
     const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[IncomingMessages::HistoricalTickBidAsk];
+    const WHAT_TO_SHOW: WhatToShow = WhatToShow::BidAsk;
 
     fn decode(message: &ResponseMessage) -> Result<(Vec<TickBidAsk>, bool), Error> {
         common::decoders::decode_historical_ticks_bid_ask(message.expect_type(IncomingMessages::HistoricalTickBidAsk)?)
@@ -851,6 +855,7 @@ impl TickDecoder<TickBidAsk> for TickBidAsk {
 
 impl TickDecoder<TickLast> for TickLast {
     const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[IncomingMessages::HistoricalTickLast];
+    const WHAT_TO_SHOW: WhatToShow = WhatToShow::Trades;
 
     fn decode(message: &ResponseMessage) -> Result<(Vec<TickLast>, bool), Error> {
         common::decoders::decode_historical_ticks_last(message.expect_type(IncomingMessages::HistoricalTickLast)?)
@@ -859,6 +864,7 @@ impl TickDecoder<TickLast> for TickLast {
 
 impl TickDecoder<TickMidpoint> for TickMidpoint {
     const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[IncomingMessages::HistoricalTick];
+    const WHAT_TO_SHOW: WhatToShow = WhatToShow::MidPoint;
 
     fn decode(message: &ResponseMessage) -> Result<(Vec<TickMidpoint>, bool), Error> {
         common::decoders::decode_historical_ticks_mid_point(message.expect_type(IncomingMessages::HistoricalTick)?)
@@ -873,9 +879,28 @@ pub(crate) struct TickFrame<T> {
 }
 
 impl<T: TickDecoder<T>> StreamDecoder<TickFrame<T>> for TickFrame<T> {
-    const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = T::RESPONSE_MESSAGE_IDS;
+    /// Every tick kind, not only the requested one: TWS answers a request for
+    /// a kind the contract has none of with another kind, and sends nothing
+    /// after it (`docs/wire-facts/market-data.md#historical-ticks-of-another-kind`).
+    const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[
+        IncomingMessages::HistoricalTickLast,
+        IncomingMessages::HistoricalTickBidAsk,
+        IncomingMessages::HistoricalTick,
+    ];
 
     fn decode(_context: &DecoderContext, message: &ResponseMessage) -> Result<Self, Error> {
+        if is_undeclared(T::RESPONSE_MESSAGE_IDS, message) {
+            let received = match message.message_type() {
+                IncomingMessages::HistoricalTickLast => WhatToShow::Trades,
+                IncomingMessages::HistoricalTickBidAsk => WhatToShow::BidAsk,
+                IncomingMessages::HistoricalTick => WhatToShow::MidPoint,
+                _ => return Err(Error::unexpected_response(message)),
+            };
+            return Err(Error::UnexpectedTickKind {
+                requested: T::WHAT_TO_SHOW,
+                received,
+            });
+        }
         let (ticks, done) = T::decode(message)?;
         Ok(Self { ticks, done })
     }
