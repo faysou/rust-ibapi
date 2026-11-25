@@ -28,7 +28,8 @@ use super::routing::{
     RoutingDecision,
 };
 use super::{
-    Admit, BoundState, BufferBound, InternalSubscription, MessageBus, Response, RoutedItem, SharedCounts, SharedTicket, Signal, SubscriptionBuilder,
+    Admit, BoundState, BufferBound, InternalSubscription, MessageBus, ReplySkip, Response, RoutedItem, SharedCounts, SharedTicket, Signal,
+    SubscriptionBuilder, UnansweredReplies,
 };
 use crate::messages::{
     is_cancel_frame, shared_channel_configuration, transport_reconnect_notice, IncomingMessages, Notice, OutgoingMessages, ResponseMessage,
@@ -82,12 +83,39 @@ struct SharedSubscriber {
     responses: &'static [IncomingMessages],
     sender: Sender<RoutedItem>,
     lease: LeaseRef,
+    // The earlier replies this subscription passes over; see `UnansweredReplies`.
+    skip: ReplySkip,
 }
 
 impl SharedSubscriber {
     fn receives(&self, message_type: IncomingMessages) -> bool {
         self.responses.contains(&message_type)
     }
+
+    // Queues `item`; `false` when the queue is gone (its handle was dropped
+    // and the cleanup signal has not been processed yet), so the caller
+    // removes this registration.
+    fn deliver(&self, item: RoutedItem) -> bool {
+        match self.sender.send(item) {
+            Ok(()) => {
+                warn_if_backlogged(format_args!("shared channel for {:?}", self.request), self.sender.len());
+                true
+            }
+            Err(_) => {
+                debug!("shared subscription {:?} dropped: removed", self.request);
+                false
+            }
+        }
+    }
+}
+
+// The live subscriptions and the replies outstanding ahead of a new one,
+// under one lock: a new subscription's skip count and the end markers the
+// dispatcher delivers to it then agree.
+#[derive(Debug, Default)]
+struct SharedSubscribers {
+    live: Vec<SharedSubscriber>,
+    unanswered: UnansweredReplies,
 }
 
 // For requests without an identifier, responses are routed by message type
@@ -104,7 +132,7 @@ struct SharedChannels {
     // Live subscriptions, added in `send_shared_request` and removed by the
     // cleanup thread on cancel or drop or, lazily, when a send finds the
     // queue gone.
-    subscribers: Mutex<Vec<SharedSubscriber>>,
+    subscribers: Mutex<SharedSubscribers>,
     // Live subscriptions per request type; see `SharedCounts`.
     counts: Mutex<SharedCounts>,
 }
@@ -116,52 +144,65 @@ impl SharedChannels {
                 .iter()
                 .flat_map(|mapping| mapping.responses.iter().copied())
                 .collect(),
-            subscribers: Mutex::new(Vec::new()),
+            subscribers: Mutex::new(SharedSubscribers::default()),
             counts: Mutex::new(SharedCounts::default()),
         }
     }
 
-    fn subscribers(&self) -> MutexGuard<'_, Vec<SharedSubscriber>> {
+    fn subscribers(&self) -> MutexGuard<'_, SharedSubscribers> {
         lock(&self.subscribers)
     }
 
-    // Registers `sender` for every response type of `request`. Panics if
-    // `request` has no mapping.
+    // Registers `sender` for every response type of `request`, counting the
+    // request as unanswered. Panics if `request` has no mapping.
     fn add(&self, request: OutgoingMessages, sender: Sender<RoutedItem>, lease: LeaseRef) {
         let responses = shared_channel_configuration::response_types(request)
             .unwrap_or_else(|| panic!("unsupported request message {request:?}. check mapping in messages::shared_channel_configuration"));
-        self.subscribers().push(SharedSubscriber {
+        let mut subscribers = self.subscribers();
+        let skip = subscribers.unanswered.add(request);
+        subscribers.live.push(SharedSubscriber {
             request,
             responses,
             sender,
             lease,
+            skip,
         });
     }
 
     // Removes the subscription holding `lease`, if still registered.
     fn remove(&self, lease: &LeaseRef) {
         let mut subscribers = self.subscribers();
-        let before = subscribers.len();
-        subscribers.retain(|subscriber| !subscriber.lease.is(lease));
-        debug!("cleanup shared subscription: removed={}", before != subscribers.len());
+        let before = subscribers.live.len();
+        subscribers.live.retain(|subscriber| !subscriber.lease.is(lease));
+        debug!("cleanup shared subscription: removed={}", before != subscribers.live.len());
     }
 
     fn is_shared_response(&self, message_type: IncomingMessages) -> bool {
         self.response_types.contains(&message_type)
     }
 
-    // Runs `write` for a new subscription of `message_type` and counts it on
-    // success. The lock spans the write so the count and the wire agree.
-    // `account` is the account-updates account, checked before the write.
+    // Registers `sender` for a new subscription of `message_type`, runs
+    // `write` and counts the subscription on success. The lock spans the
+    // write so the count and the wire agree, and the registration comes
+    // under it, before the write, so no response can arrive ahead of it and
+    // unanswered requests are counted in wire order. `account` is the
+    // account-updates account, checked before anything is registered.
     fn subscribe(
         &self,
         message_type: OutgoingMessages,
         account: Option<&AccountId>,
+        sender: Sender<RoutedItem>,
+        lease: LeaseRef,
         write: impl FnOnce() -> Result<(), Error>,
     ) -> Result<SharedTicket, Error> {
         let mut counts = lock(&self.counts);
         counts.check_account_updates(account)?;
-        write()?;
+        self.add(message_type, sender, lease.clone());
+        if let Err(e) = write() {
+            self.remove(&lease);
+            self.subscribers().unanswered.withdraw(message_type);
+            return Err(e);
+        }
         Ok(counts.subscribe(message_type, account))
     }
 
@@ -180,47 +221,47 @@ impl SharedChannels {
     // generation so their later drops cannot touch the next session's counts.
     fn reset_counts(&self) {
         lock(&self.counts).reset();
+        self.subscribers().unanswered.clear();
     }
 
     // Sends `item()` to every subscriber selected by `filter`; returns how
-    // many were selected. A send fails only when the subscriber's queue is
-    // gone (its handle was dropped and the cleanup signal has not been
-    // processed yet); it is removed here.
+    // many were selected. A subscriber whose queue is gone is removed here.
     fn send_to<F, I>(&self, filter: F, item: I) -> usize
     where
         F: Fn(&SharedSubscriber) -> bool,
         I: Fn() -> RoutedItem,
     {
         let mut selected = 0;
-        self.subscribers().retain(|subscriber| {
+        self.subscribers().live.retain(|subscriber| {
             if !filter(subscriber) {
                 return true;
             }
             selected += 1;
-            match subscriber.sender.send(item()) {
-                Ok(()) => {
-                    warn_if_backlogged(format_args!("shared channel for {:?}", subscriber.request), subscriber.sender.len());
-                    true
-                }
-                Err(_) => {
-                    debug!("shared subscription {:?} dropped: removed", subscriber.request);
-                    false
-                }
-            }
+            subscriber.deliver(item())
         });
         selected
     }
 
-    // Deliver `message` to every live subscription registered for its type;
-    // returns whether any was. With none, the frame is dropped: a shared
+    // Deliver `message` to every live subscription registered for its type,
+    // except one still passing over an earlier request's reply; returns
+    // whether any was registered. With none, the frame is dropped: a shared
     // response nobody asked for (e.g. `OpenOrder` from another client, or
     // after the requester's drop).
     fn send_message(&self, message_type: IncomingMessages, message: &ResponseMessage) -> bool {
-        let delivered = self.send_to(|subscriber| subscriber.receives(message_type), || message.clone().into()) > 0;
-        if !delivered {
+        let mut subscribers = self.subscribers();
+        let mut registered = false;
+        subscribers.live.retain_mut(|subscriber| {
+            if !subscriber.receives(message_type) {
+                return true;
+            }
+            registered = true;
+            subscriber.skip.skips(message_type) || subscriber.deliver(message.clone().into())
+        });
+        subscribers.unanswered.answered(message_type);
+        if !registered {
             trace!("no shared subscription for {message_type:?}: frame dropped");
         }
-        delivered
+        registered
     }
 
     // Deliver `message_fn()` once to every live subscription, then remove
@@ -232,10 +273,10 @@ impl SharedChannels {
         F: Fn() -> RoutedItem,
     {
         let mut subscribers = self.subscribers();
-        for subscriber in subscribers.iter() {
+        for subscriber in subscribers.live.iter() {
             let _ = subscriber.sender.send(message_fn());
         }
-        subscribers.clear();
+        subscribers.live.clear();
     }
 
     // Fail in-flight one-shot requests fast by delivering an error to the
@@ -938,21 +979,14 @@ impl<S: Stream> TcpMessageBus<S> {
         let session = self.session_generation();
         self.ensure_connected()?;
 
-        // A queue of its own, registered before the write so no response can
-        // arrive ahead of it. A failed write or a refused account takes the
-        // registration with it.
+        // A queue of its own; `subscribe` registers it before the write, and
+        // a failed write takes the registration with it.
         let (sender, receiver) = channel::unbounded();
         let lease = Lease::new();
-        let lease_ref = lease.downgrade();
-        self.shared_channels.add(message_type, sender.clone(), lease_ref.clone());
         self.throttle(message);
-        let ticket = match self.shared_channels.subscribe(message_type, account, || self.write_now(message)) {
-            Ok(ticket) => ticket,
-            Err(e) => {
-                self.shared_channels.remove(&lease_ref);
-                return Err(e);
-            }
-        };
+        let ticket = self
+            .shared_channels
+            .subscribe(message_type, account, sender.clone(), lease.downgrade(), || self.write_now(message))?;
 
         // The lease is the drop signal's identity: `Signal::Shared` removes
         // exactly this registration.

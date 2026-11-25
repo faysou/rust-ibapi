@@ -105,3 +105,42 @@ fn admit_closes_on_any_of_several_end_markers() {
         assert!(state.closed(), "{end:?} is terminal");
     }
 }
+
+/// Requests sharing an end marker share one count, an end marker with
+/// nothing outstanding (the `OpenOrderEnd` TWS sends at connect) is ignored,
+/// and a skip passes over every frame up to and including its last end marker.
+#[test]
+fn unanswered_replies_count_by_end_marker() {
+    use crate::messages::IncomingMessages as M;
+    let mut unanswered = UnansweredReplies::default();
+
+    unanswered.answered(M::OpenOrderEnd);
+    assert!(!unanswered.add(OutgoingMessages::RequestOpenOrders).skips(M::OpenOrder));
+    assert!(
+        !unanswered.add(OutgoingMessages::RequestCurrentTime).skips(M::CurrentTime),
+        "one-shots never skip"
+    );
+
+    let mut all = unanswered.add(OutgoingMessages::RequestAllOpenOrders);
+    let mut completed = unanswered.add(OutgoingMessages::RequestCompletedOrders);
+    assert_eq!(unanswered.pending(M::OpenOrderEnd), 2);
+    assert!(!completed.skips(M::CompletedOrder), "another end marker's requests counted");
+
+    for frame in [M::OpenOrder, M::OrderStatus, M::OpenOrderEnd] {
+        assert!(all.skips(frame), "{frame:?} of the earlier reply delivered");
+    }
+    assert!(!all.skips(M::OpenOrder), "own reply skipped");
+
+    unanswered.answered(M::OpenOrderEnd);
+    unanswered.answered(M::OpenOrderEnd);
+    unanswered.answered(M::OpenOrderEnd);
+    assert_eq!(unanswered.pending(M::OpenOrderEnd), 0);
+
+    unanswered.add(OutgoingMessages::RequestPositions);
+    unanswered.withdraw(OutgoingMessages::RequestPositions);
+    assert_eq!(unanswered.pending(M::PositionEnd), 0, "a withdrawn request still counted");
+
+    unanswered.add(OutgoingMessages::RequestOpenOrders);
+    unanswered.clear();
+    assert_eq!(unanswered.pending(M::OpenOrderEnd), 0, "clear kept a count");
+}

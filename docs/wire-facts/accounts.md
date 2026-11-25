@@ -57,3 +57,15 @@ Positions, PnL and account updates by model. End-marker behavior for account str
 - **Not probed:** a model code, an FA master account, later update frames (only the initial
   dump to the end marker was read), whether the Gateway applies a changed setting to an
   already-open subscription (each run reconnected).
+
+### A second `reqAccountUpdates` for the subscribed account draws no reply
+
+*Live 2026-11-25 off-hours, paper TWS, server 223.*
+
+- `reqAccountUpdates(true, account)` while the first subscription for that account was live,
+  written after the first dump's `AccountDownloadEnd`: no frame in the next 6 s. TWS does not
+  send a second dump, unlike `reqPositions`, `reqOpenOrders` and `reqCompletedOrders`
+  ([overlapping open-order requests](orders.md#overlapping-open-order-requests)). A second
+  `account_updates` caller gets only later periodic updates, never the initial values.
+- **Not probed:** a second request written before the first dump ends, and how long until the
+  next periodic update reaches it.

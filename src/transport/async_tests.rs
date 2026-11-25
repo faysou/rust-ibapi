@@ -21,7 +21,7 @@ use crate::common::test_utils::helpers::{
 };
 use crate::connection::common::ConnectionProtocol;
 use crate::connection::r#async::AsyncConnection;
-use crate::messages::{encode_raw_length, OutgoingMessages, TRANSPORT_RECONNECT_CODE};
+use crate::messages::{encode_raw_length, IncomingMessages, OutgoingMessages, TRANSPORT_RECONNECT_CODE};
 use crate::server_versions;
 use crate::testdata::builders::contracts::contract_data;
 use crate::testdata::builders::orders::order_bound;
@@ -248,14 +248,23 @@ async fn order_id_correlation_with_interleaved_responses() {
 /// Shared-channel fan-out: `RequestOpenOrders`, `RequestAllOpenOrders`, and
 /// `RequestAutoOpenOrders` all map to `[OpenOrder, OrderStatus, OpenOrderEnd]`
 /// in `CHANNEL_MAPPINGS`. The `OrderAndShared` strategy fans every `OpenOrder`
-/// out to each shared subscriber, with or without an order id.
+/// out to each shared subscriber, with or without an order id, once none is
+/// passing over an earlier request's reply.
 #[tokio::test]
 async fn shared_channel_fan_out_for_open_orders() {
+    use crate::messages::IncomingMessages as M;
     let (stream, bus) = make_bus();
 
     let mut sub_open = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, vec![]).await.unwrap();
     let mut sub_all = bus.send_shared_request(OutgoingMessages::RequestAllOpenOrders, vec![]).await.unwrap();
     let mut sub_auto = bus.send_shared_request(OutgoingMessages::RequestAutoOpenOrders, vec![]).await.unwrap();
+
+    // The end of the open-orders reply, which `sub_all` passes over.
+    stream.push_inbound(binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {}));
+    bus.read_and_route_message().await.unwrap();
+    for (name, sub) in [("open", &mut sub_open), ("auto", &mut sub_auto)] {
+        assert_eq!(next_message(sub).await.message_type(), M::OpenOrderEnd, "sub_{name}");
+    }
 
     for order_id in [Some(42), None] {
         stream.push_inbound(binary_proto(
@@ -842,11 +851,14 @@ async fn shared_subscription_cancel_waits_for_last_subscriber() {
         "cancel written while a subscription is still live"
     );
 
-    stream.push_inbound(binary_proto(
-        crate::messages::IncomingMessages::PositionEnd as i32,
-        &crate::proto::PositionEnd {},
-    ));
-    bus.read_and_route_message().await.unwrap();
+    // TWS answers each request: the survivor passes over the first reply.
+    for _ in 0..2 {
+        stream.push_inbound(binary_proto(
+            crate::messages::IncomingMessages::PositionEnd as i32,
+            &crate::proto::PositionEnd {},
+        ));
+        bus.read_and_route_message().await.unwrap();
+    }
     let item = next_item(&mut second).await.expect("survivor received nothing").unwrap();
     assert!(matches!(item, SubscriptionItem::Data(PositionUpdate::PositionEnd)), "got: {item:?}");
 
@@ -1008,6 +1020,153 @@ async fn stale_shared_handle_neither_cancels_nor_decrements() {
     drop(new);
     assert_eq!(wait_for_frames(&stream, &cancel, 1).await, 1);
     assert_eq!(wait_for_positions_live(&bus, 0).await, 0);
+}
+
+/// A data frame and the end frame of a reply to each shared request TWS
+/// answers one request at a time (`ChannelMapping::reply_end`).
+struct ReplyFrames {
+    request: OutgoingMessages,
+    data: (IncomingMessages, Vec<u8>),
+    end: (IncomingMessages, Vec<u8>),
+}
+
+fn reply_frames() -> Vec<ReplyFrames> {
+    use crate::messages::IncomingMessages as M;
+    let open_order = || {
+        (
+            M::OpenOrder,
+            binary_proto(
+                M::OpenOrder as i32,
+                &crate::proto::OpenOrder {
+                    order_id: Some(7),
+                    ..Default::default()
+                },
+            ),
+        )
+    };
+    let open_orders_end = || (M::OpenOrderEnd, binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {}));
+    vec![
+        ReplyFrames {
+            request: OutgoingMessages::RequestOpenOrders,
+            data: open_order(),
+            end: open_orders_end(),
+        },
+        ReplyFrames {
+            request: OutgoingMessages::RequestAllOpenOrders,
+            data: open_order(),
+            end: open_orders_end(),
+        },
+        ReplyFrames {
+            request: OutgoingMessages::RequestCompletedOrders,
+            data: (
+                M::CompletedOrder,
+                binary_proto(M::CompletedOrder as i32, &crate::proto::CompletedOrder::default()),
+            ),
+            end: (
+                M::CompletedOrdersEnd,
+                binary_proto(M::CompletedOrdersEnd as i32, &crate::proto::CompletedOrdersEnd {}),
+            ),
+        },
+        ReplyFrames {
+            request: OutgoingMessages::RequestPositions,
+            data: (M::Position, binary_proto(M::Position as i32, &crate::proto::Position::default())),
+            end: (M::PositionEnd, binary_proto(M::PositionEnd as i32, &crate::proto::PositionEnd {})),
+        },
+    ]
+}
+
+/// A second request made while the first one's reply is arriving reads its
+/// own full reply, not the tail of the first: TWS answers each request with
+/// a full reply and its own end marker, in the order sent.
+#[tokio::test]
+async fn overlapping_shared_request_reads_its_own_reply() {
+    for ReplyFrames {
+        request,
+        data: (data_type, data),
+        end: (end_type, end),
+    } in reply_frames()
+    {
+        let (stream, bus) = make_bus();
+        let mut first = bus.send_shared_request(request, vec![]).await.unwrap();
+        stream.push_inbound(data.clone());
+        bus.read_and_route_message().await.unwrap();
+
+        let mut second = bus.send_shared_request(request, vec![]).await.unwrap();
+        for frame in [end.clone(), data.clone(), end.clone()] {
+            stream.push_inbound(frame);
+            bus.read_and_route_message().await.unwrap();
+        }
+
+        let mut second_reply = Vec::new();
+        for _ in 0..2 {
+            second_reply.push(next_message(&mut second).await.message_type());
+        }
+        assert_eq!(second_reply, [data_type, end_type], "{request:?}: second request read another reply");
+        assert!(second.try_next_routed().is_none(), "{request:?}: second request read past its reply");
+
+        let mut first_reply = Vec::new();
+        for _ in 0..3 {
+            first_reply.push(next_message(&mut first).await.message_type());
+        }
+        assert_eq!(first_reply, [data_type, end_type, data_type], "{request:?}");
+    }
+}
+
+/// `all_open_orders` overlapping `open_orders` reads its own result set:
+/// both replies carry `OpenOrder` frames and `OpenOrderEnd`, and TWS sends
+/// the own-orders reply first.
+#[tokio::test]
+async fn overlapping_open_orders_and_all_open_orders_read_own_result_sets() {
+    use crate::messages::IncomingMessages as M;
+    let (stream, bus) = make_bus();
+    let open_order = |order_id| {
+        binary_proto(
+            M::OpenOrder as i32,
+            &crate::proto::OpenOrder {
+                order_id: Some(order_id),
+                ..Default::default()
+            },
+        )
+    };
+    let end = || binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {});
+
+    let mut own = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, vec![]).await.unwrap();
+    let mut all = bus.send_shared_request(OutgoingMessages::RequestAllOpenOrders, vec![]).await.unwrap();
+    for frame in [open_order(1), end(), open_order(1), open_order(2), end()] {
+        stream.push_inbound(frame);
+        bus.read_and_route_message().await.unwrap();
+    }
+
+    async fn read(sub: &mut AsyncInternalSubscription, count: usize) -> Vec<(M, Option<i32>)> {
+        let mut reply = Vec::new();
+        for _ in 0..count {
+            let message = next_message(sub).await;
+            reply.push((message.message_type(), message.order_id()));
+        }
+        reply
+    }
+    assert_eq!(read(&mut own, 2).await, [(M::OpenOrder, Some(1)), (M::OpenOrderEnd, None)]);
+    assert_eq!(
+        read(&mut all, 3).await,
+        [(M::OpenOrder, Some(1)), (M::OpenOrder, Some(2)), (M::OpenOrderEnd, None)]
+    );
+    assert!(all.try_next_routed().is_none(), "all_open_orders read past its reply");
+}
+
+/// A reset ends every unanswered request with its session: a request made
+/// after it reads the first reply that arrives.
+#[tokio::test]
+async fn reset_forgets_unanswered_replies() {
+    use crate::messages::IncomingMessages as M;
+    let (stream, bus) = make_bus();
+
+    let _unanswered = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, vec![]).await.unwrap();
+    bus.reset_channels().await;
+    let mut after = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, vec![]).await.unwrap();
+    stream.push_inbound(binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {}));
+    bus.read_and_route_message().await.unwrap();
+
+    assert_eq!(next_message(&mut after).await.message_type(), M::OpenOrderEnd);
 }
 
 /// The open-orders channel maps three response types. A reset that walked the
@@ -2540,6 +2699,16 @@ async fn failed_write_leaves_no_registration() {
 
     assert!(mb.send_order_request(OrderId::from(42), b"order-bytes".to_vec()).await.is_err());
     assert!(bus.orders.is_empty(), "a failed write must leave no order registered");
+
+    assert!(mb
+        .send_shared_request(OutgoingMessages::RequestPositions, b"positions".to_vec())
+        .await
+        .is_err());
+    assert_eq!(
+        bus.shared_channels.unanswered(IncomingMessages::PositionEnd),
+        0,
+        "a failed write must leave no request awaiting a reply"
+    );
 }
 
 #[tokio::test]

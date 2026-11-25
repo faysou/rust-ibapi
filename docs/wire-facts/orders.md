@@ -143,6 +143,30 @@ Placement, echoes, status, executions and completed orders. Format: [README](REA
   are reachable only through `completed_orders`.
 - **Not probed:** filled orders (assumed the same).
 
+### Overlapping open-order requests
+
+*Live 2026-11-25 off-hours, paper TWS, server 223; client with 3 resting EUR.USD limits, a
+second client with 1, other clients' orders resting too.*
+
+- Two requests written back to back on one client, before any reply frame: TWS sends one full
+  reply per request, each with its own end marker, in the order sent, never interleaved. Seen
+  for `reqOpenOrders` twice (`5 3 5 3 5 3 53`, then the same again), `reqAllOpenOrders`
+  twice, both mixed orders (the own-client list of 3 orders and `53`, then the all-clients
+  list and `53`, or the reverse), and `reqCompletedOrders` twice (76 `CompletedOrder` and
+  `102`, twice). The second reply came about 100 ms after the first.
+- `reqPositions` twice behaves the same: 14 `Position` and `62`, twice.
+- A second request written after the first reply's first frame arrived draws the same: the
+  rest of the first reply, its end marker, then a full second reply.
+- At connect, before `nextValidId`, TWS sends this client's open orders and an `OpenOrderEnd`
+  that answers no request.
+- So routing these replies by message type alone is not enough: every reply reaches every
+  live subscription of its types, and a subscription must pass over the replies outstanding
+  when its request was written (`ChannelMapping::reply_end`). Without that, a second
+  `open_orders` made mid-reply read 4 of 6 frames and ended, and `all_open_orders` written
+  after `open_orders` read the 3 own orders instead of all of them.
+- **Not probed:** `reqAutoOpenOrders` (needs client id 0), whether a busier account ever
+  interleaves two replies, an unsolicited `OpenOrderEnd` while a request is outstanding.
+
 ### Executions: `last_n_days` and `specific_dates`
 
 *Live 2026-09-27 (Sunday), paper Gateway, server 220; #858.*
