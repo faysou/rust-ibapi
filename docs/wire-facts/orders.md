@@ -480,3 +480,39 @@ non-marketable limit orders, each cancelled after 5 to 10 s.*
   silence may be TWS load rather than the order type.
 - **Not probed:** SEHK's closing auction order types (`tif` AUC was refused; no other type
   tried), TSE MOC and LOC during a session.
+
+### Crypto orders on PAXOS: time in force and cash quantity
+
+*Live 2026-11-25 11:01-11:03 UTC, paper TWS, server 223; BTC.USD (`CRYPTO`, PAXOS), BUY limits at
+1000 and SELL limits at 1000000, 0.01 BTC or 10 USD. The account has no crypto trading
+permission, so an order that passes every other check is rejected for that.*
+
+| Order | Reply |
+| ----- | ----- |
+| BUY LMT, `tif` DAY or GTC | Inactive, 201 "The crypto buy order must be Minutes or IOC." |
+| BUY LMT, `tif` IOC or `Minutes`; SELL LMT, `tif` DAY or `Minutes` | Inactive, 201 for the missing permission |
+| BUY LMT or BUY MKT, `tif` FOK | 10052 "Invalid time in force:FOK", no open order or status |
+| SELL LMT, `tif` FOK | Inactive, 201 "The time-in-force FOK is invalid for this combination of exchange and security type." |
+| BUY MKT `Minutes` with cash quantity; SELL MKT DAY | Inactive, 201 "The crypto MKT order must be IOC." |
+| BUY MKT IOC with a quantity and no cash quantity | 10289 "You must set Cash Quantity for this order", no open order |
+| BUY MKT IOC with cash quantity 10; SELL MKT IOC with a quantity | Inactive, 201 for the missing permission |
+| BUY LMT `Minutes` or SELL MKT IOC with cash quantity 10 | 10244 "Cash Quantity cannot be used for this order", no open order |
+
+- A crypto BUY order takes only IOC or `Minutes`, a market order only IOC, and FOK is refused on
+  every order. A market BUY needs a cash quantity, and every other order refuses one.
+- TWS sends `Minutes` as the `tif` text of the order and echoes it on the open order. IB cancels
+  an unfilled `Minutes` order after 5 minutes; this run could not observe that, as every order was
+  rejected.
+- The open order and the Inactive status came before the 201 in all 21 orders that drew both,
+  0.1 to 33 ms apart; the open order and status were then sent again. A downstream run reported
+  the 201 first in some orders, 0.1 to 0.7 s apart; this run did not reproduce it.
+- The 10052, 10289 and 10244 refusals came within 4 ms, with no open order: these orders are not
+  in completed orders either. Each order that drew a 201 is in `completed_orders` with status
+  `Cancelled`, order id -1, and `completed_status` "Rejected by System:" followed by the 201
+  text. A market order shows the price cap IB set (`lmt` 58796.25 on a SELL, 58798 on a 10 USD
+  BUY, whose quantity became 0.00017006).
+- Observed once, in a downstream run on 2026-11-25: an order with a refused time in force drew no
+  frame at all for 55 minutes and then appeared in completed orders as rejected. Not reproduced
+  here.
+- **Not probed:** fills and the 5-minute cancel of a `Minutes` order (needs crypto permission);
+  ZEROHASH; other crypto symbols; GTD and OPG.
