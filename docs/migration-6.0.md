@@ -1184,3 +1184,24 @@ enum rejects a name or a tagged object. An open string enum (`SecurityType`, `Se
 unrecognized code. A `Contract` stored by 5.x with `"security_type":"Stock"` loads as
 `SecurityType::Other("Stock")`, and a request built from it sends `Stock` to TWS. Convert stored JSON before loading it, by mapping each variant name to
 its code (`as_str()` lists the codes for the string enums, `i32::from` for the integer ones).
+
+### 48. `Quote` reads `None` for a side with no quote
+
+TWS reports a side with no quote as a price tick with size `0` and a placeholder price: `-1` for
+options and indices, `-1` times the price magnifier (`-100`) for a magnified contract, and `0`
+for combos. `Quote::apply` stored it, so `quote.bid` read `Some(-1.0)` although the field's
+`Option` says "no bid" with `None`. Such a tick now sets the side's price and size to `None`.
+The placeholder can't be filtered by price, since a calendar spread's real bid can be `-71`.
+
+```rust,ignore
+// 5.x
+let bid = quote.bid.filter(|_| quote.bid_size > Some(0.0));
+
+// 6.0
+let bid = quote.bid;               // None while TWS reports no bid
+let side = quote.bid_side();       // price and size, None also after a later size tick of 0
+```
+
+The compiler catches none of this. Code that read the placeholder from `Quote` to detect an empty
+side sees `None` instead. `last` and `last_size` keep what TWS sent, a price with size `0`
+included. To see the placeholder, read the `TickPrice` and `TickPriceSize` ticks.
