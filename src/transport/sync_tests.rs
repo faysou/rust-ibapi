@@ -2429,6 +2429,66 @@ fn commission_and_fees_report_routes_via_execution_id_mapping() -> Result<(), Er
     Ok(())
 }
 
+/// `cancel_order` registers its own subscription under the order id. The
+/// `place_order` subscription keeps the order's frames that follow, the fill
+/// a cancel races included, and each subscription gets each frame once.
+#[test]
+fn order_subscription_keeps_frames_after_a_cancel_subscription_opens() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    let cancel = bus.send_order_request(OrderId::from(7), &[])?;
+
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::PendingCancel));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-1"));
+    stream.push_inbound(commission_frame("exec-1"));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Cancelled));
+    stream.push_inbound(error_frame(7, 202, "Order Canceled - reason:"));
+    for _ in 0..5 {
+        bus.dispatch()?;
+    }
+
+    let expected = ["OrderStatus", "ExecutionData", "CommissionsAndFeesReport", "OrderStatus", "notice 202"];
+    for (name, sub) in [("place", &place), ("cancel", &cancel)] {
+        let items: Vec<String> = std::iter::from_fn(|| sub.next_timeout_routed(TICK)).map(routed_label).collect();
+        assert_eq!(items, expected, "{name}");
+    }
+    Ok(())
+}
+
+/// A refused modify draws a TWS error on the order id while the order goes on
+/// working. Only the newest subscription on the id, the modify's, ends on it;
+/// the `place_order` subscription receives it as a notice and keeps the
+/// order's frames that follow.
+#[test]
+fn order_error_ends_only_the_newest_subscription_on_the_order_id() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    let modify = bus.send_order_request(OrderId::from(7), &[])?;
+
+    stream.push_inbound(error_frame(7, 105, "Order being modified does not match original order."));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Submitted));
+    for _ in 0..2 {
+        bus.dispatch()?;
+    }
+
+    let place_items: Vec<String> = std::iter::from_fn(|| place.next_timeout_routed(TICK)).map(routed_label).collect();
+    let modify_first = modify.next_timeout_routed(TICK).map(routed_label);
+    assert_eq!(place_items, ["notice 105", "OrderStatus"]);
+    assert_eq!(
+        modify_first.as_deref(),
+        Some("error [105] Order being modified does not match original order.")
+    );
+    Ok(())
+}
+
+fn routed_label(item: RoutedItem) -> String {
+    match item {
+        RoutedItem::Response(message) => format!("{:?}", message.message_type()),
+        RoutedItem::Notice(notice) => format!("notice {}", notice.code),
+        RoutedItem::Error(e) => format!("error {e}"),
+    }
+}
+
 #[test]
 fn completed_order_routes_to_shared_channel() -> Result<(), Error> {
     let (stream, bus) = make_bus();
