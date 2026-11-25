@@ -1158,3 +1158,14 @@ enum rejects a name or a tagged object. An open string enum (`SecurityType`, `Se
 unrecognized code. A `Contract` stored by 5.x with `"security_type":"Stock"` loads as
 `SecurityType::Other("Stock")`, and a request built from it sends `Stock` to TWS. Convert stored JSON before loading it, by mapping each variant name to
 its code (`as_str()` lists the codes for the string enums, `i32::from` for the integer ones).
+
+### 48. `TimeInForce` gains `Minutes`
+
+IB uses the time in force `Minutes` for cryptocurrency limit orders on PAXOS: an unfilled order
+is cancelled after 5 minutes. 5.x decoded it as `TimeInForce::Unknown("Minutes")`. It is now
+`TimeInForce::Minutes`, set by `OrderBuilder::minutes()`, and it encodes back to `Minutes`.
+
+The compiler finds an exhaustive `match` on `TimeInForce` that lacks the new arm. It doesn't catch
+a comparison or match against `Unknown("Minutes")`: that code still compiles and no longer
+matches. Serialized, `TimeInForce` is the wire string, so an `Order` with it writes `"Minutes"`
+and reads back as the new variant.
