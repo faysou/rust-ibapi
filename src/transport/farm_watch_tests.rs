@@ -56,9 +56,39 @@ const CASES: &[Case] = &[
         expected: Some(FarmRecovery::Recovered),
     },
     Case {
-        name: "an inactive HMDS farm is not broken",
+        name: "an inactive HMDS farm is not broken, but not confirmed back",
         before: &[USHMDS_BROKEN],
         after: &[USHMDS_INACTIVE],
+        expected: Some(FarmRecovery::Unconfirmed),
+    },
+    Case {
+        name: "inactive, then OK: recovered",
+        before: &[USHMDS_BROKEN],
+        after: &[USHMDS_INACTIVE, USHMDS_OK],
+        expected: Some(FarmRecovery::Recovered),
+    },
+    Case {
+        name: "an OK from another farm does not confirm an inactive one",
+        before: &[USHMDS_BROKEN, CASHHMDS_BROKEN],
+        after: &[USHMDS_INACTIVE, CASHHMDS_OK],
+        expected: Some(FarmRecovery::Unconfirmed),
+    },
+    Case {
+        name: "broken again after inactive: waits",
+        before: &[USHMDS_BROKEN, USHMDS_INACTIVE, USHMDS_BROKEN],
+        after: &[],
+        expected: None,
+    },
+    Case {
+        name: "1102 confirms an inactive farm",
+        before: &[USHMDS_BROKEN, USHMDS_INACTIVE],
+        after: &[RESTORED],
+        expected: Some(FarmRecovery::Recovered),
+    },
+    Case {
+        name: "1102 before the mark clears an inactive farm",
+        before: &[USHMDS_BROKEN, USHMDS_INACTIVE, RESTORED],
+        after: &[],
         expected: Some(FarmRecovery::Recovered),
     },
     Case {
@@ -150,11 +180,11 @@ mod sync_tests {
         assert_eq!(watch.wait(watch.mark(), Instant::now()), FarmRecovery::Recovered);
     }
 
-    /// 1101 counts as data lost and wakes the signal; 1102 does neither.
+    /// 1101 counts as data lost; 1102 does not. Both wake the signal.
     #[test]
     fn data_lost_on_1101_only() {
         let watch = FarmWatch::default();
-        let signal = watch.data_lost_signal();
+        let signal = watch.signal();
         feed(|n| watch.observe(n), &[DATA_LOST]);
         let mark = watch.mark();
         let _ = signal.receiver().try_recv();
@@ -164,8 +194,26 @@ mod sync_tests {
         feed(|n| watch.observe(n), &[DATA_LOST]);
         let after_1101 = (watch.data_lost_since(mark).map(|n| n.code), signal.receiver().try_recv().is_ok());
 
-        assert_eq!(after_1102, (None, false));
+        assert_eq!(after_1102, (None, true));
         assert_eq!(after_1101, (Some(DATA_LOST.0), true));
+    }
+
+    /// An OK after the farm went inactive confirms it and wakes the signal;
+    /// an OK from a farm never broken changes nothing.
+    #[test]
+    fn confirmed_after_inactive_farm_reports_ok() {
+        let watch = FarmWatch::default();
+        feed(|n| watch.observe(n), &[USHMDS_BROKEN, USHMDS_INACTIVE]);
+        let mark = watch.mark();
+        let signal = watch.signal();
+
+        feed(|n| watch.observe(n), &[CASHHMDS_OK]);
+        let after_other_ok = (watch.confirmed(mark), signal.receiver().try_recv().is_ok());
+        feed(|n| watch.observe(n), &[USHMDS_OK]);
+        let after_ok = (watch.confirmed(mark), signal.receiver().try_recv().is_ok());
+
+        assert_eq!(after_other_ok, (false, false));
+        assert_eq!(after_ok, (true, true));
     }
 }
 
@@ -241,6 +289,22 @@ mod async_tests {
 
         assert!(after_1102, "resolved on an 1102 or on the 1101 before the mark");
         assert_eq!(lost.await.code, DATA_LOST.0);
+    }
+
+    /// Resolves once the inactive farm reports OK, not on another farm's OK.
+    #[tokio::test]
+    async fn confirmed_after_inactive_farm_reports_ok() {
+        let watch = FarmWatch::default();
+        feed(|n| watch.observe(n), &[USHMDS_BROKEN, USHMDS_INACTIVE]);
+        let confirmed = watch.confirmed(watch.mark());
+        tokio::pin!(confirmed);
+
+        feed(|n| watch.observe(n), &[CASHHMDS_OK]);
+        let after_other_ok = tokio::time::timeout(BLOCKED, &mut confirmed).await.is_err();
+        feed(|n| watch.observe(n), &[USHMDS_OK]);
+
+        assert!(after_other_ok, "resolved on an OK from a farm never broken");
+        assert!(tokio::time::timeout(BLOCKED, confirmed).await.is_ok(), "did not resolve on the OK");
     }
 
     /// A waiter dropped mid-wait leaves no receiver behind.
