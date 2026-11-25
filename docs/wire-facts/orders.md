@@ -602,8 +602,23 @@ with `override_natural_action`.*
   day.
 - The open order has no field marking it as an exercise; only the shared `permId` links it to the
   executions.
-- **Not probed:** lapse, assignment, automatic exercise at expiry, puts, futures options, and
-  exercising from a client other than the one that bought.
+- **Again during US hours** (*live 2026-11-24 16:23 and 16:31 UTC, paper TWS, server 223;
+  AAPL Nov 27 2026 calls, bought by one client and exercised by another*): the same frames and
+  order. The 340 call (in the money, AAPL at 352): 10349, OpenOrder and OrderStatus
+  `PreSubmitted`, 6 ms later ExecutionData BOT 100 AAPL at 340, OpenOrder and OrderStatus Filled
+  with 100, then ExecutionData SLD 1 call at 0 and Filled with 1, all within 20 ms. The two
+  execution ids share their first two fields and differ in the third (`.01.01` stock, `.02.01`
+  option), like a combo's. No commission report for either, live or in `executions` 3 minutes
+  later. An exercise of the out-of-the-money 380 call (AAPL at 351) went through the same way,
+  buying 100 AAPL at 380.
+- Lapse before the last trading day: 10349, OpenOrder and OrderStatus `Inactive`, 201 "Order
+  rejected - reason:trade date must match last trade date of the contract", then 322
+  "Error processing request.Exercise/Lapse failed due to server rejection." on the same id.
+- Futures option (ES Dec 2026 6800 put, held): 10349, `Inactive`, 201 "Order rejected -
+  reason:Real time exercise of FOP is not available. Please send TMS ticket to request this
+  exercise.", then 322. The position was unchanged.
+- **Not probed:** a lapse on the last trading day, assignment, automatic exercise at expiry,
+  puts, and the Gateway.
 
 ### Cancel replies, and a cancel that races a fill
 
@@ -981,3 +996,64 @@ subscription (which ended on it) and `order_update_stream`, and came with no sta
   LCID went PreSubmitted or Submitted with `why_held` "" and no `Inactive` status. The paper
   account did not produce a "locate" hold off-hours.
 - **Not probed:** short sales during RTH, a stock the account cannot borrow, and live accounts.
+
+### Non-US orders outside and during the trading session
+
+*Live 2026-11-24 22:03-22:17 UTC (SEHK, HKFE, TSE, OSE and KSE closed) and 2026-11-24
+23:46 to 2026-11-25 04:07 UTC (in session and at lunch), paper TWS, server 223;
+non-marketable limit orders, each cancelled after 5 to 10 s.*
+
+| Order | Reply | Cancel |
+| ----- | ----- | ------ |
+| 700 SEHK BUY 100 LMT 320 | 399 "Warning: Your order will not be placed at the exchange until 2026-11-25 09:30:00 Hongkong", then PreSubmitted | Cancelled, 202 |
+| HSI future HKFE BUY 1 LMT 20000; HSI option `HSI25600L6` BUY 1 LMT 1 | the same 399 with `09:15:00 Hongkong`, PreSubmitted, then Submitted within 1.3 s | Cancelled, 202 |
+| HSI futures option `PHS25600L6` BUY 1 LMT 1 | 399 with `09:15:00`, PreSubmitted twice | Cancelled, 202 |
+| N225M future OSE.JPN BUY 1 LMT 40000 | PreSubmitted, no 399 | Cancelled, 202 |
+| 7203 SMART BUY 100 LMT 2000 | Submitted, no 399 | Cancelled, 202 |
+| K200 future KSE BUY 1 LMT 300 | nothing in 5 s | nothing in 5 s; `PendingCancel` in `all_open_orders` 21 s after placing; at 22:17 a second cancel drew 10147 and no open order was listed |
+
+- The 399 carries a `Warning:` line and the order goes on, so it is a warning, not a rejection.
+  The time is the exchange's next open in its own zone, as text.
+- HKFE orders reached `Submitted` while the exchange was closed: `Submitted` does not mean the
+  order is at the exchange.
+- The KSE order neither acknowledged nor cancelled promptly, like the
+  [weekend ES cancel](#weekend-cancel-of-a-presubmitted-es-order-wedges-in-pendingcancel), and
+  cleared without a terminal status reaching the probe.
+- The same orders while the venue traded or was at lunch (2026-11-25, each cancelled after 10 s):
+
+  | Order | Session | Lunch break |
+  | ----- | ------- | ----------- |
+  | 700 SEHK BUY 100 LMT 320 (last 344) | 01:36 UTC: PreSubmitted, no 399 | 04:05: PreSubmitted, no 399 |
+  | HSI option `HSI25600L6` BUY 1 LMT 1 | 01:36: Submitted | 04:05: Submitted |
+  | HSI future BUY 1 LMT 20000 | not run (connection timed out) | 04:07: Submitted |
+  | 7203 SMART BUY 100 LMT 2000 | 00:01: PreSubmitted | 02:35: PreSubmitted; 03:35 after lunch: PreSubmitted |
+  | K200 future BUY 1 LMT 700; N225M future BUY 1 LMT 50000 | 23:46 (day session): Submitted, cancelled at once | |
+
+- No 399 came during a session or a lunch break. The SEHK and TSE stock orders stayed
+  PreSubmitted with an empty `why_held` while their venue traded, and 7203 had been Submitted at
+  22:03 when TSE was closed, so neither status tells whether the order is at the exchange.
+- Distance from the market decides the SEHK status (06:25, bid 339, ask 339.2): BUY 100 LMT 336
+  and LMT 330 went PreSubmitted, then Submitted 0.2 s later; LMT 320 stayed PreSubmitted, and so
+  did 7203 LMT 2000 again. IB holds a limit that far from the market without sending it on, and
+  says so in no field.
+- **Not probed:** fills; marketable orders; orders during the SEHK closing auction.
+
+### Auction orders on SEHK and TSE
+
+*Live 2026-11-24 22:04-22:06 UTC (both closed), paper TWS, server 223.*
+
+| Order | 700 SEHK | 7203 SMART (JPY) |
+| ----- | -------- | ---------------- |
+| LMT, `tif` OPG (LOO) | Inactive, 201 "The time-in-force OPG is invalid for this combination of exchange and security type." | not run (connection timed out) |
+| MKT, `tif` OPG (MOO) | not run (connection timed out) | Submitted; cancelled |
+| MOC | 387 "Unsupported order type for this exchange and security type." | no frame in 5 s; `PendingSubmit` in `all_open_orders`; cancelled (PendingCancel, Cancelled, 202) |
+| LOC | 387 | as MOC |
+| MTL or LMT, `tif` AUC | Inactive, 201 "The time-in-force AUC is invalid ..." | Inactive, 201 (MTL) |
+
+- The unsupported time in force drew an Inactive status before the 201; the unsupported order
+  type drew 387 with no status.
+- The 7203 MOC and LOC orders sat in `PendingSubmit` with no frame on their `place_order`
+  replies while two other connections in the same minute timed out at the handshake, so the
+  silence may be TWS load rather than the order type.
+- **Not probed:** SEHK's closing auction order types (`tif` AUC was refused; no other type
+  tried), TSE MOC and LOC during a session.

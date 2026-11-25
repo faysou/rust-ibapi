@@ -71,6 +71,30 @@ of `"0"`:
   delayed ticks carry no attributes); empty sides in tick-by-tick bid/ask or last (no real-time
   data on an illiquid contract); RTH equity and option quotes.
 
+### Option computation ticks during US hours
+
+*Live 2026-11-24 15:57-16:04 UTC, US market open, paper TWS, server 223; streaming `reqMktData`
+for 30 s on AAPL Dec 2026 350 call and put, Nov 27 350 call and Dec 500 call, and ES Dec 2026
+7500 call and put; raw capture decoded.*
+
+- Delayed data (type 3): `DelayedBidOption` (80), `DelayedAskOption` (81), `DelayedLastOption`
+  (82) and `DelayedModelOption` (83), 172 frames in all. Bid, ask and last arrived 6 to 12 times
+  per contract in 30 s, the model 1 to 4 times. No real-time computation tick (10 to 13) came.
+- Real-time data (type 1) on the AAPL options and the ES option: 354, and no computation tick.
+- A field TWS has not computed is sent as a value, never left out: `-1` for implied volatility
+  and the option price, `-2` for delta, gamma, vega and theta. Every frame carried all eleven
+  fields. 20 of the 158 bid, ask and last frames carried `-1` and `-2` for implied volatility
+  and every greek, 11 of them also `-1` for the price (a side with no quote); the other 138
+  carried them all. The first model frame of the AAPL 350 call sent present value of dividends
+  `-1`, its later ones `0`; bid, ask and last sent `0` there every time.
+- A real value can equal a sentinel of the other group: `DelayedLastOption` on the ES 7500 put
+  sent theta `-1.0`, then `-1.25`, `-0.5` and `-0.0` as its last price aged (the other
+  computations of that put had theta about `-1.9`). Theta `-1` is a value; only `-2` means not
+  computed for a greek.
+- `tick_attribute` was `0` (return based) on every frame. `underlying_price` was always set.
+- **Not probed:** real-time computations (no option data permission); snapshots during US
+  hours; index options.
+
 ### TickEFP is never sent
 
 *Live 2026-05-27, paper Gateway, server 220+; removed in v3.0 (#651).*
@@ -690,3 +714,20 @@ instead of TRADES" on crypto, "Expected what to show is TRADES ..." on others. W
 - **Not probed:** other crypto venues (ZEROHASH), RTH equities, bar sizes other than 1 hour
   and 1 minute.
 
+
+### Realtime bars across the SEHK and HKFE lunch break
+
+*Live 2026-11-25 01:38-05:00 UTC (SEHK and HKFE trading, lunch 04:00-05:00 UTC), paper TWS,
+server 223; `realtime_bars` (5-second TRADES bars, all trading hours) on 700 (SEHK) and the HSI
+December future (HKFE), both with real-time permission.*
+
+- During the session TWS sent a bar every 5 seconds, 5 to 6 s after the bar's start, including
+  bars with volume 0 at the last price (700 at 03:58:00, 03:58:15; HSI at 03:59:50, 03:59:55).
+- The last bar before the break, 03:59:55, arrived at 04:00:01.3 like any other. Then nothing,
+  no bar and no notice, for both contracts until 05:00:05.4, when the 05:00:00 bar arrived.
+  No bar was sent for the break.
+- The first 700 bar after the break carried 196,800 shares against hundreds to tens of thousands
+  per bar before it.
+- **Not probed:** the SEHK closing auction (08:00-08:10 UTC); RTH-only realtime bars;
+  keep-up-to-date historical bars across the same break (historical requests went unanswered
+  from 00:55 UTC that night, with no error, while market data kept working).
