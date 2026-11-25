@@ -421,3 +421,37 @@ fn what_to_show_trades_for_stream_security_type() {
         assert_eq!(WhatToShow::trades_for_stream(&security_type), expected, "{security_type:?}");
     }
 }
+
+/// A bar stored by 5.x carries the `-1` TWS sends for a bar with no traded volume; it reads back
+/// as `None`, as the decoder reads it. Real values, a quiet bar's zeros included, round-trip.
+#[test]
+fn bar_deserialize_applies_the_decoder_volume_rule() {
+    let traded = Bar {
+        volume: Some(1200.0),
+        wap: Some(101.25),
+        count: Some(37),
+        ..Bar::default()
+    };
+    let quiet = Bar {
+        volume: Some(0.0),
+        wap: Some(0.0),
+        count: Some(0),
+        ..Bar::default()
+    };
+    let stored = |volume: f64, wap: f64, count: i32| {
+        let mut json = serde_json::to_value(Bar::default()).unwrap();
+        json["volume"] = serde_json::json!(volume);
+        json["wap"] = serde_json::json!(wap);
+        json["count"] = serde_json::json!(count);
+        serde_json::from_value::<Bar>(json).unwrap()
+    };
+    let read = |bar: &Bar| (bar.volume, bar.wap, bar.count);
+
+    assert_eq!(read(&stored(-1.0, -1.0, -1)), (None, None, None), "5.x sentinel");
+    assert_eq!(read(&stored(-1.0, -100.0, -1)), (None, None, None), "magnified WAP sentinel");
+    assert_eq!(read(&stored(-1.0, 101.25, 5)), (None, None, Some(5)), "WAP needs a volume");
+    for bar in [traded, quiet] {
+        let back: Bar = serde_json::from_value(serde_json::to_value(bar).unwrap()).unwrap();
+        assert_eq!(back, bar);
+    }
+}

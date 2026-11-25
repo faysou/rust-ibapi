@@ -873,7 +873,7 @@ The compiler finds every use as `f64`. It doesn't catch the serialized form: `Ba
 marks both fields nullable. JSON written by 5.x still deserializes, with a stored `0` read as
 `Some(0.0)`.
 
-`count`, and the historical `Bar`'s volume, WAP and count, follow in [§53](#53-bar-volume-wap-and-count-are-none-on-a-non-trades-bar).
+`count`, and the historical `Bar`'s volume, WAP and count, follow in [§53](#53-bar-volume-wap-and-count-are-none-on-a-bar-with-no-traded-volume).
 
 ### 39. Tick-by-tick and historical ticks share `TickLast`, `TickBidAsk` and `TickMidpoint`
 
@@ -1275,10 +1275,10 @@ on both clients.
   order's streams and is copied to the request, so a reply can carry a fill's report twice.
   Key commissions by `execution_id`.
 
-### 53. Bar volume, WAP and count are `None` on a non-TRADES bar
+### 53. Bar volume, WAP and count are `None` on a bar with no traded volume
 
-A bar that isn't `WhatToShow::Trades` (MIDPOINT, BID, ASK, ...) has no traded volume. TWS sends
-its volume, WAP and trade count as `-1`, or leaves them out. For a contract with a price
+A MIDPOINT, BID, ASK or BID_ASK bar has no traded volume. TWS sends its volume, WAP and trade
+count as `-1`, or leaves them out. For a contract with a price
 magnifier, it sends the WAP as `-1` times the magnifier (`-100` for a CBOT corn option).
 
 - **Historical `Bar`** (`market_data::historical::Bar`): `volume` and `wap` are `Option<f64>`
@@ -1286,8 +1286,9 @@ magnifier, it sends the WAP as `-1` times the magnifier (`-100` for a CBOT corn 
 - **Realtime `Bar`**: `count` is `Option<i32>` instead of `i32`. `volume` and `wap` were already
   `Option<f64>` (§38), but a `-1` from TWS decoded as `Some(-1.0)`. It is now `None`.
 
-All three are `None` on a non-TRADES bar. A TRADES bar with no volume, such as an index's, still
-has `Some(0.0)`.
+All three are `None` on such a bar. A TRADES bar with no volume, such as an index's, still has
+`Some(0.0)`. TRADES, AGGTRADES and ADJUSTED_LAST bars carry real values; HISTORICAL_VOLATILITY and
+OPTION_IMPLIED_VOLATILITY bars carry volume `1` and count `0`, which are not traded volume.
 
 ```rust,ignore
 // 5.x
@@ -1304,8 +1305,9 @@ let volume = bar.volume.unwrap_or(0.0); // where a missing volume should read as
 
 The compiler finds every use as `f64` or `i32`. It doesn't catch the serialized form: both `Bar`
 types derive `Serialize` / `Deserialize`, and a missing value now serializes as `null`. JSON
-written by 5.x still deserializes, but a stored `-1` reads as `Some(-1.0)` or `Some(-1)`, not
-`None`. The `utoipa` schemas mark the fields nullable.
+written by 5.x still deserializes, by the decoder's rule: a stored negative volume or count reads
+as `None`, and so does the WAP of a bar with no volume. The `utoipa` schemas mark the fields
+nullable.
 
 ### 54. `Currency::default()` is empty
 

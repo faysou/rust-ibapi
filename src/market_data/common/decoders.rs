@@ -48,21 +48,31 @@ pub(in crate::market_data) struct BarVolume {
     pub(in crate::market_data) count: Option<i32>,
 }
 
-/// A bar that isn't TRADES (MIDPOINT, BID, ASK, ...) has no traded volume. TWS leaves the three
+impl BarVolume {
+    /// Applies [`decode_bar_volume`]'s rule to values already read: a negative volume or count
+    /// is `None`, and the WAP is kept only beside a volume. Deserializing a `Bar` applies it too,
+    /// so a bar stored by 5.x with `-1` reads back as `None`.
+    pub(in crate::market_data) fn new(volume: Option<f64>, wap: Option<f64>, count: Option<i32>) -> Self {
+        let volume = volume.filter(|volume| *volume >= 0.0);
+        Self {
+            wap: wap.filter(|_| volume.is_some()),
+            volume,
+            count: count.filter(|count| *count >= 0),
+        }
+    }
+}
+
+/// A bar with no traded volume (MIDPOINT, BID, ASK, BID_ASK) carries none: TWS leaves the three
 /// fields out or sends them as `-1`, and for a contract with a price magnifier it sends the WAP as
-/// `-1` times the magnifier, so the WAP is kept only beside a volume
-/// (`docs/wire-facts/market-data.md#bar-volume-and-wap-on-non-trades-bars`).
+/// `-1` times the magnifier, so the WAP is kept only beside a volume. The rule goes by value, not
+/// by `WhatToShow` (`docs/wire-facts/market-data.md#bar-volume-and-wap-on-non-trades-bars`).
 pub(in crate::market_data) fn decode_bar_volume(volume: Option<&str>, wap: Option<&str>, count: Option<i32>) -> Result<BarVolume, Error> {
     let volume = parse_optional_decimal(volume)?.filter(|volume| *volume >= 0.0);
     let wap = match volume {
         Some(_) => parse_optional_decimal(wap)?,
         None => None,
     };
-    Ok(BarVolume {
-        volume,
-        wap,
-        count: count.filter(|count| *count >= 0),
-    })
+    Ok(BarVolume::new(volume, wap, count))
 }
 
 #[cfg(test)]

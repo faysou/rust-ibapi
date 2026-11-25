@@ -158,8 +158,15 @@ paper TWS, server 223; raw capture.*
 - Earlier result (2026-11-15, paper Gateway, server 226): realtime MIDPOINT bars on EUR.USD and
   ES left `volume` and `WAP` **out** and sent `count` as `-1`; historical bars sent `-1`. So a
   realtime bar can carry either form.
+- Volatility and adjusted bars (live 2026-11-25 Wed 11:10 ET, US equities open, paper TWS, server
+  223; decoded values, 1-hour bars over 2 days, AAPL): ADJUSTED_LAST sent real volume, WAP and
+  count, the same as TRADES (9 bars). HISTORICAL_VOLATILITY (1 bar) and
+  OPTION_IMPLIED_VOLATILITY (10 bars) sent volume `1` and count `0` on every bar, with the WAP a
+  volatility (`0.289`, `0.260`). Paper Gateway (server 226, 2026-11-16) showed the same for the two
+  volatility types and real values for ADJUSTED_LAST.
 - Settles that a non-TRADES bar's volume, WAP and count are a `-1` sentinel or absent on both bar
-  types, and that the WAP sentinel scales with the price magnifier.
+  types, and that the WAP sentinel scales with the price magnifier. The sentinel marks a bar with
+  no traded volume, not every non-TRADES bar: the volatility types send `1` and `0` instead.
 - **Not probed:** TRADES `keepUpToDate` updates (no real-time data on this account for stocks or
   CME; with `keepUpToDate`, BTC draws 10299 for TRADES and 321 "Source price not supported with
   live updates" for AGGTRADES); realtime bars on a
