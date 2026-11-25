@@ -1159,24 +1159,28 @@ unrecognized code. A `Contract` stored by 5.x with `"security_type":"Stock"` loa
 `SecurityType::Other("Stock")`, and a request built from it sends `Stock` to TWS. Convert stored JSON before loading it, by mapping each variant name to
 its code (`as_str()` lists the codes for the string enums, `i32::from` for the integer ones).
 
-### 48. `order_update_stream` yields a notice after a reconnect
+### 48. Client-synthesized notices classify as `NoticeCategory::ClientSynthesized`
 
-After each transport reconnect, once the new session is live, `order_update_stream` yields one
-`SubscriptionItem::Notice` with code `TRANSPORT_RECONNECT_CODE`. It marks the updates TWS sent
-during the outage, which it does not replay. Before, the stream gave no sign of the gap.
-
-The notice is client-synthesized and classifies as an error (`notice.is_error()` is `true`). A
-match that treats every error notice on this stream as an order rejection now sees it as one.
-Match the code first:
+A notice with a negative code is raised by this client, not TWS: `TRANSPORT_RECONNECT_CODE`,
+`SUBSCRIPTION_LAG_CODE`, `NOTICE_STREAM_LAG_CODE`, `UNKNOWN_MESSAGE_TYPE_CODE`,
+`HANDSHAKE_UNKNOWN_FRAME_CODE` and `HANDSHAKE_DECODE_FAILURE_CODE`. They classified as
+`NoticeCategory::Error`, so `is_error()` was true and `is_informational()` false. They now classify
+as `NoticeCategory::ClientSynthesized`, ahead of every other rule, and are informational: none of
+them ends a request or stream.
 
 ```rust,ignore
-// 5.x
-SubscriptionItem::Notice(n) if n.is_error() => order_rejected(n),
+// 5.x: client-synthesized notices reached the is_error() branch
+if notice.is_error() { /* TWS errors, plus reconnect, lag and desync notices */ }
 
-// 6.0
-SubscriptionItem::Notice(n) if n.code == TRANSPORT_RECONNECT_CODE => rebuild_order_state(),
-SubscriptionItem::Notice(n) if n.is_error() => order_rejected(n),
+// 6.0: they need their own branch
+if notice.is_error() { /* TWS errors only */ }
+if notice.is_client_synthesized() { /* match notice.code: reconnect, lag, desync */ }
 ```
 
-`iter_data()` and `filter_data()` drop notices, this one included. To rebuild order state, follow
-the recovery steps in the `order_update_stream` docs.
+The compiler catches none of this. Code that relied on `is_error()` or `NoticeCategory::Error`
+to see these notices must match their codes or `NoticeCategory::ClientSynthesized`. This matters
+most for the notice stream: `UNKNOWN_MESSAGE_TYPE_CODE` (a frame with an unknown message id, the
+sign of a desynchronized stream) and `HANDSHAKE_DECODE_FAILURE_CODE` no longer reach an
+`is_error()` arm. `Notice::is_client_synthesized()` is true for the same codes as before. A match
+on `NoticeCategory` with a wildcard arm sees the new variant there; the enum is
+`#[non_exhaustive]`, so no new arm is required.

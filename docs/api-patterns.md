@@ -543,8 +543,8 @@ for item in client.resubscribing(|| client.realtime_bars(&contract).subscribe())
 subscription keeps delivering once the connection returns. Updates TWS emitted
 during the outage are **not** replayed. Once the new session is live, the stream
 yields one notice with code `TRANSPORT_RECONNECT_CODE` to mark the gap; rebuild
-order state from snapshots when it arrives. The notice classifies as an error, so
-match its code before treating error notices as rejections:
+order state from snapshots when it arrives. The notice is client-synthesized
+(`NoticeCategory::ClientSynthesized`), so `is_error()` is false for it:
 
 ```rust
 let updates = client.order_update_stream()?;
