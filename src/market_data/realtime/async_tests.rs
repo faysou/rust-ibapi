@@ -1,6 +1,7 @@
 use super::*;
 use crate::common::test_utils::helpers::{
-    assert_request, assert_request_proto, proto_response, request_message_count, text_response, TEST_REQ_ID_FIRST,
+    assert_proto_msg_id, assert_request, assert_request_proto, proto_error_response, proto_response, request_message_count, text_response,
+    TEST_REQ_ID_FIRST,
 };
 use crate::contracts::tick_types::TickType;
 use crate::contracts::{ComboLeg, Contract, Currency, DeltaNeutralContract, Exchange, LegAction, SecurityType, Symbol};
@@ -798,4 +799,34 @@ async fn market_depth_reroute_ends_without_cancel() {
     assert!(subscription.next().await.is_none(), "stream ends after Reroute");
     subscription.cancel().await;
     assert_eq!(message_bus.request_messages().len(), 1, "TWS ended the request: no cancel");
+}
+
+/// 10197 during an internet outage: TWS keeps the request and resumes its ticks, so the
+/// subscription yields a notice and reads on, and its cancel is still sent.
+#[tokio::test]
+async fn market_data_reads_on_after_10197() {
+    let tick = || proto_response(IncomingMessages::TickPrice, tick_price().tick_type(1).price(1.1595).encode_proto());
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+        tick(),
+        proto_error_response(TEST_REQ_ID_FIRST, 10197, "No market data during competing live session"),
+        tick(),
+    ]));
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+    let contract = Contract::forex("EUR", "USD").build();
+
+    let mut subscription = client.market_data(&contract).subscribe().await.expect("market data request failed");
+    let first = subscription.next().await;
+    let notice = subscription.next().await;
+    let after = subscription.next().await;
+    subscription.cancel().await;
+
+    assert!(matches!(first, Some(Ok(SubscriptionItem::Data(TickTypes::Price(_))))), "{first:?}");
+    assert!(
+        matches!(notice, Some(Ok(SubscriptionItem::Notice(ref n))) if n.code == 10197),
+        "{notice:?}"
+    );
+    assert!(matches!(after, Some(Ok(SubscriptionItem::Data(TickTypes::Price(_))))), "{after:?}");
+    let requests = message_bus.request_messages();
+    assert_eq!(requests.len(), 2, "the request and its cancel");
+    assert_proto_msg_id(&requests[1], OutgoingMessages::CancelMarketData);
 }

@@ -65,6 +65,16 @@ pub(crate) const HMDS_ERROR_CODE: i32 = 162;
 /// "Error validating request" (e.g. an invalid account code).
 pub(crate) const REQUEST_VALIDATION_CODE: i32 = 321;
 
+/// "Failed to request live updates (disconnected)." Ends a keep-up-to-date historical bar
+/// request when its HMDS farm breaks; TWS sends nothing more for it
+/// (`docs/wire-facts/market-data.md#streams-across-an-internet-outage`).
+pub(crate) const SUBSCRIPTION_DISCONNECTED_CODE: i32 = 10182;
+
+/// "No market data during competing live session". On a market data request TWS resumes
+/// ticks on the same request afterwards
+/// (`docs/wire-facts/market-data.md#streams-across-an-internet-outage`).
+pub(crate) const COMPETING_LIVE_SESSION_CODE: i32 = 10197;
+
 /// Range of error codes that are considered warnings: the whole `21xx` band.
 ///
 /// IB's published table stops at 2169, but the gateway keeps adding codes above

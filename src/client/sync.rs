@@ -313,6 +313,13 @@ impl Client {
     /// the new subscription's first item. Data from the outage is missing. A first `open` that
     /// fails with a lost connection is retried too, without a notice.
     ///
+    /// An internet outage leaves the socket up, and TWS resumes most streams on their own. It
+    /// ends a historical bar request with `keep_up_to_date` with error 10182 when its HMDS farm
+    /// breaks. The wrapper yields that 10182 as a `SubscriptionItem::Notice`, the gap marker,
+    /// waits until no HMDS farm reports broken (or TWS reports connectivity restored with 1101
+    /// or 1102, or 15 minutes pass), then calls `open` again. A 10182 on the reopened request
+    /// starts another wait, and a reconnect during the wait reopens as above.
+    ///
     /// It ends after yielding any other error, the error `wait_connected` returns when the
     /// reconnect gave up, or when the subscription itself ends (a snapshot that finished).
     ///
@@ -328,6 +335,7 @@ impl Client {
     /// | market depth | the book rebuilt from scratch: reset yours on the notice |
     /// | historical bars, `subscribe_with_updates` | the initial bars again (duplicates) |
     /// | historical bars, `subscribe` | the whole request again, `Bars` then `End`, if cut before `End`; the stream ends after `End` |
+    /// | historical bars, `subscribe_with_updates`, after a 10182 notice | the initial bars again once the HMDS farm is back |
     /// | account, position, PnL, account summary | the initial snapshot again |
     /// | scanner | a fresh scan |
     ///
