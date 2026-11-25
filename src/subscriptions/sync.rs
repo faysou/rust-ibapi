@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crossbeam::channel::Receiver;
+
 use log::{debug, error, warn};
 
 use super::common::{
@@ -350,6 +352,20 @@ impl<T: StreamDecoder<T>> Subscription<T> {
         loop {
             match self.handle_response(self.subscription.next_routed()) {
                 NextAction::Return(val) => return val,
+                NextAction::Skip => continue,
+            }
+        }
+    }
+
+    /// [`next`](Self::next), or `None` once `wake` receives first, with the
+    /// queue left as it was.
+    pub(crate) fn next_unless(&self, wake: &Receiver<()>) -> Option<Option<Result<SubscriptionItem<T>, Error>>> {
+        if self.stream_ended.load(Ordering::Relaxed) {
+            return Some(None);
+        }
+        loop {
+            match self.handle_response(self.subscription.next_routed_unless(wake)?) {
+                NextAction::Return(val) => return Some(val),
                 NextAction::Skip => continue,
             }
         }

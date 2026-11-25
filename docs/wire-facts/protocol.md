@@ -271,8 +271,10 @@ connectivity flaps; #1209 (`FARM_CODES`, `Notice::data_farm` in `src/messages/no
 - Farm notices arrived only with request id -1.
 - Streaming requests sent during the outage got no frame and no error, for up to 354 s.
 - `Client::resubscribing` waits for the HMDS OKs after a 10182 (`src/transport/farm_watch.rs`).
-- **Not probed:** 1101; an outage that drops the API socket; a router uplink cut; a TWS daily
-  restart; IB Gateway.
+- `Client::resubscribing` reopens a stream on 1101, cancel first, on IB's documented rule alone.
+- **Not probed:** 1101, so also whether TWS answers a cancel for a request opened before a 1101
+  (with 300, or at all) and whether such a request resumes on its own; an outage that drops the
+  API socket; a router uplink cut; a TWS daily restart; IB Gateway.
 
 ### Requests held during an internet outage
 

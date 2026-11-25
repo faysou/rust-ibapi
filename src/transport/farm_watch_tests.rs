@@ -81,6 +81,8 @@ const CASES: &[Case] = &[
     },
 ];
 
+const DATA_LOST: (i32, &str) = (1101, "Connectivity between IBKR and Trader Workstation has been restored - data lost.");
+
 /// A wait that should still be blocked is given this long.
 const BLOCKED: Duration = Duration::from_millis(50);
 
@@ -147,6 +149,24 @@ mod sync_tests {
         watch.reset();
         assert_eq!(watch.wait(watch.mark(), Instant::now()), FarmRecovery::Recovered);
     }
+
+    /// 1101 counts as data lost and wakes the signal; 1102 does neither.
+    #[test]
+    fn data_lost_on_1101_only() {
+        let watch = FarmWatch::default();
+        let signal = watch.data_lost_signal();
+        feed(|n| watch.observe(n), &[DATA_LOST]);
+        let mark = watch.mark();
+        let _ = signal.receiver().try_recv();
+
+        feed(|n| watch.observe(n), &[RESTORED]);
+        let after_1102 = (watch.data_lost_since(mark), signal.receiver().try_recv().is_ok());
+        feed(|n| watch.observe(n), &[DATA_LOST]);
+        let after_1101 = (watch.data_lost_since(mark).map(|n| n.code), signal.receiver().try_recv().is_ok());
+
+        assert_eq!(after_1102, (None, false));
+        assert_eq!(after_1101, (Some(DATA_LOST.0), true));
+    }
 }
 
 #[cfg(feature = "async")]
@@ -204,6 +224,23 @@ mod async_tests {
         feed(|n| watch.observe(n), &[USHMDS_BROKEN]);
         watch.reset();
         assert_eq!(watch.wait(watch.mark(), Instant::now()).await, FarmRecovery::Recovered);
+    }
+
+    /// Resolves on the first 1101 after the mark, not on an 1102.
+    #[tokio::test]
+    async fn data_lost_on_1101_only() {
+        let watch = FarmWatch::default();
+        feed(|n| watch.observe(n), &[DATA_LOST]);
+        let mark = watch.mark();
+        let lost = watch.data_lost(mark);
+        tokio::pin!(lost);
+
+        feed(|n| watch.observe(n), &[RESTORED]);
+        let after_1102 = tokio::time::timeout(BLOCKED, &mut lost).await.is_err();
+        feed(|n| watch.observe(n), &[DATA_LOST]);
+
+        assert!(after_1102, "resolved on an 1102 or on the 1101 before the mark");
+        assert_eq!(lost.await.code, DATA_LOST.0);
     }
 
     /// A waiter dropped mid-wait leaves no receiver behind.

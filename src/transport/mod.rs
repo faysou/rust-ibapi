@@ -483,6 +483,18 @@ impl InternalSubscription {
         self.pick_receiver()?.recv_timeout(timeout).ok()
     }
 
+    /// [`next_routed`](Self::next_routed), or `None` once `wake` receives
+    /// first. Either may win when both are ready.
+    pub(crate) fn next_routed_unless(&self, wake: &Receiver<()>) -> Option<Option<RoutedItem>> {
+        let Some(receiver) = self.pick_receiver() else {
+            return Some(None);
+        };
+        crossbeam::select! {
+            recv(receiver) -> item => Some(item.ok()),
+            recv(wake) -> _ => None,
+        }
+    }
+
     pub(crate) fn cancel(&self) {
         if let Some(sender) = &self.sender {
             if let Err(e) = sender.send(Error::Cancelled.into()) {
