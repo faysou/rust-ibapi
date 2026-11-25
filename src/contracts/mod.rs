@@ -198,9 +198,9 @@ pub struct Contract {
     /// The contract's symbol within its primary exchange. For US options, this is the OCC symbol.
     ///
     /// Other exchanges use their own layouts: `HSI25600L6` on HKFE (class, strike, month and right
-    /// letter, one-digit year), `K200992L6.KS` on KSE, a 9-digit exchange code on OSE.JPN. Read the
-    /// strike, right and expiry from their fields rather than parsing this (live: 2026-11-24,
-    /// server 223; `docs/wire-facts/contracts.md#local-symbols-of-hkfe-ose-and-kse-options`).
+    /// letter, one-digit year), `K200992L6.KS` on KSE, `TCH DEC26 640 C` for a SEHK stock option,
+    /// a 9-digit exchange code on OSE.JPN. Read the strike, right and expiry from their fields
+    /// rather than parsing this (live: 2026-11-24, server 223; `docs/wire-facts/contracts.md#local-symbols-of-hkfe-ose-and-kse-options`).
     pub local_symbol: String,
     /// The contract's primary exchange.
     /// For smart routed contracts, used to define contract in case of ambiguity.
