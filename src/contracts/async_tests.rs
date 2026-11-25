@@ -791,3 +791,27 @@ async fn option_chain_buffer_limit_reaches_the_bus() {
     );
     assert_eq!(request_message_count(&message_bus), 2, "the rejected request sends nothing");
 }
+
+/// Requests TWS answers with 321 fail before anything is sent.
+#[tokio::test]
+async fn known_invalid_requests_are_rejected_before_sending() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+    let bag = Contract {
+        security_type: SecurityType::Spread,
+        ..Contract::stock("AAPL").build()
+    };
+
+    let details = client.contract_details(&bag).await;
+    let stream = client.contract_details_stream(&bag).subscribe().await;
+    let chain = client.option_chain("AAPL", SecurityType::Stock, 0).subscribe().await;
+
+    assert!(matches!(details, Err(Error::InvalidArgument(_))), "contract_details: {details:?}");
+    assert!(
+        matches!(stream, Err(Error::InvalidArgument(_))),
+        "contract_details_stream: {:?}",
+        stream.err()
+    );
+    assert!(matches!(chain, Err(Error::InvalidArgument(_))), "option_chain: {:?}", chain.err());
+    assert_eq!(request_message_count(&message_bus), 0);
+}
