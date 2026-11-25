@@ -20,9 +20,16 @@ impl Client {
     /// Collects every row before returning. To read rows as they arrive, stop reading early, or know the
     /// request id up front, use [Client::contract_details_stream].
     ///
-    /// Waits for TWS's end marker with no time bound. For a bound, use
+    /// Waits for TWS's end marker for at most the client's
+    /// [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout), counted from the call, and
+    /// without a time limit when none is set. TWS has left a contract-details request unanswered,
+    /// with no error, for hours. For a bound on one call, use
     /// [`contract_details_stream`](Self::contract_details_stream) and
     /// [`collect_to_end_within`](crate::subscriptions::Subscription::collect_to_end_within).
+    ///
+    /// # Errors
+    /// [`Error::Timeout`] if the end marker has not arrived within the `one_shot_timeout`; the
+    /// request is then cancelled at TWS.
     ///
     /// # Arguments
     /// * `contract` - The [Contract] used as sample to query the available contracts.
@@ -46,7 +53,12 @@ impl Client {
     /// }
     /// ```
     pub async fn contract_details(&self, contract: &Contract) -> Result<Vec<ContractDetails>, Error> {
-        self.contract_details_stream(contract).subscribe().await?.collect_to_end().await
+        let started = std::time::Instant::now();
+        let mut subscription = self.contract_details_stream(contract).subscribe().await?;
+        match self.one_shot_timeout() {
+            Some(timeout) => subscription.collect_to_end_within(timeout.saturating_sub(started.elapsed())).await,
+            None => subscription.collect_to_end().await,
+        }
     }
 
     /// Build a contract-details request whose subscription yields one
