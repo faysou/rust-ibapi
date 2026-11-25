@@ -579,3 +579,9 @@ fn trading_session_rejects_malformed_entries() {
         assert!(matches!(&err, Error::Parse(_, value, _) if value == raw), "{label}: {err:?}");
     }
 }
+
+#[test]
+fn option_right_open_interest_tick() {
+    assert_eq!(OptionRight::Call.open_interest_tick(), TickType::OptionCallOpenInterest);
+    assert_eq!(OptionRight::Put.open_interest_tick(), TickType::OptionPutOpenInterest);
+}

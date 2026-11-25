@@ -14,7 +14,9 @@
 //! subscribes to using the IB API's canonical upper-snake-case spelling.
 //!
 //! Many tick types are delivered by default and require no entry in
-//! `genericTickList`. Only the IDs below opt in to additional data.
+//! `genericTickList`. Only the IDs below opt in to additional data. A
+//! snapshot takes none: TWS rejects a snapshot with generic ticks with error
+//! 321 (live: 2026-11-24).
 //!
 //! # Examples
 //!
@@ -51,10 +53,16 @@
 /// Delivers received ticks `OPTION_CALL_VOLUME` (29) and `OPTION_PUT_VOLUME` (30).
 pub const OPTION_VOLUME: &str = "100";
 
-/// `101` — Call/put option open interest (currently for stocks).
+/// `101` — Call/put option open interest.
 ///
 /// Delivers received ticks `OPTION_CALL_OPEN_INTEREST` (27) and
-/// `OPTION_PUT_OPEN_INTEREST` (28).
+/// `OPTION_PUT_OPEN_INTEREST` (28). On an option or a futures option, the
+/// contract's own open interest arrives on the tick for its right, and the
+/// other tick arrives as `0`; [`OptionRight::open_interest_tick`] names the
+/// one to read. Delayed data carries both, with the market closed too, as
+/// the subscription starts (live: 2026-11-24).
+///
+/// [`OptionRight::open_interest_tick`]: crate::contracts::OptionRight::open_interest_tick
 pub const OPTION_OPEN_INTEREST: &str = "101";
 
 /// `104` — 30-day historical volatility (currently for stocks).
@@ -186,7 +194,10 @@ pub const IPO_PRICES: &str = "586";
 
 /// `588` — Total outstanding futures contracts.
 ///
-/// Delivers received tick `FUTURES_OPEN_INTEREST` (86).
+/// Delivers received tick `FUTURES_OPEN_INTEREST` (86) on a future. Delayed
+/// data carries it as the subscription starts; a futures option
+/// gets nothing (live: 2026-11-24). For an option's open interest use
+/// [`OPTION_OPEN_INTEREST`].
 pub const FUTURES_OPEN_INTEREST: &str = "588";
 
 /// `595` — Past 3/5/10-minute volume (stocks only).
