@@ -442,9 +442,10 @@ mod sync_tests {
         assert_eq!(cancels(&bus), 1, "End does not end a keep-up-to-date request");
     }
 
-    /// With updates, only 200 is verified to end the request; 162 keeps the cancel.
+    /// With updates, 162 is verified to end the request (TWS answers a cancel with 366), so no
+    /// cancel follows it.
     #[test]
-    fn subscribe_with_updates_rejection_162_still_cancels() {
+    fn subscribe_with_updates_rejection_162_writes_no_cancel() {
         let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_error_response(
             TEST_REQ_ID_FIRST,
             162,
@@ -461,7 +462,7 @@ mod sync_tests {
         assert!(matches!(subscription.next(), Some(Err(Error::Notice(notice))) if notice.code == 162));
         drop(subscription);
 
-        assert_eq!(cancels(&bus), 1);
+        assert_eq!(cancels(&bus), 0);
     }
 
     #[test]
@@ -839,9 +840,10 @@ mod async_tests {
         assert_eq!(cancels(&bus), 1, "End does not end a keep-up-to-date request");
     }
 
-    /// With updates, only 200 is verified to end the request; 162 keeps the cancel.
+    /// With updates, 162 is verified to end the request (TWS answers a cancel with 366), so no
+    /// cancel follows it.
     #[tokio::test]
-    async fn subscribe_with_updates_rejection_162_still_cancels() {
+    async fn subscribe_with_updates_rejection_162_writes_no_cancel() {
         let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_error_response(
             TEST_REQ_ID_FIRST,
             162,
@@ -860,7 +862,7 @@ mod async_tests {
         drop(subscription);
         settle().await;
 
-        assert_eq!(cancels(&bus), 1);
+        assert_eq!(cancels(&bus), 0);
     }
 
     #[tokio::test]

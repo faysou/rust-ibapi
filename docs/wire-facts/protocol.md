@@ -42,6 +42,7 @@ the cancel; types whose code is verified here now skip it, so the reply no longe
 | market_depth | 200, 354 | 310 |
 | market_depth | 10092 (no depth for the security type and exchange) | none |
 | historical_data (stream / fetch) | 200, 162, 10314 | 366 "No historical data query found" |
+| historical_data (subscribe_with_updates) | 162, 321 | 366 |
 | pnl | 321 | 10185 |
 | pnl_single | 321 | 10186 |
 | scanner | 162 (disabled scan code) | 365 |
@@ -70,6 +71,33 @@ the cancel; types whose code is verified here now skip it, so the reply no longe
   global skip was rejected: a code we treat as terminal may not end the request at TWS (10197
   market data, 10299 below), and skipping would leak TWS resources.
 - **Not probed:** 354 and 10168 on market data during RTH; 10197; market depth 354 on a stock.
+
+### Cancel after a rejected keepUpToDate historical request
+
+*Live 2026-11-25 09:57-10:01 UTC off-hours, paper TWS, server 223, sync.*
+
+- Raw `reqHistoricalData` with `keepUpToDate` true, then `cancelHistoricalData` 1.5 s after the
+  error, under the same request id. Every rejection below drew 366 "No historical data query
+  found for ticker id:<id>" within 1 ms of the cancel, so TWS had ended the request:
+  - 200 "No security definition has been found for the request" (ZZZZQX stock, and 005930 on
+    KSE).
+  - 162 "Historical Market Data Service error message:No market data permissions for IBIS STK"
+    (SAP on IBIS, 1 h `TRADES` bars, 1 day).
+  - 162 "Historical Market Data Service error message:invalid step: 1" (EUR.USD, 1 s
+    `MIDPOINT` bars, 2 days).
+  - 321 "Error validating request.-'D' : cause - End date not supported with live updates"
+    (EUR.USD, end date set).
+  - 321 "Error validating request.-'D' : cause - Source price not supported with live
+    updates" (AAPL `ADJUSTED_LAST`; BTC `AGGTRADES`).
+- The same requests with `keepUpToDate` false drew the same 200 and 162 errors, and the same
+  366 to a cancel; with an end date or `ADJUSTED_LAST` / `AGGTRADES` they were served.
+- Requests that streamed answered the cancel with 162 "API historical data query cancelled:
+  <id>" instead: EUR.USD `MIDPOINT` (updates every ~5 s), and ESZ6 (CME) and 7203 (TSE)
+  `TRADES`, whose bars came without a permission error and then no update or error for 12 to
+  45 s.
+- `HistoricalDataFrame::rejection_ends_request` matches 200, 162 and 321 by code under `keep_up_to_date`.
+- **Not probed:** 354 and 10182 on a historical request (neither could be provoked: no
+  contract tried drew 354, and no HMDS farm disconnect happened), pacing-violation 162, and RTH.
 
 ### Cancel after a request TWS finished
 

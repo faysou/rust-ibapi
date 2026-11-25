@@ -263,8 +263,8 @@ fn rejection_ends_request_only_for_verified_codes() {
         case(
             "HistoricalDataFrame, keep_up_to_date",
             |code| rejection_ends_with::<HistoricalDataFrame>(code, &DecoderContext::default().with_keep_up_to_date(true)),
-            &[200],
-            162,
+            &[200, 162, 321],
+            10197,
         ),
         case("PnL", rejection_ends::<PnL>, &[321], 200),
         case("PnLSingle", rejection_ends::<PnLSingle>, &[321], 200),

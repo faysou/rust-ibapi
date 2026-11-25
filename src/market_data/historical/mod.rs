@@ -26,7 +26,7 @@ use time::{Date, OffsetDateTime};
 
 use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
-use crate::messages::{IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE};
+use crate::messages::{IncomingMessages, Notice, ResponseMessage, HMDS_ERROR_CODE, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
@@ -655,10 +655,12 @@ impl StreamDecoder<HistoricalDataFrame> for HistoricalDataFrame {
 
     /// Without `keep_up_to_date`, any error: a one-shot query has nothing to
     /// continue after one. Verified live for 162, 200 and 10314, where TWS
-    /// answers a cancel with 366 (no query found). With it, only 200, after
-    /// which TWS answers the cancel with 366.
+    /// answers a cancel with 366 (no query found). With it, only 200, 162 (no
+    /// market data permissions, invalid step) or 321 (end date or source price
+    /// not supported with live updates), after which TWS answers the cancel
+    /// with 366.
     fn rejection_ends_request(notice: &Notice, context: &DecoderContext) -> bool {
-        !context.keep_up_to_date || notice.code == NO_SECURITY_DEFINITION_CODE
+        !context.keep_up_to_date || matches!(notice.code, NO_SECURITY_DEFINITION_CODE | HMDS_ERROR_CODE | REQUEST_VALIDATION_CODE)
     }
 }
 
