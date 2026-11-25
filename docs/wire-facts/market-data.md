@@ -116,18 +116,30 @@ of `"0"`:
 
 ### Bar volume and WAP on non-TRADES bars
 
-*Live 2026-11-15 Sun 22:25 ET (FX and CME Globex open, US equities overnight), paper, server
-226; raw capture.*
+*Live 2026-11-23 Mon 18:55-19:05 ET (FX, crypto and CME Globex open, US equities after hours),
+paper TWS, server 223; raw capture.*
 
-- `reqRealTimeBars` MIDPOINT, EUR.USD and ES: `RealTimeBarTick.volume` (7) and `WAP` (8)
-  **absent** in 7 of 7 frames; `count` sent as `-1`. TRADES on ES: all three sent with real
-  values. EUR.USD TRADES draws 420 (no Last data for CASH).
-- `reqHistoricalData` MIDPOINT and BID, 1-hour bars, AAPL, EUR.USD and ES: `volume` and `WAP`
-  **sent** as `"-1"`, `barCount` as `-1`. TRADES sends real values.
-- Settles that the two bar types differ: realtime leaves the fields out, historical sends a
-  `-1` sentinel. C# reads an absent realtime value as unset (`decimal.MaxValue`).
-- **Not probed:** ASK bars; AAPL realtime bars (no data overnight); `HistoricalDataUpdate`
-  (keep-up-to-date) bars.
+- `reqRealTimeBars` MIDPOINT, BID and ASK, EUR.USD, XAUUSD and BTC (PAXOS): `volume` (7) and
+  `WAP` (8) **sent** as `"-1"` and `count` as `-1` in every frame. TRADES and AGGTRADES on BTC
+  send real values, and a quiet bar sends `"0"` volume with count `0`.
+- `reqHistoricalData` MIDPOINT, BID, ASK and BID_ASK, 1-hour bars (AAPL, ES, EUR.USD, an AAPL
+  option, a CBOT corn option, the IBUS500 CFD, XAUUSD, BTC) and daily bars (AAPL, ES,
+  EUR.USD): `volume` and `WAP` sent as `"-1"` and `barCount` as `-1`. TRADES and AGGTRADES
+  send real values. An SPX TRADES bar sends `volume` and `WAP` as `"0"` with a real `barCount`.
+- The corn option (OZC, price magnifier 100) sends the non-TRADES `WAP` as `"-100"`, `-1` times
+  the magnifier. `volume` and `barCount` stay `-1`.
+- `keepUpToDate` updates (`HistoricalDataUpdate`), MIDPOINT and ASK on EUR.USD, MIDPOINT on
+  BTC, ASK on XAUUSD: `volume` and `WAP` sent as `"-1"` and `barCount` as `-1`, as in the
+  initial bars.
+- Earlier result (2026-11-15, paper Gateway, server 226): realtime MIDPOINT bars on EUR.USD and
+  ES left `volume` and `WAP` **out** and sent `count` as `-1`; historical bars sent `-1`. So a
+  realtime bar can carry either form.
+- Settles that a non-TRADES bar's volume, WAP and count are a `-1` sentinel or absent on both bar
+  types, and that the WAP sentinel scales with the price magnifier.
+- **Not probed:** TRADES `keepUpToDate` updates (no real-time data on this account for stocks or
+  CME; with `keepUpToDate`, BTC draws 10299 for TRADES and 321 "Source price not supported with
+  live updates" for AGGTRADES); realtime bars on a
+  magnified contract; a quiet historical TRADES bar.
 
 ### One-second bars reach back at most 2000 S
 
