@@ -29,8 +29,7 @@ pub struct ChannelMapping {
     /// requests sharing an end marker share that order. Every reply reaches
     /// every subscription of its message types, so a subscription made while
     /// earlier requests of its end marker are unanswered skips their replies
-    /// (see `UnansweredReplies`). `None` where that is unverified or untrue:
-    /// a second `RequestAccountData` for the subscribed account draws no reply.
+    /// (see `UnansweredReplies`). `None` where that is unverified or untrue.
     /// See `docs/wire-facts/orders.md#overlapping-open-order-requests`.
     pub reply_end: Option<IncomingMessages>,
 }
@@ -110,7 +109,10 @@ pub(crate) const CHANNEL_MAPPINGS: &[ChannelMapping] = &[
             IncomingMessages::AccountUpdateTime,
         ],
         one_shot: false,
-        reply_end: None,
+        // A repeated subscribe for the subscribed account goes out as
+        // unsubscribe then subscribe, so every subscribe draws one dump. See
+        // `docs/wire-facts/accounts.md#a-second-reqaccountupdates-for-the-subscribed-account-draws-no-reply`.
+        reply_end: Some(IncomingMessages::AccountDownloadEnd),
     },
     ChannelMapping {
         request: OutgoingMessages::RequestMktDepthExchanges,
