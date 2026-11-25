@@ -26,7 +26,7 @@ use time::{Date, OffsetDateTime};
 
 use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
-use crate::messages::{IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE};
+use crate::messages::{IncomingMessages, Notice, ResponseMessage, HMDS_ERROR_CODE, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
@@ -585,9 +585,11 @@ impl StreamDecoder<HistoricalBarUpdate> for HistoricalBarUpdate {
         cancel_historical_data(request_id)
     }
 
-    /// Live: after 200 TWS answers the cancel with 366 (no query found).
+    /// Live: after 200, 162 (no market data permissions, invalid step) or
+    /// 321 (end date or source price not supported with live updates) TWS
+    /// answers the cancel with 366 (no query found).
     fn rejection_ends_request(notice: &Notice) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(notice.code, NO_SECURITY_DEFINITION_CODE | HMDS_ERROR_CODE | REQUEST_VALIDATION_CODE)
     }
 }
 
