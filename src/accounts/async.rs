@@ -1,12 +1,13 @@
 //! Asynchronous implementation of account management functionality
 
+use std::ops::Deref;
 use std::time::Duration;
 
 use time::OffsetDateTime;
 
 use crate::client::{ClientRequestBuilders, SubscriptionBuilderExt};
 use crate::common::request_helpers::{self, empty_on_end_of_stream, expect_proto};
-use crate::messages::OutgoingMessages;
+use crate::messages::{resubscribed_notice, OutgoingMessages};
 use crate::subscriptions::Subscription;
 use crate::{Client, Error};
 
@@ -232,6 +233,9 @@ impl Client {
     /// emitted only when a row changed a value since the previous one. Choose `quiet` longer than
     /// the gap between the rows of one push, which arrive within milliseconds of each other.
     ///
+    /// The stream ends when the transport reconnects; to resubscribe and keep going, use
+    /// [`account_summary_snapshots_resubscribing`](Self::account_summary_snapshots_resubscribing).
+    ///
     /// To fold the rows with your own batching instead, use [`AccountSummarySnapshot::apply`].
     ///
     /// Notices that arrive on the subscription are logged at `warn!`. For other streams that dump
@@ -280,6 +284,66 @@ impl Client {
             builder: SnapshotBuilder::default(),
             quiet,
         })
+    }
+
+    /// [`account_summary_snapshots`](Self::account_summary_snapshots) that survives transport
+    /// reconnects.
+    ///
+    /// When the connection drops, it waits for the reconnect, requests the summary again, and
+    /// yields `Err(`[`Error::Notice`]`)` with code [`TRANSPORT_RECONNECT_CODE`](crate::TRANSPORT_RECONNECT_CODE)
+    /// before the next snapshot, as [`resubscribing`](Self::resubscribing) does. The next snapshot
+    /// is built from scratch: it completes at the new subscription's `End`, holds only the rows
+    /// that subscription reports, and drops rows not yet emitted before the outage. Values that
+    /// changed during the outage are missing.
+    ///
+    /// It ends after yielding any other error, the error [`wait_connected`](Self::wait_connected)
+    /// returns when the reconnect gave up, or once the subscription ends.
+    ///
+    /// The stream borrows the client. To move it into a spawned task, open it from an
+    /// `Arc<Client>` with [`AccountSummarySnapshotsResubscribing::subscribe`].
+    ///
+    /// # Arguments
+    /// * `group` - Set to "All" to return account summary data for all accounts, or set to a specific Advisor Account Group name.
+    /// * `tags`  - List of the desired tags.
+    /// * `quiet` - How long without a row completes a pushed update.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::Client;
+    /// use ibapi::accounts::AccountSummaryTags;
+    /// use ibapi::accounts::types::AccountGroup;
+    /// use ibapi::{Error, TRANSPORT_RECONNECT_CODE};
+    /// use std::time::Duration;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
+    ///
+    ///     let group = AccountGroup("All".to_string());
+    ///     let tags = &[AccountSummaryTags::NET_LIQUIDATION];
+    ///
+    ///     let mut snapshots = client
+    ///         .account_summary_snapshots_resubscribing(&group, tags, Duration::from_secs(1))
+    ///         .await
+    ///         .expect("error requesting account summary");
+    ///
+    ///     while let Some(snapshot) = snapshots.next().await {
+    ///         match snapshot {
+    ///             Ok(snapshot) => println!("{} rows", snapshot.len()),
+    ///             Err(Error::Notice(n)) if n.code == TRANSPORT_RECONNECT_CODE => println!("gap: {n}"),
+    ///             Err(e) => eprintln!("error: {e}"),
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    pub async fn account_summary_snapshots_resubscribing(
+        &self,
+        group: &AccountGroup,
+        tags: &[&str],
+        quiet: Duration,
+    ) -> Result<AccountSummarySnapshotsResubscribing<&Self>, Error> {
+        AccountSummarySnapshotsResubscribing::subscribe(self, group, tags, quiet).await
     }
 
     /// Subscribe to detailed account updates for a specific account.
@@ -711,6 +775,129 @@ impl AccountSummarySnapshots {
                 }
                 Some(Err(e)) => return Some(Err(e)),
                 None => return self.builder.flush().map(Ok),
+            }
+        }
+    }
+}
+
+/// Account summary snapshots that survive transport reconnects, from
+/// [`Client::account_summary_snapshots_resubscribing`] or [`subscribe`](Self::subscribe).
+///
+/// `C` is how the stream holds the client it resubscribes with: `&Client` from the client
+/// method, or an owned handle such as `Arc<Client>` from [`subscribe`](Self::subscribe), which
+/// makes the stream `'static` so it can move into a spawned task.
+pub struct AccountSummarySnapshotsResubscribing<C> {
+    client: C,
+    group: AccountGroup,
+    tags: Vec<String>,
+    quiet: Duration,
+    /// `None` once the stream has ended.
+    snapshots: Option<AccountSummarySnapshots>,
+}
+
+impl<C> std::fmt::Debug for AccountSummarySnapshotsResubscribing<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountSummarySnapshotsResubscribing")
+            .field("group", &self.group)
+            .field("tags", &self.tags)
+            .field("quiet", &self.quiet)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<C: Deref<Target = Client>> AccountSummarySnapshotsResubscribing<C> {
+    /// Requests the account summary through `client` and returns its snapshots, resubscribing
+    /// after each transport reconnect, as
+    /// [`Client::account_summary_snapshots_resubscribing`] does.
+    ///
+    /// Pass an `Arc<Client>` to get a stream that owns its client handle and can move into a
+    /// spawned task.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// use ibapi::accounts::types::AccountGroup;
+    /// use ibapi::accounts::{AccountSummarySnapshotsResubscribing, AccountSummaryTags};
+    /// use ibapi::Client;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let client = Arc::new(Client::connect("127.0.0.1:4002", 100).await.expect("connection failed"));
+    ///
+    ///     let group = AccountGroup("All".to_string());
+    ///     let tags = &[AccountSummaryTags::NET_LIQUIDATION];
+    ///     let mut snapshots = AccountSummarySnapshotsResubscribing::subscribe(Arc::clone(&client), &group, tags, Duration::from_secs(1))
+    ///         .await
+    ///         .expect("error requesting account summary");
+    ///
+    ///     // The first snapshot here, the rest in a task.
+    ///     let first = snapshots.next().await;
+    ///     println!("first: {first:?}");
+    ///     tokio::spawn(async move {
+    ///         while let Some(snapshot) = snapshots.next().await {
+    ///             println!("{snapshot:?}");
+    ///         }
+    ///     });
+    /// }
+    /// ```
+    // Four required arguments, the client method's three plus the handle; a builder would only
+    // rename them.
+    pub async fn subscribe(client: C, group: &AccountGroup, tags: &[&str], quiet: Duration) -> Result<Self, Error> {
+        let snapshots = client.account_summary_snapshots(group, tags, quiet).await?;
+
+        Ok(Self {
+            client,
+            group: group.clone(),
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            quiet,
+            snapshots: Some(snapshots),
+        })
+    }
+
+    /// Cancels the underlying subscription. The next call to [`next`](Self::next) returns
+    /// `Err(Error::Cancelled)`, then any rows not yet emitted, then `None`.
+    pub async fn cancel(&self) {
+        if let Some(snapshots) = &self.snapshots {
+            snapshots.cancel().await;
+        }
+    }
+
+    /// Returns the next snapshot, the reconnect notice, or `None` once the stream has ended.
+    ///
+    /// Not cancel-safe, as [`AccountSummarySnapshots::next`].
+    pub async fn next(&mut self) -> Option<Result<AccountSummarySnapshot, Error>> {
+        match self.snapshots.as_mut()?.next().await {
+            Some(Err(e)) if e.is_connection_lost() => {
+                // Its request died with the old session; dropping it sends no cancel.
+                self.snapshots = None;
+                Some(Err(self.resubscribe().await))
+            }
+            None => {
+                self.snapshots = None;
+                None
+            }
+            item => item,
+        }
+    }
+
+    /// Waits for the reconnect and requests the summary again. Returns the gap notice, or the
+    /// error that ends the stream.
+    async fn resubscribe(&mut self) -> Error {
+        let tags: Vec<&str> = self.tags.iter().map(String::as_str).collect();
+        loop {
+            if let Err(e) = self.client.wait_connected().await {
+                return e;
+            }
+            match self.client.account_summary_snapshots(&self.group, &tags, self.quiet).await {
+                Ok(snapshots) => {
+                    self.snapshots = Some(snapshots);
+                    return Error::Notice(resubscribed_notice());
+                }
+                Err(e) if e.is_connection_lost() => {}
+                Err(e) => return e,
             }
         }
     }
