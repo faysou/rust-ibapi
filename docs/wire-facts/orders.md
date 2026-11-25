@@ -1104,3 +1104,13 @@ non-marketable limit orders, each cancelled after 5 to 10 s.*
   silence may be TWS load rather than the order type.
 - **Not probed:** SEHK's closing auction order types (`tif` AUC was refused; no other type
   tried), TSE MOC and LOC during a session.
+
+### `Minutes` time in force on a crypto order
+
+*Live 2026-11-25 11:01 UTC, paper TWS, server 223; the account has no crypto trading permission.*
+
+- BTC.USD (`CRYPTO`, PAXOS) BUY 0.01 LMT 1000, `tif` `Minutes`: TWS took the time in force and
+  echoed `Minutes` on the open order, then sent Inactive and 201 for the missing permission. The
+  same order with `tif` DAY drew 201 "The crypto buy order must be Minutes or IOC." instead.
+- `completed_orders` lists the rejected order with `tif` `Minutes`.
+- **Not probed:** the 5-minute cancel of an unfilled `Minutes` order (needs crypto permission).
