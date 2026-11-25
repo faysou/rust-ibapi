@@ -70,8 +70,8 @@ impl Client {
     ///   session is live, the stream yields one
     ///   [`SubscriptionItem::Notice`]
     ///   with code [`TRANSPORT_RECONNECT_CODE`](crate::TRANSPORT_RECONNECT_CODE)
-    ///   to mark the gap. It classifies as an error, so match its code before
-    ///   treating error notices as rejections. Watch [`Self::notice_stream`] for the
+    ///   to mark the gap. Its `is_error()` is false
+    ///   ([`NoticeCategory::ClientSynthesized`](crate::NoticeCategory::ClientSynthesized)). Watch [`Self::notice_stream`] for the
     ///   connectivity notices (codes 1100 connectivity lost, 1101 restored
     ///   with data lost, 1102 restored with data maintained, 1300 socket reset).
     /// - **Error.** An `Err` item ends the stream; every later call returns

@@ -873,7 +873,7 @@ The compiler finds every use as `f64`. It doesn't catch the serialized form: `Ba
 marks both fields nullable. JSON written by 5.x still deserializes, with a stored `0` read as
 `Some(0.0)`.
 
-`count`, and the historical `Bar`'s volume, WAP and count, follow in [§48](#48-bar-volume-wap-and-count-are-none-on-a-non-trades-bar).
+`count`, and the historical `Bar`'s volume, WAP and count, follow in [§53](#53-bar-volume-wap-and-count-are-none-on-a-non-trades-bar).
 
 ### 39. Tick-by-tick and historical ticks share `TickLast`, `TickBidAsk` and `TickMidpoint`
 
@@ -1179,29 +1179,7 @@ open one. Track which request a record came from instead.
 To read a completed record's status and quantities, use `OrderData::completed_order_status()`.
 A completed order's `order.total_quantity` is the quantity left unfilled, not the size ordered.
 
-### 49. `order_update_stream` yields a notice after a reconnect
-
-After each transport reconnect, once the new session is live, `order_update_stream` yields one
-`SubscriptionItem::Notice` with code `TRANSPORT_RECONNECT_CODE`. It marks the updates TWS sent
-during the outage, which it does not replay. Before, the stream gave no sign of the gap.
-
-The notice is client-synthesized and classifies as an error (`notice.is_error()` is `true`). A
-match that treats every error notice on this stream as an order rejection now sees it as one.
-Match the code first:
-
-```rust,ignore
-// 5.x
-SubscriptionItem::Notice(n) if n.is_error() => order_rejected(n),
-
-// 6.0
-SubscriptionItem::Notice(n) if n.code == TRANSPORT_RECONNECT_CODE => rebuild_order_state(),
-SubscriptionItem::Notice(n) if n.is_error() => order_rejected(n),
-```
-
-`iter_data()` and `filter_data()` drop notices, this one included. To rebuild order state, follow
-the recovery steps in the `order_update_stream` docs.
-
-### 50. Bracket `submit_all` returns `LinkedOrdersError`
+### 49. Bracket `submit_all` returns `LinkedOrdersError`
 
 `BracketOrderBuilder::submit_all` (sync and async) now returns
 `Result<BracketOrderIds, ibapi::orders::LinkedOrdersError>`. 5.x returned `ibapi::Error` and gave
@@ -1227,7 +1205,7 @@ match client.order(&contract).buy(100).bracket().entry_limit(50.0).take_profit(5
 }
 ```
 
-### 51. Order codes outside 200-399 move out of `NoticeCategory::Error`
+### 50. Order codes outside 200-399 move out of `NoticeCategory::Error`
 
 Eleven order codes outside the order-rejection band no longer classify as `NoticeCategory::Error`.
 Each was verified against a paper account (`docs/wire-facts/orders.md`):
@@ -1249,7 +1227,7 @@ terms. Treat the order as gone only when no status has been seen for it. For an
 A refused cancel or modify that arrives before any status for the order no longer starts an
 `order_status_stream`, so `wait_for_fill` does not report it as `OrderOutcome::Rejected`.
 
-### 52. A cancel or modify no longer ends the order's earlier subscription
+### 51. A cancel or modify no longer ends the order's earlier subscription
 
 5.x kept one subscription per order ID: `cancel_order`, or a modify through another
 `place_order` with the same ID, replaced the earlier subscription, which ended at once. Fills
@@ -1267,7 +1245,7 @@ now stays live and receives each of the order's frames once.
   going. Code that read the refusal from the `place_order` subscription as an `Err` reads it as a
   notice there, or from the modify's or cancel's own subscription.
 
-### 53. `executions()` replies no longer reach order subscriptions or `order_update_stream`
+### 52. `executions()` replies no longer reach order subscriptions or `order_update_stream`
 
 An `ExecutionData` frame that answers `executions()` carries that request's id; a live fill
 carries -1. 5.x delivered a reply for an order with an open `place_order` subscription to that
@@ -1286,7 +1264,7 @@ on both clients.
   order's streams and is copied to the request, so a reply can carry a fill's report twice.
   Key commissions by `execution_id`.
 
-### 54. Bar volume, WAP and count are `None` on a non-TRADES bar
+### 53. Bar volume, WAP and count are `None` on a non-TRADES bar
 
 A bar that isn't `WhatToShow::Trades` (MIDPOINT, BID, ASK, ...) has no traded volume. TWS sends
 its volume, WAP and trade count as `-1`, or leaves them out. For a contract with a price
@@ -1318,7 +1296,7 @@ types derive `Serialize` / `Deserialize`, and a missing value now serializes as 
 written by 5.x still deserializes, but a stored `-1` reads as `Some(-1.0)` or `Some(-1)`, not
 `None`. The `utoipa` schemas mark the fields nullable.
 
-### 55. `Currency::default()` is empty
+### 54. `Currency::default()` is empty
 
 5.x defaulted `Currency` to `"USD"`, so a `Contract` struct literal ending in
 `..Default::default()` that never set `currency`, and `Contract::default()` itself, asked TWS
@@ -1354,7 +1332,7 @@ let contract = Contract::stock("AAPL").build();
 Code that compares a contract's currency with `Currency::default()` to mean USD now compares
 with the empty currency.
 
-### 56. Error 10089 ends the subscription
+### 55. Error 10089 ends the subscription
 
 5.x treated 10089 ("Requested market data requires additional subscription for API ... Delayed
 market data is available") as a data advisory (#677): a `market_data`, `realtime_bars` or
@@ -1368,7 +1346,7 @@ sent. `Notice::category()` returns `NoticeCategory::Error` for it, `is_informati
 10089 should instead set a delayed market data type (`switch_market_data_type`); TWS then sends
 10167, which stays an advisory, before the delayed ticks.
 
-### 57. `TimeInForce` gains `Minutes`
+### 56. `TimeInForce` gains `Minutes`
 
 IB uses the time in force `Minutes` for cryptocurrency limit orders on PAXOS: an unfilled order
 is cancelled after 5 minutes. 5.x decoded it as `TimeInForce::Unknown("Minutes")`. It is now
@@ -1379,7 +1357,7 @@ a comparison or match against `Unknown("Minutes")`: that code still compiles and
 matches. Serialized, `TimeInForce` is the wire string, so an `Order` with it writes `"Minutes"`
 and reads back as the new variant.
 
-### 58. 10197 continues a `market_data` subscription
+### 57. 10197 continues a `market_data` subscription
 
 During an internet outage TWS sends error 10197 ("No market data during competing live session")
 on a `reqMktData` request and keeps the request: its ticks resume on the same request id once the
@@ -1406,7 +1384,7 @@ match item {
 
 The compiler catches none of this. Code that stopped or re-requested on `Err` for 10197 sees a
 notice instead; `iter_data` and `filter_data` drop it.
-### 59. Client-synthesized notices classify as `NoticeCategory::ClientSynthesized`
+### 58. Client-synthesized notices classify as `NoticeCategory::ClientSynthesized`
 
 A notice with a negative code is raised by this client, not TWS: `TRANSPORT_RECONNECT_CODE`,
 `SUBSCRIPTION_LAG_CODE`, `NOTICE_STREAM_LAG_CODE`, `UNKNOWN_MESSAGE_TYPE_CODE`,
