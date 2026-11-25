@@ -1,8 +1,8 @@
 pub(super) mod decoders;
 pub(super) mod encoders;
 pub(crate) mod fill;
-pub(crate) mod lookup;
 pub(super) mod linked;
+pub(crate) mod lookup;
 /// Helpers for constructing commonly used order templates.
 pub mod order_builder;
 pub(crate) mod stream_decoders;
