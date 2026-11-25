@@ -455,6 +455,10 @@ non-marketable limit orders, each cancelled after 5 to 10 s.*
 - No 399 came during a session or a lunch break. The SEHK and TSE stock orders stayed
   PreSubmitted with an empty `why_held` while their venue traded, and 7203 had been Submitted at
   22:03 when TSE was closed, so neither status tells whether the order is at the exchange.
+- Distance from the market decides the SEHK status (06:25, bid 339, ask 339.2): BUY 100 LMT 336
+  and LMT 330 went PreSubmitted, then Submitted 0.2 s later; LMT 320 stayed PreSubmitted, and so
+  did 7203 LMT 2000 again. IB holds a limit that far from the market without sending it on, and
+  says so in no field.
 - **Not probed:** fills; marketable orders; orders during the SEHK closing auction.
 
 ### Auction orders on SEHK and TSE

@@ -182,8 +182,8 @@ Contract details and option chains. Format: [README](README.md).
 
 ### Local symbols of HKFE, OSE and KSE options
 
-*Live 2026-11-24 21:47-21:51 UTC (HKFE, OSE and KSE closed), paper TWS, server 223; contract
-details of every listed contract.*
+*Live 2026-11-24 21:47-21:51 UTC (HKFE, OSE and KSE closed) and 2026-11-25 06:21 UTC (SEHK
+options), paper TWS, server 223; contract details of every listed contract.*
 
 | Query | Rows | `localSymbol` | `tradingClass` |
 | ----- | ---- | ------------- | -------------- |
@@ -192,6 +192,7 @@ details of every listed contract.*
 | FOP HSI HKFE | 1,942 | `PHS25600L6`, `PHS25600X6` | `PHS` |
 | OPT N225 OSE.JPN 202612 | 706 | `131126218` (16250 P), `141127718` (17750 C) | `225` |
 | OPT K200 KSE 202612 | 1,134 | `K200270L6.KS`, `K200992L6.KS` (992.5 C), `K200220X6.KS` | `01` |
+| OPT 700 SEHK 202612 C | 139 | `TCH DEC26 640 C` | `TCH` |
 
 - HKFE and KSE: trading class (`K200` for KSE), strike, one letter for month and right, last digit
   of the expiry year, then `.KS` on KSE. Calls take `A` (January) to `L` (December), puts `M` to
@@ -209,8 +210,9 @@ details of every listed contract.*
   puts and `4` or `9` for calls; the last two are `18` (also on the N225 future, `161120018`;
   the N225 mini future ends in `19`). The middle digits change with the strike range. Read the
   strike, right and expiry from the contract fields; the code does not spell them.
-- **Not probed:** SEHK stock options (OPT 700 HKFE drew 200; no other symbol tried), KSE weekly
-  options, OSE weekly options and other OSE products.
+- SEHK stock options list under the stock's symbol on `SEHK` (OPT 700 on HKFE drew 200), with a
+  short class (`TCH` for 700), a spelled-out local symbol `TCH DEC26 640 C` and multiplier 100.
+- **Not probed:** KSE weekly options, OSE weekly options and other OSE products.
 
 ### Board lots: `min_size` and `size_increment`
 
