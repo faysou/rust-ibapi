@@ -26,6 +26,7 @@ use time::{Date, OffsetDateTime};
 
 use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
+use crate::market_data::common::decoders::BarVolume;
 use crate::messages::{IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
@@ -165,6 +166,7 @@ impl From<OffsetDateTime> for BarTimestamp {
 /// Bar describes the historical data bar.
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, PartialEq, Copy, Serialize, Deserialize)]
+#[serde(from = "StoredBar")]
 pub struct Bar {
     /// The bar's timestamp — either a calendar date (daily+ bars) or a full
     /// datetime (intraday bars). See [`BarTimestamp`] for details.
@@ -179,15 +181,46 @@ pub struct Bar {
     pub close: f64,
     /// The bar's traded volume.
     ///
-    /// `None` for a bar that isn't [`WhatToShow::Trades`] (MIDPOINT, BID, ASK, ...), which has
-    /// no traded volume: TWS sends `-1` there. It never means nothing traded: a TRADES bar with no
-    /// volume, such as an index's, reports `Some(0.0)`.
+    /// `None` when TWS has no traded volume for the bar: MIDPOINT, BID, ASK and BID_ASK bars,
+    /// for which it sends `-1`. It never means nothing traded: a TRADES bar with no volume, such
+    /// as an index's, reports `Some(0.0)`. TRADES, AGGTRADES and ADJUSTED_LAST bars carry real
+    /// values. HISTORICAL_VOLATILITY and OPTION_IMPLIED_VOLATILITY bars carry volume `1` and
+    /// count `0` on every bar seen, so `Some(1.0)` there is not traded volume.
     pub volume: Option<f64>,
     /// The bar's volume-weighted average price. `None` when [`volume`](Self::volume) is.
     pub wap: Option<f64>,
-    /// The number of trades during the bar's timespan. `None` for a bar that isn't
-    /// [`WhatToShow::Trades`].
+    /// The number of trades during the bar's timespan. `None` when TWS has no traded volume for
+    /// the bar, as for [`volume`](Self::volume).
     pub count: Option<i32>,
+}
+
+/// [`Bar`] as stored, read back through the decoder's rule for volume, WAP and count.
+#[derive(Deserialize)]
+struct StoredBar {
+    date: BarTimestamp,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: Option<f64>,
+    wap: Option<f64>,
+    count: Option<i32>,
+}
+
+impl From<StoredBar> for Bar {
+    fn from(stored: StoredBar) -> Self {
+        let BarVolume { volume, wap, count } = BarVolume::new(stored.volume, stored.wap, stored.count);
+        Self {
+            date: stored.date,
+            open: stored.open,
+            high: stored.high,
+            low: stored.low,
+            close: stored.close,
+            volume,
+            wap,
+            count,
+        }
+    }
 }
 
 impl Default for Bar {
