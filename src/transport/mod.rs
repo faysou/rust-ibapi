@@ -243,6 +243,93 @@ impl SharedCounts {
     }
 }
 
+/// Requests written but not yet answered, per reply end marker, for the
+/// shared requests TWS answers one at a time with a full reply each
+/// (`ChannelMapping::reply_end`).
+/// Every reply reaches every live subscription of its message types, so a
+/// subscription made while `n` replies of its end marker are outstanding
+/// skips those `n` and then reads its own: without it, `open_orders` called
+/// during another `open_orders` ends at the earlier reply's end marker with
+/// the tail of that reply, and `all_open_orders` overlapping `open_orders`
+/// reads the other request's result set.
+///
+/// Counted under the same lock as the request write, so the count follows
+/// wire order; decremented under the lock that delivers the end marker, so a
+/// new subscription sees each end marker exactly when the count does.
+#[cfg(any(feature = "sync", feature = "async"))]
+#[derive(Debug, Default)]
+pub(crate) struct UnansweredReplies {
+    pending: std::collections::HashMap<crate::messages::IncomingMessages, usize>,
+}
+
+#[cfg(any(feature = "sync", feature = "async"))]
+impl UnansweredReplies {
+    /// Counts a request of `request` about to be written and returns what its
+    /// subscription skips: the replies still outstanding ahead of it.
+    pub(crate) fn add(&mut self, request: OutgoingMessages) -> ReplySkip {
+        let Some(end) = crate::messages::shared_channel_configuration::reply_end(request) else {
+            return ReplySkip::default();
+        };
+        let pending = self.pending.entry(end).or_insert(0);
+        let skip = ReplySkip {
+            end: Some(end),
+            remaining: *pending,
+        };
+        *pending += 1;
+        skip
+    }
+
+    /// Uncounts a request whose write failed after [`add`](Self::add).
+    pub(crate) fn withdraw(&mut self, request: OutgoingMessages) {
+        if let Some(end) = crate::messages::shared_channel_configuration::reply_end(request) {
+            self.answered(end);
+        }
+    }
+
+    /// Records a frame of `message_type`: an end marker answers the oldest
+    /// outstanding request. One with nothing outstanding (TWS sends this
+    /// client's open orders and an `OpenOrderEnd` at connect) changes nothing.
+    pub(crate) fn answered(&mut self, message_type: crate::messages::IncomingMessages) {
+        if let Some(pending) = self.pending.get_mut(&message_type) {
+            *pending = pending.saturating_sub(1);
+        }
+    }
+
+    /// Starts a new session: nothing written before it will be answered.
+    pub(crate) fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending(&self, end: crate::messages::IncomingMessages) -> usize {
+        self.pending.get(&end).copied().unwrap_or(0)
+    }
+}
+
+/// The earlier replies a shared subscription has yet to pass over before its
+/// own; see [`UnansweredReplies`].
+#[cfg(any(feature = "sync", feature = "async"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReplySkip {
+    end: Option<crate::messages::IncomingMessages>,
+    remaining: usize,
+}
+
+#[cfg(any(feature = "sync", feature = "async"))]
+impl ReplySkip {
+    /// `true` when a frame of `message_type` belongs to an earlier reply, and
+    /// so is not this subscription's. Counts down on each end marker.
+    pub(crate) fn skips(&mut self, message_type: crate::messages::IncomingMessages) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        if self.end == Some(message_type) {
+            self.remaining -= 1;
+        }
+        true
+    }
+}
+
 // MessageBus trait - defines the interface for message handling
 #[cfg(feature = "sync")]
 pub(crate) trait MessageBus: Send + Sync {

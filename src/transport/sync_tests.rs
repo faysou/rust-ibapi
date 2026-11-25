@@ -873,14 +873,24 @@ fn order_id_correlation_with_interleaved_responses() -> Result<(), Error> {
 /// `RequestAutoOpenOrders` all map to `[OpenOrder, OrderStatus, OpenOrderEnd]`
 /// in `CHANNEL_MAPPINGS`. The `OrderAndShared` strategy in `process_orders`
 /// fans every `OpenOrder` out to each shared subscriber, with or without an
-/// order id.
+/// order id, once none is passing over an earlier request's reply.
 #[test]
 fn shared_channel_fan_out_for_open_orders() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
     let (stream, bus) = make_bus();
 
     let sub_open = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
     let sub_all = bus.send_shared_request(OutgoingMessages::RequestAllOpenOrders, &[])?;
     let sub_auto = bus.send_shared_request(OutgoingMessages::RequestAutoOpenOrders, &[])?;
+
+    // The end of the open-orders reply, which `sub_all` passes over.
+    stream.push_inbound(binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {}));
+    bus.dispatch()?;
+    for (name, sub) in [("open", &sub_open), ("auto", &sub_auto)] {
+        let msg = sub.next_timeout(TICK).unwrap_or_else(|| panic!("sub_{name} got no end"))?;
+        assert_eq!(msg.message_type(), M::OpenOrderEnd, "sub_{name}");
+    }
+    assert!(sub_all.try_next_routed().is_none(), "sub_all read the open-orders reply");
 
     for order_id in [Some(42), None] {
         stream.push_inbound(binary_proto(
@@ -1136,11 +1146,14 @@ fn shared_subscription_cancel_waits_for_last_subscriber() -> Result<(), Error> {
     drop(first);
     assert_eq!(cancels_written(), 0, "cancel written while a subscription is still live");
 
-    stream.push_inbound(binary_proto(
-        crate::messages::IncomingMessages::PositionEnd as i32,
-        &crate::proto::PositionEnd {},
-    ));
-    bus.dispatch()?;
+    // TWS answers each request: the survivor passes over the first reply.
+    for _ in 0..2 {
+        stream.push_inbound(binary_proto(
+            crate::messages::IncomingMessages::PositionEnd as i32,
+            &crate::proto::PositionEnd {},
+        ));
+        bus.dispatch()?;
+    }
     let item = second.next_timeout(TICK).expect("survivor received nothing")?;
     assert!(matches!(item, SubscriptionItem::Data(PositionUpdate::PositionEnd)), "got: {item:?}");
 
@@ -1286,7 +1299,7 @@ fn account_updates_other_account_refused() -> Result<(), Error> {
 
     let (stream, bus) = make_bus();
     let first = account_updates_subscription(&bus, "DU1")?;
-    let subscribers = bus.shared_channels.subscribers().len();
+    let subscribers = bus.shared_channels.subscribers().live.len();
 
     let refused = account_updates_subscription(&bus, "DU2").map(|_| ());
     assert!(
@@ -1299,7 +1312,11 @@ fn account_updates_other_account_refused() -> Result<(), Error> {
         "refused request was written"
     );
     assert_eq!(bus.shared_channels.counts.lock().unwrap().live(OutgoingMessages::RequestAccountData), 1);
-    assert_eq!(bus.shared_channels.subscribers().len(), subscribers, "refused registration left behind");
+    assert_eq!(
+        bus.shared_channels.subscribers().live.len(),
+        subscribers,
+        "refused registration left behind"
+    );
 
     stream.push_inbound(binary_proto(
         crate::messages::IncomingMessages::AccountDownloadEnd as i32,
@@ -1665,36 +1682,39 @@ fn concurrent_one_shot_shared_requests_each_receive_reply() -> Result<(), Error>
     Ok(())
 }
 
-/// Every live subscription of a shared streaming type receives every frame,
-/// as with the async broadcast: two `RequestPositions` subscriptions both see
-/// each `Position` and `PositionEnd`.
+/// Every live subscription of a shared streaming type receives every frame
+/// from its own reply on, as with the async broadcast. TWS answers each
+/// `RequestPositions` with a full list and a `PositionEnd`: the first
+/// subscription, a live stream, reads both replies; the second passes over
+/// the first reply and reads its own.
 #[test]
 fn live_shared_subscriptions_each_receive_every_frame() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
     let (stream, bus) = make_bus();
 
     let first = bus.send_shared_request(OutgoingMessages::RequestPositions, &[])?;
     let second = bus.send_shared_request(OutgoingMessages::RequestPositions, &[])?;
 
-    stream.push_inbound(binary_proto(
-        crate::messages::IncomingMessages::Position as i32,
-        &crate::proto::Position {
-            account: Some("DU123".to_string()),
-            ..Default::default()
-        },
-    ));
-    stream.push_inbound(binary_proto(
-        crate::messages::IncomingMessages::PositionEnd as i32,
-        &crate::proto::PositionEnd {},
-    ));
-    bus.dispatch()?;
-    bus.dispatch()?;
+    for _ in 0..2 {
+        stream.push_inbound(binary_proto(
+            M::Position as i32,
+            &crate::proto::Position {
+                account: Some("DU123".to_string()),
+                ..Default::default()
+            },
+        ));
+        stream.push_inbound(binary_proto(M::PositionEnd as i32, &crate::proto::PositionEnd {}));
+        bus.dispatch()?;
+        bus.dispatch()?;
+    }
 
-    for (name, sub) in [("first", &first), ("second", &second)] {
-        let position = sub.next_timeout(TICK).unwrap_or_else(|| panic!("{name} got no Position"))?;
-        assert_eq!(position.message_type(), crate::messages::IncomingMessages::Position, "{name}");
-        let end = sub.next_timeout(TICK).unwrap_or_else(|| panic!("{name} got no PositionEnd"))?;
-        assert_eq!(end.message_type(), crate::messages::IncomingMessages::PositionEnd, "{name}");
-        assert!(sub.try_next_routed().is_none(), "{name} received a frame twice");
+    let both_replies = [M::Position, M::PositionEnd, M::Position, M::PositionEnd];
+    for (name, sub, expected) in [("first", &first, &both_replies[..]), ("second", &second, &both_replies[2..])] {
+        for message_type in expected {
+            let message = sub.next_timeout(TICK).unwrap_or_else(|| panic!("{name} got no {message_type:?}"))?;
+            assert_eq!(message.message_type(), *message_type, "{name}");
+        }
+        assert!(sub.try_next_routed().is_none(), "{name} received an extra frame");
     }
     Ok(())
 }
@@ -1744,9 +1764,154 @@ fn later_shared_subscription_does_not_see_earlier_reset() -> Result<(), Error> {
     Ok(())
 }
 
+/// A data frame and the end frame of a reply to each shared request TWS
+/// answers one request at a time (`ChannelMapping::reply_end`).
+struct ReplyFrames {
+    request: OutgoingMessages,
+    data: (IncomingMessages, Vec<u8>),
+    end: (IncomingMessages, Vec<u8>),
+}
+
+fn reply_frames() -> Vec<ReplyFrames> {
+    use crate::messages::IncomingMessages as M;
+    let frame = |message_type: M, body: &dyn Fn(M) -> Vec<u8>| (message_type, body(message_type));
+    let open_order = || {
+        frame(M::OpenOrder, &|m| {
+            binary_proto(
+                m as i32,
+                &crate::proto::OpenOrder {
+                    order_id: Some(7),
+                    ..Default::default()
+                },
+            )
+        })
+    };
+    let open_orders_end = || frame(M::OpenOrderEnd, &|m| binary_proto(m as i32, &crate::proto::OpenOrdersEnd {}));
+    vec![
+        ReplyFrames {
+            request: OutgoingMessages::RequestOpenOrders,
+            data: open_order(),
+            end: open_orders_end(),
+        },
+        ReplyFrames {
+            request: OutgoingMessages::RequestAllOpenOrders,
+            data: open_order(),
+            end: open_orders_end(),
+        },
+        ReplyFrames {
+            request: OutgoingMessages::RequestCompletedOrders,
+            data: frame(M::CompletedOrder, &|m| binary_proto(m as i32, &crate::proto::CompletedOrder::default())),
+            end: frame(M::CompletedOrdersEnd, &|m| binary_proto(m as i32, &crate::proto::CompletedOrdersEnd {})),
+        },
+        ReplyFrames {
+            request: OutgoingMessages::RequestPositions,
+            data: frame(M::Position, &|m| binary_proto(m as i32, &crate::proto::Position::default())),
+            end: frame(M::PositionEnd, &|m| binary_proto(m as i32, &crate::proto::PositionEnd {})),
+        },
+    ]
+}
+
+/// A second request made while the first one's reply is arriving reads its
+/// own full reply, not the tail of the first: TWS answers each request with
+/// a full reply and its own end marker, in the order sent.
+#[test]
+fn overlapping_shared_request_reads_its_own_reply() -> Result<(), Error> {
+    for ReplyFrames {
+        request,
+        data: (data_type, data),
+        end: (end_type, end),
+    } in reply_frames()
+    {
+        let (stream, bus) = make_bus();
+        let first = bus.send_shared_request(request, &[])?;
+        stream.push_inbound(data.clone());
+        bus.dispatch()?;
+
+        let second = bus.send_shared_request(request, &[])?;
+        for frame in [end.clone(), data.clone(), end.clone()] {
+            stream.push_inbound(frame);
+            bus.dispatch()?;
+        }
+
+        let read = |sub: &InternalSubscription, count| -> Vec<IncomingMessages> {
+            (0..count)
+                .map(|_| sub.next_timeout(TICK).expect("reply cut short").unwrap().message_type())
+                .collect()
+        };
+        assert_eq!(read(&second, 2), [data_type, end_type], "{request:?}: second request read another reply");
+        assert!(second.try_next_routed().is_none(), "{request:?}: second request read past its reply");
+        assert_eq!(read(&first, 3), [data_type, end_type, data_type], "{request:?}");
+    }
+    Ok(())
+}
+
+/// `all_open_orders` overlapping `open_orders` reads its own result set:
+/// both replies carry `OpenOrder` frames and `OpenOrderEnd`, and TWS sends
+/// the own-orders reply first.
+#[test]
+fn overlapping_open_orders_and_all_open_orders_read_own_result_sets() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
+    let (stream, bus) = make_bus();
+    let open_order = |order_id| {
+        binary_proto(
+            M::OpenOrder as i32,
+            &crate::proto::OpenOrder {
+                order_id: Some(order_id),
+                ..Default::default()
+            },
+        )
+    };
+    let end = || binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {});
+
+    let own = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
+    let all = bus.send_shared_request(OutgoingMessages::RequestAllOpenOrders, &[])?;
+    for frame in [open_order(1), end(), open_order(1), open_order(2), end()] {
+        stream.push_inbound(frame);
+        bus.dispatch()?;
+    }
+
+    let read = |sub: &InternalSubscription, count| -> Vec<(M, Option<i32>)> {
+        (0..count)
+            .map(|_| {
+                let message = sub.next_timeout(TICK).expect("reply cut short").unwrap();
+                (message.message_type(), message.order_id())
+            })
+            .collect()
+    };
+    assert_eq!(read(&own, 2), [(M::OpenOrder, Some(1)), (M::OpenOrderEnd, None)]);
+    assert_eq!(read(&all, 3), [(M::OpenOrder, Some(1)), (M::OpenOrder, Some(2)), (M::OpenOrderEnd, None)]);
+    assert!(all.try_next_routed().is_none(), "all_open_orders read past its reply");
+    Ok(())
+}
+
+/// A reset ends every unanswered request with its session: a request made
+/// after it reads the first reply that arrives.
+#[test]
+fn reset_forgets_unanswered_replies() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
+    let (stream, bus) = make_bus();
+
+    let _unanswered = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
+    bus.reset();
+    let after = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
+    stream.push_inbound(binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {}));
+    bus.dispatch()?;
+
+    let message = after.next_timeout(TICK).expect("request after the reset passed over its reply")?;
+    assert_eq!(message.message_type(), M::OpenOrderEnd);
+    Ok(())
+}
+
 /// The registered shared subscriptions matching `predicate`.
 fn shared_subscriber_count<S: Stream>(bus: &TcpMessageBus<S>, predicate: impl Fn(&SharedSubscriber) -> bool) -> usize {
-    bus.shared_channels.subscribers.lock().unwrap().iter().filter(|s| predicate(s)).count()
+    bus.shared_channels
+        .subscribers
+        .lock()
+        .unwrap()
+        .live
+        .iter()
+        .filter(|s| predicate(s))
+        .count()
 }
 
 /// Dropping a shared subscription removes its registration, so no response
@@ -1765,6 +1930,15 @@ fn dropped_shared_subscription_is_unregistered() -> Result<(), Error> {
     drop(sub);
     drain_cleanup_signals(&bus);
     assert_eq!(registered(&bus), 1, "dropped subscription still registered");
+
+    // TWS answers the dropped request first; the survivor passes over that
+    // reply.
+    stream.push_inbound(binary_proto(
+        crate::messages::IncomingMessages::OpenOrderEnd as i32,
+        &crate::proto::OpenOrdersEnd {},
+    ));
+    bus.dispatch()?;
+    assert!(survivor.try_next_routed().is_none(), "survivor read the dropped request's reply");
 
     // The survivor is the one still registered: every response type of the
     // mapping still delivers to it, once.
@@ -1840,11 +2014,14 @@ fn shared_subscription_cancel_notifies_and_unregisters() -> Result<(), Error> {
     assert_eq!(shared_subscriber_count(&bus, |_| true), 0, "cancelled subscription still registered");
 
     let later = bus.send_shared_request(OutgoingMessages::RequestPositions, &[])?;
-    stream.push_inbound(binary_proto(
-        crate::messages::IncomingMessages::PositionEnd as i32,
-        &crate::proto::PositionEnd {},
-    ));
-    bus.dispatch()?;
+    // TWS answers the cancelled request too; `later` passes over that reply.
+    for _ in 0..2 {
+        stream.push_inbound(binary_proto(
+            crate::messages::IncomingMessages::PositionEnd as i32,
+            &crate::proto::PositionEnd {},
+        ));
+        bus.dispatch()?;
+    }
 
     let resp = sub.next_timeout(TICK).expect("cancelled shared subscription got no notification");
     assert!(matches!(resp, Err(Error::Cancelled)), "{resp:?}");
@@ -3741,6 +3918,11 @@ fn failed_write_leaves_no_registration() {
         shared_subscriber_count(&bus, |_| true),
         0,
         "a failed write must leave no shared subscription registered"
+    );
+    assert_eq!(
+        bus.shared_channels.subscribers().unanswered.pending(IncomingMessages::PositionEnd),
+        0,
+        "a failed write must leave no request awaiting a reply"
     );
 }
 
