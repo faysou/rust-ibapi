@@ -82,6 +82,35 @@ fn insert_keeps_other_leases_and_replaces_the_same_lease() {
     assert_eq!(counts, [1, 0, 1]);
 }
 
+/// A route stays superseded once a later route under its key is removed: an
+/// error frame reaches it as a notice, and a lone route still gets the error.
+#[test]
+fn superseded_route_gets_errors_as_notices_after_the_newer_route_goes() {
+    let routes = SenderHash::new();
+    let (first, mut first_receiver, _first_lease) = route();
+    let (second, _second_receiver, second_lease) = route();
+    let (lone, mut lone_receiver, _lone_lease) = route();
+    routes.insert(OrderId::from(7), first);
+    routes.insert(OrderId::from(7), second);
+    routes.remove_if_same(OrderId::from(7), &second_lease.downgrade());
+    routes.insert(OrderId::from(8), lone);
+    let refusal = || RoutedItem::Error(Error::Notice(crate::Notice::synthesized(10148, "can not be cancelled".into())));
+
+    routes.deliver(&OrderId::from(7), refusal()).unwrap();
+    routes.deliver(&OrderId::from(8), refusal()).unwrap();
+
+    let first_items = items(&mut first_receiver);
+    let lone_items = items(&mut lone_receiver);
+    assert!(
+        matches!(first_items.as_slice(), [RoutedItem::Notice(n)] if n.code == 10148),
+        "{first_items:?}"
+    );
+    assert!(
+        matches!(lone_items.as_slice(), [RoutedItem::Error(Error::Notice(n))] if n.code == 10148),
+        "{lone_items:?}"
+    );
+}
+
 /// Removing one subscription's route leaves the others under the key.
 #[test]
 fn remove_if_same_keeps_the_other_routes_under_the_key() {

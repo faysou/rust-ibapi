@@ -89,7 +89,9 @@ sequenceDiagram
    (`place_order`, a modify, `cancel_order`) receives each of that order's frames once and yields
    the types its decoder declares, so a cancel or modify takes nothing from the subscription
    that placed the order. A TWS error on the order id ends only the newest subscription, whose
-   request drew it; the others receive it as a notice.
+   request it most likely answers. A subscription that another one was opened after receives it
+   as a notice, also once the later one is dropped. A modify sent with `submit_order` opens no
+   subscription, so its refusal ends the `place_order` subscription if that is the only one.
 
 ## Module Structure
 

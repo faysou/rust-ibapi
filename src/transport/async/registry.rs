@@ -31,6 +31,11 @@ pub(super) struct Route {
     pub(super) sender: BroadcastSender,
     pub(super) lease: LeaseRef,
     bound: Option<RouteBound>,
+    /// Another route was registered under this route's key after it, so an
+    /// error frame on the key may answer that later request: it reaches this
+    /// route as [`RoutedItem::for_earlier_subscription`], also once the later
+    /// route is gone.
+    superseded: bool,
 }
 
 #[derive(Debug)]
@@ -52,7 +57,12 @@ impl RouteBound {
 
 impl Route {
     pub(super) fn unbounded(sender: BroadcastSender, lease: LeaseRef) -> Self {
-        Self { sender, lease, bound: None }
+        Self {
+            sender,
+            lease,
+            bound: None,
+            superseded: false,
+        }
     }
 
     /// A bounded route's channel has one slot more than `bound.limit`, for the
@@ -69,6 +79,7 @@ impl Route {
             sender,
             lease,
             bound: Some(bound),
+            superseded: false,
         }
     }
 
@@ -131,13 +142,17 @@ impl<K: Hash + Eq + Display + Debug> SenderHash<K> {
         write_lock(&self.routes)
     }
 
-    /// Registers `route` under `id` beside the routes already there. A route
-    /// with the same lease is replaced, so one subscription never holds two
-    /// routes under a key and never receives a frame twice.
+    /// Registers `route` under `id` beside the routes already there, which
+    /// it supersedes. A route with the same lease is replaced, so one
+    /// subscription never holds two routes under a key and never receives a
+    /// frame twice.
     pub(super) fn insert(&self, id: K, route: Route) {
         let mut routes = self.write();
         let registered = routes.entry(id).or_default();
         registered.retain(|other| !other.lease.is(&route.lease));
+        for other in registered.iter_mut() {
+            other.superseded = true;
+        }
         registered.push(route);
     }
 
@@ -174,7 +189,8 @@ impl<K: Hash + Eq + Display + Debug> SenderHash<K> {
     }
 
     /// Deliver `item` to each of `id`'s routes and run `then` on each, all
-    /// under the read lock. Routes older than the newest receive
+    /// under the read lock. Superseded routes, every one but the newest and
+    /// the newest too once a later route was removed, receive
     /// [`RoutedItem::for_earlier_subscription`].
     fn deliver_then(&self, id: &K, item: RoutedItem, then: impl Fn(&Route)) -> Result<(), RoutedItem> {
         let routes = self.read();
@@ -185,6 +201,7 @@ impl<K: Hash + Eq + Display + Debug> SenderHash<K> {
             route.deliver(id, item.for_earlier_subscription());
             then(route);
         }
+        let item = if newest.superseded { item.for_earlier_subscription() } else { item };
         newest.deliver(id, item);
         then(newest);
         Ok(())

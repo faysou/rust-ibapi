@@ -105,7 +105,8 @@ impl Client {
     /// commission reports reach only the `place_order` subscription, since
     /// [`CancelOrder`] has no variant for them. A refused cancel (10147 for an
     /// unknown order, 10148 for a finished one) ends only this subscription;
-    /// the `place_order` subscription receives the error as a notice.
+    /// the `place_order` subscription receives the error as a notice, also when
+    /// this subscription is dropped before TWS answers.
     ///
     /// Sends an immediate cancel with default [`OrderCancel`] fields (no manual cancel
     /// time, operator ID or manual order indicator). To set any of them, use
@@ -412,9 +413,14 @@ impl Client {
     /// - sends nothing for a modify of a held order (`transmit` false); the modify that sets
     ///   `transmit` releases it with the new terms.
     ///
-    /// A refused modify leaves the order working. Its error ends only the modify's
-    /// subscription; this subscription and the order's other subscriptions receive the error
-    /// as a notice and keep receiving the order's events.
+    /// A refused modify leaves the order working. TWS sends its error on the order ID, which
+    /// does not say which request it answers, so the error ends only the newest subscription on
+    /// the ID. Every subscription opened on the ID before another one receives the error as a
+    /// notice and keeps receiving the order's events, also after the later subscription is
+    /// dropped. A modify sent with [`submit_order`](Self::submit_order) opens no subscription:
+    /// if this is the order's only subscription, a refusal of that modify ends it with the
+    /// error while the order goes on working. Send modifies with `place_order` to keep this
+    /// subscription open.
     ///
     /// # Arguments
     /// * `order_id` - ID for [`crate::orders::Order`]. Get next valid ID using [Client::next_order_id].
