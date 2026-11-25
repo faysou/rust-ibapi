@@ -28,6 +28,7 @@ pub mod sync;
 #[cfg(feature = "async")]
 pub mod r#async;
 
+pub(crate) mod farm_watch;
 pub(crate) mod order_taps;
 pub(crate) mod rate_limiter;
 
@@ -393,6 +394,10 @@ pub(crate) trait MessageBus: Send + Sync {
     /// was sent in: once they differ, the request died with an earlier
     /// session and a cancel would name an id the current session never saw.
     fn session_generation(&self) -> u64;
+
+    /// Historical-data farm state from the global notices, which
+    /// `Client::resubscribing` waits on after a 10182.
+    fn farm_watch(&self) -> &farm_watch::sync_impl::FarmWatch;
 }
 
 // InternalSubscription - handles receiving messages for sync subscriptions

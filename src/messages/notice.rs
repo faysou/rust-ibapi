@@ -92,6 +92,16 @@ pub(crate) const MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE: i32 = 10089;
 /// and sends that series (`docs/wire-facts/market-data.md#10299-whattoshow-substitution`).
 pub(crate) const WHAT_TO_SHOW_SUBSTITUTED_CODE: i32 = 10299;
 
+/// "Failed to request live updates (disconnected)." Ends a keep-up-to-date historical bar
+/// request when its HMDS farm breaks; TWS sends nothing more for it
+/// (`docs/wire-facts/market-data.md#streams-across-an-internet-outage`).
+pub(crate) const SUBSCRIPTION_DISCONNECTED_CODE: i32 = 10182;
+
+/// "No market data during competing live session". On a market data request TWS resumes
+/// ticks on the same request afterwards
+/// (`docs/wire-facts/market-data.md#streams-across-an-internet-outage`).
+pub(crate) const COMPETING_LIVE_SESSION_CODE: i32 = 10197;
+
 /// Range of error codes that are considered warnings: the whole `21xx` band.
 ///
 /// IB's published table stops at 2169, but the gateway keeps adding codes above

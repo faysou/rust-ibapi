@@ -1,0 +1,220 @@
+use std::time::Duration;
+
+use super::*;
+use crate::common::test_utils::helpers::test_notice;
+
+const USHMDS_BROKEN: (i32, &str) = (2105, "HMDS data farm connection is broken:ushmds");
+const CASHHMDS_BROKEN: (i32, &str) = (2105, "HMDS data farm connection is broken:cashhmds");
+const USHMDS_OK: (i32, &str) = (2106, "HMDS data farm connection is OK:ushmds");
+const CASHHMDS_OK: (i32, &str) = (2106, "HMDS data farm connection is OK:cashhmds");
+const USHMDS_INACTIVE: (i32, &str) = (2107, "HMDS data farm connection is inactive but should be available upon demand.ushmds");
+const JFARM_BROKEN: (i32, &str) = (2103, "Market data farm connection is broken:jfarm");
+const RESTORED: (i32, &str) = (
+    1102,
+    "Connectivity between IBKR and Trader Workstation has been restored - data maintained. All data farms are connected: cashhmds; ushmds.",
+);
+
+struct Case {
+    name: &'static str,
+    /// Notices before the mark.
+    before: &'static [(i32, &'static str)],
+    /// Notices after it.
+    after: &'static [(i32, &'static str)],
+    expected: Option<FarmRecovery>,
+}
+
+/// Notice sequences from the outage runs, and how a wait begun between them ends.
+const CASES: &[Case] = &[
+    Case {
+        name: "no farm broken: recovered at once",
+        before: &[],
+        after: &[],
+        expected: Some(FarmRecovery::Recovered),
+    },
+    Case {
+        name: "both HMDS farms broken: waits",
+        before: &[USHMDS_BROKEN, CASHHMDS_BROKEN],
+        after: &[],
+        expected: None,
+    },
+    Case {
+        name: "one of two HMDS farms back: still waits",
+        before: &[USHMDS_BROKEN, CASHHMDS_BROKEN],
+        after: &[USHMDS_OK],
+        expected: None,
+    },
+    Case {
+        name: "both HMDS farms back: recovered",
+        before: &[USHMDS_BROKEN, CASHHMDS_BROKEN],
+        after: &[USHMDS_OK, CASHHMDS_OK],
+        expected: Some(FarmRecovery::Recovered),
+    },
+    Case {
+        name: "OK before the mark counts",
+        before: &[USHMDS_BROKEN, USHMDS_OK],
+        after: &[],
+        expected: Some(FarmRecovery::Recovered),
+    },
+    Case {
+        name: "an inactive HMDS farm is not broken",
+        before: &[USHMDS_BROKEN],
+        after: &[USHMDS_INACTIVE],
+        expected: Some(FarmRecovery::Recovered),
+    },
+    Case {
+        name: "a broken market data farm is ignored",
+        before: &[JFARM_BROKEN],
+        after: &[],
+        expected: Some(FarmRecovery::Recovered),
+    },
+    Case {
+        name: "1102 ends the wait though no OK came",
+        before: &[USHMDS_BROKEN],
+        after: &[RESTORED],
+        expected: Some(FarmRecovery::Recovered),
+    },
+    Case {
+        name: "1102 before the mark does not",
+        before: &[USHMDS_BROKEN, RESTORED],
+        after: &[],
+        expected: None,
+    },
+];
+
+/// A wait that should still be blocked is given this long.
+const BLOCKED: Duration = Duration::from_millis(50);
+
+fn feed(observe: impl Fn(&Notice), notices: &[(i32, &str)]) {
+    for (code, message) in notices {
+        observe(&test_notice(*code, *message));
+    }
+}
+
+#[cfg(feature = "sync")]
+mod sync_tests {
+    use std::time::Instant;
+
+    use super::*;
+    use crate::transport::farm_watch::sync_impl::FarmWatch;
+
+    #[test]
+    fn wait_ends_per_notice_sequence() {
+        for case in CASES {
+            let watch = FarmWatch::default();
+            feed(|n| watch.observe(n), case.before);
+            let mark = watch.mark();
+            feed(|n| watch.observe(n), case.after);
+
+            let recovery = watch.wait(mark, Instant::now() + BLOCKED);
+            assert_eq!(recovery, case.expected.unwrap_or(FarmRecovery::TimedOut), "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn notice_wakes_a_blocked_waiter() {
+        let watch = FarmWatch::default();
+        feed(|n| watch.observe(n), &[USHMDS_BROKEN]);
+        let mark = watch.mark();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| watch.wait(mark, Instant::now() + Duration::from_secs(10)));
+            std::thread::sleep(BLOCKED);
+            assert!(!waiter.is_finished(), "returned while the farm was broken");
+            feed(|n| watch.observe(n), &[USHMDS_OK]);
+            assert_eq!(waiter.join().unwrap(), FarmRecovery::Recovered);
+        });
+    }
+
+    #[test]
+    fn reset_and_close_end_the_session() {
+        for end in [FarmWatch::reset as fn(&FarmWatch), FarmWatch::close] {
+            let watch = FarmWatch::default();
+            feed(|n| watch.observe(n), &[USHMDS_BROKEN]);
+            let mark = watch.mark();
+            std::thread::scope(|scope| {
+                let waiter = scope.spawn(|| watch.wait(mark, Instant::now() + Duration::from_secs(10)));
+                std::thread::sleep(BLOCKED);
+                end(&watch);
+                assert_eq!(waiter.join().unwrap(), FarmRecovery::SessionEnded);
+            });
+        }
+    }
+
+    /// The new session starts with no farm broken.
+    #[test]
+    fn reset_clears_broken_farms() {
+        let watch = FarmWatch::default();
+        feed(|n| watch.observe(n), &[USHMDS_BROKEN]);
+        watch.reset();
+        assert_eq!(watch.wait(watch.mark(), Instant::now()), FarmRecovery::Recovered);
+    }
+}
+
+#[cfg(feature = "async")]
+mod async_tests {
+    use tokio::time::Instant;
+
+    use super::*;
+    use crate::transport::farm_watch::async_impl::FarmWatch;
+
+    #[tokio::test]
+    async fn wait_ends_per_notice_sequence() {
+        for case in CASES {
+            let watch = FarmWatch::default();
+            feed(|n| watch.observe(n), case.before);
+            let mark = watch.mark();
+            feed(|n| watch.observe(n), case.after);
+
+            let recovery = watch.wait(mark, Instant::now() + BLOCKED).await;
+            assert_eq!(recovery, case.expected.unwrap_or(FarmRecovery::TimedOut), "{}", case.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn notice_wakes_a_blocked_waiter() {
+        let watch = FarmWatch::default();
+        feed(|n| watch.observe(n), &[USHMDS_BROKEN]);
+        let mark = watch.mark();
+        let waiter = watch.wait(mark, Instant::now() + Duration::from_secs(10));
+        tokio::pin!(waiter);
+        assert!(
+            tokio::time::timeout(BLOCKED, &mut waiter).await.is_err(),
+            "returned while the farm was broken"
+        );
+        feed(|n| watch.observe(n), &[USHMDS_OK]);
+        assert_eq!(waiter.await, FarmRecovery::Recovered);
+    }
+
+    #[tokio::test]
+    async fn reset_and_close_end_the_session() {
+        for end in [FarmWatch::reset as fn(&FarmWatch), FarmWatch::close] {
+            let watch = FarmWatch::default();
+            feed(|n| watch.observe(n), &[USHMDS_BROKEN]);
+            let mark = watch.mark();
+            let waiter = watch.wait(mark, Instant::now() + Duration::from_secs(10));
+            tokio::pin!(waiter);
+            assert!(tokio::time::timeout(BLOCKED, &mut waiter).await.is_err());
+            end(&watch);
+            assert_eq!(waiter.await, FarmRecovery::SessionEnded);
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_clears_broken_farms() {
+        let watch = FarmWatch::default();
+        feed(|n| watch.observe(n), &[USHMDS_BROKEN]);
+        watch.reset();
+        assert_eq!(watch.wait(watch.mark(), Instant::now()).await, FarmRecovery::Recovered);
+    }
+
+    /// A waiter dropped mid-wait leaves no receiver behind.
+    #[tokio::test]
+    async fn dropped_waiter_leaves_nothing() {
+        let watch = FarmWatch::default();
+        feed(|n| watch.observe(n), &[USHMDS_BROKEN]);
+        let mut waiter = Box::pin(watch.wait(watch.mark(), Instant::now() + Duration::from_secs(10)));
+        assert!(tokio::time::timeout(BLOCKED, &mut waiter).await.is_err());
+        assert_eq!(watch.waiters(), 1);
+        drop(waiter);
+        assert_eq!(watch.waiters(), 0);
+    }
+}

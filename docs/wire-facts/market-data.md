@@ -732,3 +732,29 @@ December future (HKFE), both with real-time permission.*
 - **Not probed:** the SEHK closing auction (08:00-08:10 UTC); RTH-only realtime bars;
   keep-up-to-date historical bars across the same break (historical requests went unanswered
   from 00:55 UTC that night, with no error, while market data kept working).
+
+### Streams across an internet outage
+
+*Live 2026-11-25 12:40-13:08 UTC (US pre-market, FX open), paper TWS, server 223; EUR.USD
+IDEALPRO; Wi-Fi off for 15 s, 2 min and 6 min; one client never cancelled or re-requested;
+#1300.*
+
+- `reqMktData`, tick-by-tick, depth and realtime bars resumed on the same request 0.5 to 1.5 s
+  before the 1102. A re-request at the last farm OK or the 1102 delivered 3.4 to 4.4 s later.
+- Realtime bars: TWS sent every missed 5-second bar on the original request in one burst (5, 30,
+  81 bars, no slot missing). A re-request delivers only new bars.
+- No tick-by-tick tick stamped more than 5 s before arrival; rate after restore was normal.
+- Depth: 317 arrived in the same millisecond as 2103 for `cashfarm`, at the loss. Rows resumed on
+  the same request with no second 317.
+- Keep-up-to-date bars: 10182 "Failed to request live updates (disconnected)." arrived in the
+  same millisecond as 2105 for `cashhmds`, after it, every run, every client (one also got 165).
+  No frame followed in 270 s, 389 s, 635 s. A new request after the restore returned a batch
+  covering every outage minute, 2.5 to 3.7 s after the 1102. `Client::resubscribing` reopens the
+  request once no HMDS farm reports broken.
+- 10197 "No market data during competing live session" does not end a market data request: drawn
+  51 s into the 6-minute outage on all clients; on the client that sent no cancel, ticks resumed
+  on the same id at restore (2233 to the end). Tick-by-tick, depth and realtime bars got no 10197.
+  A market data subscription yields it as a notice and keeps reading
+  (`TickTypes::error_continues_request`).
+- **Not probed:** 1101; stocks, futures, RTH; insert or update rows after restore; 10197 during a
+  real competing session.
