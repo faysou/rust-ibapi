@@ -420,10 +420,11 @@ with `override_natural_action`.*
   partially filled order.
 
 
-### Non-US orders outside the trading session
+### Non-US orders outside and during the trading session
 
-*Live 2026-11-24 22:03-22:17 UTC (SEHK, HKFE, TSE, OSE and KSE closed), paper TWS, server 223;
-non-marketable limit orders, each cancelled after 5 s.*
+*Live 2026-11-24 22:03-22:17 UTC (SEHK, HKFE, TSE, OSE and KSE closed) and 2026-11-24
+23:46 to 2026-11-25 04:07 UTC (in session and at lunch), paper TWS, server 223;
+non-marketable limit orders, each cancelled after 5 to 10 s.*
 
 | Order | Reply | Cancel |
 | ----- | ----- | ------ |
@@ -441,8 +442,20 @@ non-marketable limit orders, each cancelled after 5 s.*
 - The KSE order neither acknowledged nor cancelled promptly, like the
   [weekend ES cancel](#weekend-cancel-of-a-presubmitted-es-order-wedges-in-pendingcancel), and
   cleared without a terminal status reaching the probe.
-- **Not probed:** the same orders during a session or the lunch break (see below if recorded),
-  fills.
+- The same orders while the venue traded or was at lunch (2026-11-25, each cancelled after 10 s):
+
+  | Order | Session | Lunch break |
+  | ----- | ------- | ----------- |
+  | 700 SEHK BUY 100 LMT 320 (last 344) | 01:36 UTC: PreSubmitted, no 399 | 04:05: PreSubmitted, no 399 |
+  | HSI option `HSI25600L6` BUY 1 LMT 1 | 01:36: Submitted | 04:05: Submitted |
+  | HSI future BUY 1 LMT 20000 | not run (connection timed out) | 04:07: Submitted |
+  | 7203 SMART BUY 100 LMT 2000 | 00:01: PreSubmitted | 02:35: PreSubmitted; 03:35 after lunch: PreSubmitted |
+  | K200 future BUY 1 LMT 700; N225M future BUY 1 LMT 50000 | 23:46 (day session): Submitted, cancelled at once | |
+
+- No 399 came during a session or a lunch break. The SEHK and TSE stock orders stayed
+  PreSubmitted with an empty `why_held` while their venue traded, and 7203 had been Submitted at
+  22:03 when TSE was closed, so neither status tells whether the order is at the exchange.
+- **Not probed:** fills; marketable orders; orders during the SEHK closing auction.
 
 ### Auction orders on SEHK and TSE
 
