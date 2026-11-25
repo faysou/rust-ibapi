@@ -1180,3 +1180,25 @@ open one. Track which request a record came from instead.
 
 To read a completed record's status and quantities, use `OrderData::completed_order_status()`.
 A completed order's `order.total_quantity` is the quantity left unfilled, not the size ordered.
+
+### 49. `order_update_stream` yields a notice after a reconnect
+
+After each transport reconnect, once the new session is live, `order_update_stream` yields one
+`SubscriptionItem::Notice` with code `TRANSPORT_RECONNECT_CODE`. It marks the updates TWS sent
+during the outage, which it does not replay. Before, the stream gave no sign of the gap.
+
+The notice is client-synthesized and classifies as an error (`notice.is_error()` is `true`). A
+match that treats every error notice on this stream as an order rejection now sees it as one.
+Match the code first:
+
+```rust,ignore
+// 5.x
+SubscriptionItem::Notice(n) if n.is_error() => order_rejected(n),
+
+// 6.0
+SubscriptionItem::Notice(n) if n.code == TRANSPORT_RECONNECT_CODE => rebuild_order_state(),
+SubscriptionItem::Notice(n) if n.is_error() => order_rejected(n),
+```
+
+`iter_data()` and `filter_data()` drop notices, this one included. To rebuild order state, follow
+the recovery steps in the `order_update_stream` docs.
