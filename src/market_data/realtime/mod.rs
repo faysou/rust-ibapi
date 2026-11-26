@@ -70,7 +70,10 @@ impl StreamDecoder<TickBidAsk> for TickBidAsk {
 
     /// Live: after 200, 10189 or 10089 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        matches!(notice.code, NO_SECURITY_DEFINITION_CODE | TICK_BY_TICK_FAILED_CODE | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE)
+        matches!(
+            notice.code,
+            NO_SECURITY_DEFINITION_CODE | TICK_BY_TICK_FAILED_CODE | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE
+        )
     }
 }
 
@@ -91,7 +94,10 @@ impl StreamDecoder<TickMidpoint> for TickMidpoint {
 
     /// Live: after 200, 10189 or 10089 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        matches!(notice.code, NO_SECURITY_DEFINITION_CODE | TICK_BY_TICK_FAILED_CODE | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE)
+        matches!(
+            notice.code,
+            NO_SECURITY_DEFINITION_CODE | TICK_BY_TICK_FAILED_CODE | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE
+        )
     }
 }
 
@@ -187,10 +193,7 @@ impl StreamDecoder<Bar> for Bar {
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
         matches!(
             notice.code,
-            NO_SECURITY_DEFINITION_CODE
-                | MARKET_DATA_NOT_SUBSCRIBED_CODE
-                | REALTIME_QUERY_INVALID_CODE
-                | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE
+            NO_SECURITY_DEFINITION_CODE | MARKET_DATA_NOT_SUBSCRIBED_CODE | REALTIME_QUERY_INVALID_CODE | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE
         )
     }
 }
@@ -212,7 +215,10 @@ impl StreamDecoder<TickLast> for TickLast {
 
     /// Live: after 200, 10189 or 10089 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        matches!(notice.code, NO_SECURITY_DEFINITION_CODE | TICK_BY_TICK_FAILED_CODE | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE)
+        matches!(
+            notice.code,
+            NO_SECURITY_DEFINITION_CODE | TICK_BY_TICK_FAILED_CODE | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE
+        )
     }
 }
 
