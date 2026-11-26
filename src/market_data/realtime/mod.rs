@@ -18,7 +18,6 @@ use time::OffsetDateTime;
 
 use crate::common::error_helpers;
 use crate::contracts::{OptionComputation, SecurityType};
-use crate::market_data::common::decoders::BarTradeFields;
 use crate::messages::{
     IncomingMessages, Notice, ResponseMessage, COMPETING_LIVE_SESSION_CODE, MARKET_DATA_DELAYED_NOT_ENABLED_CODE, MARKET_DATA_NOT_SUBSCRIBED_CODE,
     MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE, MARKET_DEPTH_RESET_CODE, NO_SECURITY_DEFINITION_CODE, REALTIME_QUERY_INVALID_CODE,
@@ -104,7 +103,6 @@ impl StreamDecoder<TickMidpoint> for TickMidpoint {
 /// Represents a real-time bar with OHLCV data
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(from = "StoredBar")]
 pub struct Bar {
     /// The timestamp of the bar in market timezone
     pub date: OffsetDateTime,
@@ -127,35 +125,6 @@ pub struct Bar {
     /// Number of trades during the bar period. `None` when TWS sends none or `-1`, which it
     /// does on a MIDPOINT, BID or ASK bar; a quiet TRADES bar reports `Some(0)`.
     pub count: Option<i32>,
-}
-
-/// [`Bar`] as stored, read back through the decoder's rule for volume, WAP and count.
-#[derive(Deserialize)]
-struct StoredBar {
-    date: OffsetDateTime,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: Option<f64>,
-    wap: Option<f64>,
-    count: Option<i32>,
-}
-
-impl From<StoredBar> for Bar {
-    fn from(stored: StoredBar) -> Self {
-        let BarTradeFields { volume, wap, count } = BarTradeFields::new(stored.volume, stored.wap, stored.count);
-        Self {
-            date: stored.date,
-            open: stored.open,
-            high: stored.high,
-            low: stored.low,
-            close: stored.close,
-            volume,
-            wap,
-            count,
-        }
-    }
 }
 
 impl Default for Bar {

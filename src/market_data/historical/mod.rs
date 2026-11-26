@@ -27,7 +27,6 @@ use time::{Date, OffsetDateTime};
 use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
 use crate::contracts::SecurityType;
-use crate::market_data::common::decoders::BarTradeFields;
 use crate::messages::{
     IncomingMessages, Notice, ResponseMessage, HMDS_ERROR_CODE, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE, WHAT_TO_SHOW_SUBSTITUTED_CODE,
 };
@@ -175,7 +174,6 @@ impl From<OffsetDateTime> for BarTimestamp {
 /// Bar describes the historical data bar.
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, PartialEq, Copy, Serialize, Deserialize)]
-#[serde(from = "StoredBar")]
 pub struct Bar {
     /// The bar's timestamp — either a calendar date (daily+ bars) or a full
     /// datetime (intraday bars). See [`BarTimestamp`] for details.
@@ -202,35 +200,6 @@ pub struct Bar {
     /// [`WhatToShow::HistoricalVolatility`] and [`WhatToShow::OptionImpliedVolatility`] bars
     /// report `Some(0)`, which is not a trade count.
     pub count: Option<i32>,
-}
-
-/// [`Bar`] as stored, read back through the decoder's rule for volume, WAP and count.
-#[derive(Deserialize)]
-struct StoredBar {
-    date: BarTimestamp,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: Option<f64>,
-    wap: Option<f64>,
-    count: Option<i32>,
-}
-
-impl From<StoredBar> for Bar {
-    fn from(stored: StoredBar) -> Self {
-        let BarTradeFields { volume, wap, count } = BarTradeFields::new(stored.volume, stored.wap, stored.count);
-        Self {
-            date: stored.date,
-            open: stored.open,
-            high: stored.high,
-            low: stored.low,
-            close: stored.close,
-            volume,
-            wap,
-            count,
-        }
-    }
 }
 
 impl Default for Bar {

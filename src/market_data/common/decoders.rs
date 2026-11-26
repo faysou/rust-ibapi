@@ -56,21 +56,6 @@ pub(in crate::market_data) struct BarTradeFields {
 /// `-1` times the magnifier (`docs/wire-facts/market-data.md#bar-trade-fields-volume-wap-count`).
 const NO_TRADE_DATA: i32 = -1;
 
-impl BarTradeFields {
-    /// Applies [`decode_bar_trade_fields`]'s rule to values already read: volume and count are
-    /// `None` when `-1`, and WAP is `None` whenever volume is. Deserializing a `Bar` applies it
-    /// too, so a bar stored by 5.x with `-1` reads back as `None`.
-    pub(in crate::market_data) fn new(volume: Option<f64>, wap: Option<f64>, count: Option<i32>) -> Self {
-        // Exact compare: TWS sends the literal `"-1"`, which parses to exactly -1.0.
-        let volume = volume.filter(|&v| v != f64::from(NO_TRADE_DATA));
-        Self {
-            wap: wap.filter(|_| volume.is_some()),
-            volume,
-            count: count.filter(|&c| c != NO_TRADE_DATA),
-        }
-    }
-}
-
 /// Decodes the trade fields shared by realtime and historical bars, by value rather than by
 /// `WhatToShow`: ADJUSTED_LAST and AGGTRADES carry real trade values too.
 ///
@@ -78,12 +63,14 @@ impl BarTradeFields {
 /// `-1`; it is `None` whenever volume is. A TRADES bar in which nothing traded keeps
 /// `Some(0.0)` / `Some(0)`.
 pub(in crate::market_data) fn decode_bar_trade_fields(volume: Option<&str>, wap: Option<&str>, count: Option<i32>) -> Result<BarTradeFields, Error> {
-    let fields = BarTradeFields::new(parse_optional_decimal(volume)?, None, count);
-    let wap = match fields.volume {
+    // Exact compare: TWS sends the literal `"-1"`, which parses to exactly -1.0.
+    let volume = parse_optional_decimal(volume)?.filter(|&v| v != f64::from(NO_TRADE_DATA));
+    let wap = match volume {
         Some(_) => parse_optional_decimal(wap)?,
         None => None,
     };
-    Ok(BarTradeFields { wap, ..fields })
+    let count = count.filter(|&c| c != NO_TRADE_DATA);
+    Ok(BarTradeFields { volume, wap, count })
 }
 
 #[cfg(test)]
