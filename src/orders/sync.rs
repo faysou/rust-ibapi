@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use super::common::fill::{lookup_wait, FillTracker};
 use super::common::lookup::{recheck_delay, OrderKey};
-use super::common::{decoders, encoders, verify};
+use super::common::{decoders, encoders, linked, verify};
 use super::{
     ApiOnly, AutoBind, CancelOrder, ClientBound, ExecutionFilter, Executions, ExerciseOptionsBuilder, OrderBuilder, OrderCancel, OrderLookup,
     OrderOutcome, OrderStatus, OrderUpdate, Orders, PlaceOrder,
@@ -560,6 +560,74 @@ impl Client {
         }
 
         Ok(order_ids)
+    }
+
+    /// Submits orders that TWS must release together, such as a parent with its children:
+    /// only the last order transmits.
+    ///
+    /// Each order is sent under its own [`order_id`](crate::orders::Order::order_id), which the
+    /// caller sets, e.g. from [`next_order_id`](Self::next_order_id); a child names its parent
+    /// in [`parent_id`](crate::orders::Order::parent_id). The `transmit` flag of each order is
+    /// overwritten: `false` on all but the last, `true` on the last. TWS holds the earlier
+    /// orders until the last one arrives, then releases them all.
+    ///
+    /// Every order is checked before anything is sent. When a send fails part-way, the orders
+    /// already sent are held at TWS, listed nowhere, and stay held until cancelled, so this
+    /// cancels each of them before returning the error.
+    ///
+    /// # Errors
+    /// [`LinkedOrdersError`](crate::orders::LinkedOrdersError), whose
+    /// [`error`](crate::orders::LinkedOrdersError::error) is:
+    /// - [`Error::OrderIdInRequestRange`] or [`Error::InvalidArgument`], with nothing sent, for
+    ///   an order [`submit_order`](Self::submit_order) would reject;
+    /// - the send error, such as [`Error::ConnectionReset`], with the held orders sent before it
+    ///   and the outcome of cancelling each of them.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::client::blocking::Client;
+    /// use ibapi::contracts::Contract;
+    /// use ibapi::orders::builder::BracketPrices;
+    /// use ibapi::orders::{order_builder, Action};
+    ///
+    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
+    /// let contract = Contract::stock("AAPL").build();
+    ///
+    /// // Ids parent, parent + 1 and parent + 2; children carry `parent_id`.
+    /// let prices = BracketPrices { entry: 220.0, take_profit: 230.0, stop_loss: 210.0 };
+    /// let orders = order_builder::bracket_order(client.next_order_id(), Action::Buy, 100.0, prices).expect("invalid bracket");
+    /// let orders = orders.into_iter().map(|order| (contract.clone(), order)).collect();
+    ///
+    /// match client.submit_linked_orders(orders) {
+    ///     Ok(()) => println!("bracket transmitted"),
+    ///     Err(e) => {
+    ///         println!("{e}: sent {:?}, cancelled {:?}", e.sent, e.cancelled);
+    ///         for (order_id, error) in &e.cancel_failures {
+    ///             println!("order {order_id} may still be held: {error}");
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    // A failed multi-order submit is rare and dwarfed by its I/O; boxing would only cost callers a deref.
+    #[allow(clippy::result_large_err)]
+    pub fn submit_linked_orders(&self, orders: Vec<(Contract, crate::orders::Order)>) -> Result<(), crate::orders::LinkedOrdersError> {
+        let requests =
+            linked::encode_linked_orders(self.id_manager(), self.server_version(), orders).map_err(crate::orders::LinkedOrdersError::unsent)?;
+
+        let mut sent = Vec::with_capacity(requests.len());
+        for (order_id, request) in requests {
+            if let Err(error) = self.send_message(request) {
+                let mut failure = crate::orders::LinkedOrdersError::after_sends(error, sent);
+                for order_id in failure.sent.clone().into_iter().rev() {
+                    failure.record_cancel(order_id, self.cancel_order(order_id));
+                }
+                return Err(failure);
+            }
+            sent.push(order_id);
+        }
+
+        Ok(())
     }
 
     /// Creates a subscription stream for receiving real-time order updates.

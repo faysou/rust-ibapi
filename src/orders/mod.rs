@@ -1862,6 +1862,47 @@ pub enum CancelOrder {
     OrderStatus(OrderStatus),
 }
 
+/// A failed `submit_linked_orders`, or bracket `submit_all`, with what reached TWS.
+///
+/// Only the last order of a linked list transmits, so every order in [`sent`](Self::sent) was
+/// held at TWS when the failure happened. A held order shows up in no order listing, and it
+/// stays held, even across a disconnect, until cancelled. The submit therefore sends a cancel
+/// for each of them before returning this error. The orders after the one that failed were
+/// never sent.
+///
+/// To recover from a failed cancel, cancel the ids in
+/// [`cancel_failures`](Self::cancel_failures) again from the same client id, after a reconnect
+/// if needed: TWS answers the cancel of a held order with 202 "Order was discarded", and of an
+/// id it never received with 10147 (live: 2026-11-23, see
+/// `docs/wire-facts/orders.md#transmit-absent-means-held`).
+/// `?` converts this error into [`Error`](crate::Error), dropping the ids.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{error} ({} held orders sent, {} cancelled, {} cancels failed)",
+    .sent.len(),
+    .cancelled.len(),
+    .cancel_failures.len()
+)]
+pub struct LinkedOrdersError {
+    /// Why the submit failed: a check that failed before anything was sent, or the error of
+    /// the send that failed.
+    pub error: crate::Error,
+    /// The orders sent before the failure, in send order. Empty when nothing was sent.
+    pub sent: Vec<OrderId>,
+    /// The orders in `sent` a cancel was sent for, in the order sent: last order first. TWS
+    /// confirms each with 202.
+    pub cancelled: Vec<OrderId>,
+    /// The orders in `sent` whose cancel could not be sent, each with its error. These may
+    /// still be held at TWS.
+    pub cancel_failures: Vec<(OrderId, crate::Error)>,
+}
+
+impl From<LinkedOrdersError> for crate::Error {
+    fn from(error: LinkedOrdersError) -> Self {
+        error.error
+    }
+}
+
 /// Enumerates possible results from querying an [Order].
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Debug)]

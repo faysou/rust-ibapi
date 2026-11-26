@@ -74,6 +74,10 @@ pub(crate) struct MessageBusStub {
     reconnect_fails: bool,
     /// What `send_message` does after recording the message. See [`MessageBusStub::with_failing_sends`].
     send_mode: SendMode,
+    /// `send_message` calls so far, for [`SendMode::FailAfter`].
+    sends: AtomicUsize,
+    /// `send_order_request` fails. See [`MessageBusStub::with_failing_order_requests`].
+    order_requests_fail: bool,
     #[cfg(feature = "sync")]
     open_sync_senders: Mutex<Vec<channel::Sender<RoutedItem>>>,
     #[cfg(feature = "async")]
@@ -84,7 +88,8 @@ pub(crate) struct MessageBusStub {
 #[derive(Clone, Copy)]
 enum SendMode {
     Succeed,
-    Fail,
+    /// Succeed this many times, then fail.
+    FailAfter(usize),
     #[cfg(feature = "async")]
     Stall,
 }
@@ -121,6 +126,8 @@ impl Default for MessageBusStub {
             reconnect_delay: Duration::ZERO,
             reconnect_fails: false,
             send_mode: SendMode::Succeed,
+            sends: AtomicUsize::new(0),
+            order_requests_fail: false,
             #[cfg(feature = "sync")]
             open_sync_senders: Mutex::default(),
             #[cfg(feature = "async")]
@@ -202,9 +209,28 @@ impl MessageBusStub {
 
     /// Make each `send_message` fail with [`Error::ConnectionReset`] after
     /// recording it, as a write to a lost connection does.
-    pub fn with_failing_sends(mut self) -> Self {
-        self.send_mode = SendMode::Fail;
+    pub fn with_failing_sends(self) -> Self {
+        self.with_sends_failing_after(0)
+    }
+
+    /// Let the first `count` `send_message` calls succeed, then fail each later one as
+    /// [`Self::with_failing_sends`] does: a connection lost part-way through a series of sends.
+    pub fn with_sends_failing_after(mut self, count: usize) -> Self {
+        self.send_mode = SendMode::FailAfter(count);
         self
+    }
+
+    /// Make each order request (`send_order_request`, which `cancel_order` uses) fail with
+    /// [`Error::ConnectionReset`] after recording it.
+    pub fn with_failing_order_requests(mut self) -> Self {
+        self.order_requests_fail = true;
+        self
+    }
+
+    /// Whether this `send_message` call fails under [`SendMode::FailAfter`].
+    fn send_fails(&self) -> bool {
+        let earlier = self.sends.fetch_add(1, Ordering::SeqCst);
+        matches!(self.send_mode, SendMode::FailAfter(count) if earlier >= count)
     }
 
     /// Make each async `send_message` record its message, then never
@@ -319,15 +345,19 @@ impl MessageBus for MessageBusStub {
     }
 
     fn send_order_request(&self, order_id: OrderId, message: &[u8]) -> Result<InternalSubscription, Error> {
+        if self.order_requests_fail {
+            self.request_messages.write().unwrap().push(message.to_vec());
+            return Err(Error::ConnectionReset);
+        }
         Ok(mock_request(self, MockRoute::Order(order_id), message))
     }
 
     fn send_message(&self, message: &[u8]) -> Result<(), Error> {
         self.request_messages.write().unwrap().push(message.to_vec());
-        match self.send_mode {
-            SendMode::Fail => Err(Error::ConnectionReset),
-            _ => Ok(()),
+        if self.send_fails() {
+            return Err(Error::ConnectionReset);
         }
+        Ok(())
     }
 
     fn send_market_data_type(&self, message: &[u8]) -> Result<(), Error> {
@@ -477,6 +507,10 @@ impl AsyncMessageBus for MessageBusStub {
     }
 
     async fn send_order_request(&self, _order_id: OrderId, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
+        if self.order_requests_fail {
+            self.request_messages.write().unwrap().push(message);
+            return Err(Error::ConnectionReset);
+        }
         Ok(self.seeded_subscription(message))
     }
 
@@ -490,10 +524,12 @@ impl AsyncMessageBus for MessageBusStub {
 
     async fn send_message(&self, message: Vec<u8>) -> Result<(), Error> {
         self.request_messages.write().unwrap().push(message);
+        if self.send_fails() {
+            return Err(Error::ConnectionReset);
+        }
         match self.send_mode {
-            SendMode::Succeed => Ok(()),
-            SendMode::Fail => Err(Error::ConnectionReset),
             SendMode::Stall => std::future::pending().await,
+            _ => Ok(()),
         }
     }
 

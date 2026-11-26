@@ -2,8 +2,8 @@ use super::order_builder::{AttachedOrdersBuilder, BracketOrderBuilder, ClientBou
 use super::types::{AttachedOrderIds, BracketOrderIds};
 use crate::client::sync::Client;
 use crate::errors::Error;
-use crate::orders::OrderId;
 use crate::orders::PlaceOrder;
+use crate::orders::{LinkedOrdersError, OrderId};
 impl OrderBuilder<ClientBound<'_, Client>> {
     /// Submit the order synchronously
     /// Returns the order ID assigned to the submitted order
@@ -55,13 +55,22 @@ impl BracketOrderBuilder<'_, Client> {
     /// Submit bracket orders synchronously
     /// Returns BracketOrderIds containing all three order IDs
     ///
+    /// Reserves three consecutive order ids, then sends the parent and take-profit held and the
+    /// stop-loss with `transmit` set, which releases all three, through
+    /// [`Client::submit_linked_orders`]. When a send fails, the held orders already sent are
+    /// cancelled before the error returns.
+    ///
     /// # Errors
-    /// [`Error::Validation`] if the builder's inputs fail validation, before anything is sent;
+    /// [`LinkedOrdersError`] whose [`error`](LinkedOrdersError::error) is
+    /// [`Error::Validation`] if the builder's inputs fail validation, or
     /// [`Error::OrderIdInRequestRange`] if the client's next order id has reached 1,500,000,000
-    /// (reserved for request ids).
-    pub fn submit_all(self) -> Result<BracketOrderIds, Error> {
+    /// (reserved for request ids), both before anything is sent; or the send error, with the
+    /// orders sent and cancelled.
+    // A failed multi-order submit is rare and dwarfed by its I/O; boxing would only cost callers a deref.
+    #[allow(clippy::result_large_err)]
+    pub fn submit_all(self) -> Result<BracketOrderIds, LinkedOrdersError> {
         let ClientBound { client, contract } = self.parent_builder.target;
-        let orders = self.build()?;
+        let orders = self.build().map_err(|e| LinkedOrdersError::unsent(e.into()))?;
 
         // Reserve all order IDs upfront to prevent collisions
         let parent_id = client.next_order_id();
@@ -69,22 +78,18 @@ impl BracketOrderBuilder<'_, Client> {
         let sl_id = client.next_order_id();
         let reserved_ids = [parent_id, tp_id, sl_id];
 
-        for (i, mut order) in orders.into_iter().enumerate() {
-            let order_id = reserved_ids[i];
-            order.order_id = order_id;
-
-            // Update parent_id for child orders
-            if i > 0 {
-                order.parent_id = parent_id;
-            }
-
-            // Only transmit the last order
-            if i == 2 {
-                order.transmit = true;
-            }
-
-            client.submit_order(order_id, contract, &order)?;
-        }
+        let orders = orders
+            .into_iter()
+            .zip(reserved_ids)
+            .map(|(mut order, order_id)| {
+                order.order_id = order_id;
+                if order_id != parent_id {
+                    order.parent_id = parent_id;
+                }
+                (contract.clone(), order)
+            })
+            .collect();
+        client.submit_linked_orders(orders)?;
 
         Ok(BracketOrderIds::new(parent_id, tp_id, sl_id))
     }
