@@ -28,7 +28,8 @@ use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
 use crate::contracts::SecurityType;
 use crate::messages::{
-    IncomingMessages, Notice, ResponseMessage, HMDS_ERROR_CODE, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE, WHAT_TO_SHOW_SUBSTITUTED_CODE,
+    IncomingMessages, Notice, ResponseMessage, HMDS_ERROR_CODE, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE, SUBSCRIPTION_DISCONNECTED_CODE,
+    WHAT_TO_SHOW_SUBSTITUTED_CODE,
 };
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
@@ -667,10 +668,14 @@ impl StreamDecoder<HistoricalDataFrame> for HistoricalDataFrame {
     /// continue after one. Verified live for 162, 200 and 10314, where TWS
     /// answers a cancel with 366 (no query found). With it, only 200, 162 (no
     /// market data permissions, invalid step) or 321 (end date or source price
-    /// not supported with live updates), after which TWS answers the cancel
-    /// with 366.
+    /// not supported with live updates), or 10182 when the HMDS farm breaks,
+    /// after which TWS answers the cancel with 366.
     fn rejection_ends_request(notice: &Notice, context: &DecoderContext) -> bool {
-        !context.keep_up_to_date || matches!(notice.code, NO_SECURITY_DEFINITION_CODE | HMDS_ERROR_CODE | REQUEST_VALIDATION_CODE)
+        !context.keep_up_to_date
+            || matches!(
+                notice.code,
+                NO_SECURITY_DEFINITION_CODE | HMDS_ERROR_CODE | REQUEST_VALIDATION_CODE | SUBSCRIPTION_DISCONNECTED_CODE
+            )
     }
 
     /// Live: after 10299 TWS sends the bars of the series the error names

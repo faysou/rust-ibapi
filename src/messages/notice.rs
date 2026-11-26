@@ -97,8 +97,8 @@ pub(crate) const MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE: i32 = 10089;
 pub(crate) const WHAT_TO_SHOW_SUBSTITUTED_CODE: i32 = 10299;
 
 /// "Failed to request live updates (disconnected)." Ends a keep-up-to-date historical bar
-/// request when its HMDS farm breaks; TWS sends nothing more for it
-/// (`docs/wire-facts/market-data.md#streams-across-an-internet-outage`).
+/// request when its HMDS farm breaks; TWS sends nothing more for it and answers a cancel
+/// with 366 (`docs/wire-facts/market-data.md#streams-across-an-internet-outage`).
 pub(crate) const SUBSCRIPTION_DISCONNECTED_CODE: i32 = 10182;
 
 /// "No market data during competing live session". On a market data request TWS resumes

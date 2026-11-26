@@ -83,7 +83,6 @@ fn bar_default_is_zero_at_epoch() {
     assert_eq!((volume, wap, count), (None, None, None));
 }
 
-
 #[test]
 fn what_to_show_trades_for_security_type() {
     let cases = [

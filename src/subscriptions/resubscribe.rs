@@ -19,7 +19,9 @@ use crate::transport::farm_watch::{FarmMark, FarmRecovery};
 /// while the farm is still down got no frame and no error live, and whether
 /// TWS answers it once the farm is back is unknown, so the reopened stream
 /// is reopened once more when TWS confirms the farms back before its first
-/// bar. Live, the farm came back 2 s to 6 min after the 10182, with the outage.
+/// bar. Live, the farm came back 2 s to 19 min 41 s after the 10182, with the
+/// outage; in the longest run the reopen at this limit got no answer and the
+/// second reopen, at the farm's OK, delivered the whole outage.
 const FARM_RECOVERY_LIMIT: Duration = Duration::from_secs(15 * 60);
 
 /// Stream item types that are safe to resubscribe after a reconnect.

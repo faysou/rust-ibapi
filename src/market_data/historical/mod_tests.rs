@@ -384,7 +384,6 @@ fn bar_default_is_zero_at_epoch_with_no_trade_data() {
     assert_eq!((volume, wap, count), (None, None, None));
 }
 
-
 #[test]
 fn what_to_show_trades_for_security_type() {
     let cases = [

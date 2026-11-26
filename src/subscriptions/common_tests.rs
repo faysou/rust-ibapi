@@ -263,7 +263,7 @@ fn rejection_ends_request_only_for_verified_codes() {
         case(
             "HistoricalDataFrame, keep_up_to_date",
             |code| rejection_ends_with::<HistoricalDataFrame>(code, &DecoderContext::default().with_keep_up_to_date(true)),
-            &[200, 162, 321],
+            &[200, 162, 321, 10182],
             10197,
         ),
         case("PnL", rejection_ends::<PnL>, &[321], 200),
@@ -331,8 +331,8 @@ fn error_continues_request_only_for_10197_on_market_data() {
     use crate::market_data::historical::HistoricalDataFrame;
     use crate::market_data::realtime::{Bar, MarketDepths, TickBidAsk, TickLast, TickMidpoint, TickTypes};
 
-    type Hook = fn(&Notice) -> bool;
-    let continues = |hook: Hook, code| hook(&Notice::synthesized(code, String::new()));
+    type Hook = fn(&Notice, &DecoderContext) -> bool;
+    let continues = |hook: Hook, code| hook(&Notice::synthesized(code, String::new()), &DecoderContext::default());
     assert!(continues(TickTypes::error_continues_request, 10197));
     assert!(!continues(TickTypes::error_continues_request, 200));
     let siblings: [(&str, Hook); 6] = [
