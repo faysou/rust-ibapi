@@ -122,3 +122,15 @@ Positions, PnL and account updates by model. End-marker behavior for account str
 - **Not probed:** updates for the subscribed account after the other-account request (the
   account has no second account to switch to, and no change happened in the window), an FA
   account, RTH.
+
+### Account streams across an internet outage
+
+*Live 2026-11-25, paper TWS, server 223; Wi-Fi off for 15 s, 2 min and 6 min; #1300.*
+
+- Account summary, positions and PnL resumed on the same subscription with no action. Positions
+  re-sent the 4 open positions, no `PositionEnd`, 2.0 to 3.3 s before the 1102; account summary
+  pushed 0.1 to 1.9 s after it.
+- PnL pushed twice during the 6-minute outage. At restore one client's stream carried one value
+  far off (unrealized -63,090 between values near -86,000); a `reqPnL` sent at restore first
+  answered all zeros.
+- **Not probed:** `reqAccountUpdates`, model variants.

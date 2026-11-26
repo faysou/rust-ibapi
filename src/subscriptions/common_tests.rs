@@ -323,3 +323,27 @@ fn error_continues_request_only_for_10299_on_historical_bars() {
     assert!(!continues(HistoricalDataFrame::error_continues_request, 162));
     assert!(!continues(TickTypes::error_continues_request, 10299));
 }
+
+/// Only market data reads on after 10197: TWS resumes its ticks. Another terminal
+/// code still ends it, and the decoders sharing the market-data path still end on 10197.
+#[test]
+fn error_continues_request_only_for_10197_on_market_data() {
+    use crate::market_data::historical::HistoricalDataFrame;
+    use crate::market_data::realtime::{Bar, MarketDepths, TickBidAsk, TickLast, TickMidpoint, TickTypes};
+
+    type Hook = fn(&Notice) -> bool;
+    let continues = |hook: Hook, code| hook(&Notice::synthesized(code, String::new()));
+    assert!(continues(TickTypes::error_continues_request, 10197));
+    assert!(!continues(TickTypes::error_continues_request, 200));
+    let siblings: [(&str, Hook); 6] = [
+        ("Bar", Bar::error_continues_request),
+        ("TickLast", TickLast::error_continues_request),
+        ("TickBidAsk", TickBidAsk::error_continues_request),
+        ("TickMidpoint", TickMidpoint::error_continues_request),
+        ("MarketDepths", MarketDepths::error_continues_request),
+        ("HistoricalDataFrame", HistoricalDataFrame::error_continues_request),
+    ];
+    for (decoder, hook) in siblings {
+        assert!(!continues(hook, 10197), "{decoder} must still end on 10197");
+    }
+}

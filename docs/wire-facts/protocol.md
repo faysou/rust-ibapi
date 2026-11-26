@@ -68,9 +68,11 @@ the cancel; types whose code is verified here now skip it, so the reply no longe
   no error, so no terminal error could be provoked.
 - 10314 came from a 1975 end date (IB rejects that old a date), not a format problem.
 - Skipping the cancel is opt-in per verified code (`StreamDecoder::rejection_ends_request`). A
-  global skip was rejected: a code we treat as terminal may not end the request at TWS (10197
-  market data, 10299 below), and skipping would leak TWS resources.
-- **Not probed:** 354 and 10168 on market data during RTH; 10197; market depth 354 on a stock.
+  global skip was rejected: a code we treat as terminal may not end the request at TWS (10299
+  below), and skipping would leak TWS resources. 10197 does not end a market data request at
+  all; see [Streams across an internet outage](market-data.md#streams-across-an-internet-outage).
+- **Not probed:** 354 and 10168 on market data during RTH; the cancel reply after 10197 and after
+  10182; market depth 354 on a stock.
 
 ### Cancel after a rejected keepUpToDate historical request
 
@@ -96,8 +98,10 @@ the cancel; types whose code is verified here now skip it, so the reply no longe
   `TRADES`, whose bars came without a permission error and then no update or error for 12 to
   45 s.
 - `HistoricalDataFrame::rejection_ends_request` matches 200, 162 and 321 by code under `keep_up_to_date`.
-- **Not probed:** 354 and 10182 on a historical request (neither could be provoked: no
-  contract tried drew 354, and no HMDS farm disconnect happened), pacing-violation 162, and RTH.
+- **Not probed:** 354 on a historical request (no contract tried drew it); the cancel reply
+  after 10182, which only the internet outage runs drew
+  ([Streams across an internet outage](market-data.md#streams-across-an-internet-outage));
+  pacing-violation 162, and RTH.
 
 ### Cancel after a request TWS finished
 
@@ -119,8 +123,9 @@ the cancel; types whose code is verified here now skip it, so the reply no longe
   market data requires additional subscription for API ... Delayed market data is available",
   then nothing for 12-15 s: no ticks, no TickSnapshotEnd. A cancel afterwards drew 300 every
   time, so TWS had already ended the request.
-- The client classifies 10089 as a data advisory (`DATA_ADVISORY_CODES`), so the stream stays
-  open and its drop still sends the cancel.
+- The client ends the stream on 10089 and sends no cancel; the full sweep is in
+  [market data type and permission notices](market-data.md#market-data-type-and-permission-notices)
+  (#1297).
 - With market data type delayed (3) or delayed-frozen (4), the same requests drew 10167 and
   delayed ticks; frozen (2) drew 10168.
 - **Not probed:** RTH, and an account with delayed data enabled for the API.
@@ -135,7 +140,10 @@ the cancel; types whose code is verified here now skip it, so the reply no longe
 - With `keepUpToDate` (`stream()`), TWS sent the bars after the 10299 and kept sending updates
   every ~5 s. A cancel sent right after the 10299 drew 366 "No historical data query found",
   and the updates kept coming for the 37 s left in the session.
-- The client ends the stream on the 10299, so those frames reach no recipient.
+- Clients before #1298 ended the stream on the 10299, so those frames reached no recipient. Bar
+  requests now yield it as a notice and read on
+  ([10299 substitution](market-data.md#10299-whattoshow-substitution)); historical ticks still
+  end on it.
 - historical_ticks TRADES on BTC drew the same 10299 and no ticks afterwards.
 - **Not probed:** whether a later cancel stops the updates.
 
@@ -210,9 +218,10 @@ connectivity flaps; #1209 (`FARM_CODES`, `Notice::data_farm` in `src/messages/no
   available upon demand.cashfarm`, about 2.5 min after the cashfarm quote was cancelled. It
   arrived as two identical frames (both in the raw capture, so TWS sends it twice).
   `Notice::data_farm` parsed every notice above to the right kind, status and name.
+- TWS server 223 also sends the broken codes 2103, 2105 and 2157, seen in the 2026-11-25 outage
+  runs (see [Internet outage: notices and timing](#internet-outage-notices-and-timing)).
 - **Not probed:** 2107 (HMDS inactive): `ushmds` stayed up through 30 min idle after one
-  head-timestamp request. Non-OK codes on TWS (only Gateway showed them), and farms other than
-  those named above.
+  head-timestamp request. Farms other than those named above.
 
 ### A TWS stall leaves historical, contract-detail and completed-order requests unanswered
 
@@ -240,3 +249,42 @@ connectivity flaps; #1209 (`FARM_CODES`, `Notice::data_farm` in `src/messages/no
   service stopped, but other clients on the same TWS ran their own requests.
 - **Not probed:** the cause; IB Gateway; whether a reconnect of every client, short of a restart,
   clears it.
+
+### Internet outage: notices and timing
+
+*Live 2026-11-25 12:40-13:08 UTC (US pre-market, FX open), paper TWS, server 223; Wi-Fi off for
+15 s, 2 min and 6 min, four API clients connected; #1300.*
+
+- The API socket stayed up in all three runs: no transport reconnect, no connection-lost error.
+- Loss: 1100 and broken-farm notices (2103, 2105, 2157) for every connected farm; no 2110. 1100
+  came 17.5 s (as Wi-Fi returned), 36.5 s and 131.5 s after the cut; the first broken notice
+  17.5 s, 50.3 s and 44.3 s. In the 6-minute run broken notices came 87 s before the 1100.
+- With the 1100, TWS sent 1104 "Pending to create 1 orders: <order id>" to the client that had
+  placed an order during the outage.
+- Some farms went to 2108 instead of, or after, broken. jfarm went broken, then 2108, and got no
+  2104.
+- Restore order, every run: in the 2- and 6-minute runs a second 1100 23.7 s and 31.2 s after the
+  network returned; then OKs for every farm within 1.3 to 2.1 s, including farms never reported
+  broken; then 1102, 0.7 to 2.1 s after the first OK and 6.4 s, 28.5 s and 35.4 s after the
+  network. Both HMDS OKs (2106 `ushmds`, `cashhmds`) came before the 1102.
+- The 1102 farm list named 11, 8 and 6 farms while 11, 12 and 12 sent an OK. Do not parse it.
+- Farm notices arrived only with request id -1.
+- Streaming requests sent during the outage got no frame and no error, for up to 354 s.
+- `Client::resubscribing` waits for the HMDS OKs after a 10182 (`src/transport/farm_watch.rs`).
+- `Client::resubscribing` reopens a stream on 1101, cancel first, on IB's documented rule alone.
+- **Not probed:** 1101, so also whether TWS answers a cancel for a request opened before a 1101
+  (with 300, or at all) and whether such a request resumes on its own; an outage that drops the
+  API socket; a router uplink cut; a TWS daily restart; IB Gateway.
+
+### Requests held during an internet outage
+
+*Live 2026-11-25, paper TWS, server 223; same runs.*
+
+- Historical bar requests sent during the outage were answered 0.4 to 0.5 s after the 1102
+  (waits up to 146 s). Each reply ended at the minute the request was sent.
+- `reqOpenOrders` sent 65 s in (after the 1100) was answered 82.6 s later. Before TWS noticed the
+  outage it was answered at once.
+- `reqPositions` sent 65 s in drew 2151 "Positions info is not available yet." with request id
+  -1 and then nothing, also after the restore (open 323 s). Sent 0.1 s after the network
+  returned, it got 4 positions and `PositionEnd` where other requests got 11 to 14.
+- **Not probed:** contract details, completed orders.

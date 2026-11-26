@@ -1244,3 +1244,15 @@ money) BUY 1 LMT 0.05.*
   same order with `tif` DAY drew 201 "The crypto buy order must be Minutes or IOC." instead.
 - `completed_orders` lists the rejected order with `tif` `Minutes`.
 - **Not probed:** the 5-minute cancel of an unfilled `Minutes` order (needs crypto permission).
+### Orders during an internet outage
+
+*Live 2026-11-25, paper TWS, server 223; AAPL BUY 1 LMT 1.00 resting PreSubmitted; Wi-Fi off 15 s
+and 2 min; orders placed 5 s after the cut, before TWS reported the loss; #1300.*
+
+- A resting order stayed PreSubmitted. At the 6-minute restore TWS re-sent `openOrder` and
+  `orderStatus` for every open order 2 s before the 1102, unrequested.
+- An order placed during the outage got ApiPending; with the 1100 TWS sent 1104 "Pending to
+  create 1 orders: <id>". TWS never created it: no status, no error, absent from
+  `reqOpenOrders`, and a later cancel drew 10147 "not found". 2 of 2 runs.
+- A cancel sent 5 s later returned ApiCancelled within 1 ms.
+- **Not probed:** an order placed after the 1100; a fill during the outage; IB Gateway.

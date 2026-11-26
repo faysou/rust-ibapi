@@ -329,7 +329,7 @@ pub(crate) trait StreamDecoder<T> {
     /// data line, a scanner slot). Default: `false`, the cancel is written.
     ///
     /// Match the codes verified live, not every error: an unverified terminal
-    /// code (10197 on market data) must keep its cancel. A
+    /// code must keep its cancel. A
     /// one-shot query with nothing to continue (`HistoricalDataFrame` without
     /// `keep_up_to_date`) may accept any error.
     ///
@@ -342,7 +342,7 @@ pub(crate) trait StreamDecoder<T> {
     /// Whether TWS goes on serving the request after this error, so the
     /// subscription yields it as a `SubscriptionItem::Notice` and keeps reading
     /// instead of ending. Opt in only where wire-verified that data follows the
-    /// error (10299 on historical bars). Default: `false`, the error ends the
+    /// error (10299 on historical bars, 10197 on market data). Default: `false`, the error ends the
     /// stream.
     fn error_continues_request(_notice: &Notice) -> bool {
         false
