@@ -1408,3 +1408,14 @@ sent. `Notice::category()` returns `NoticeCategory::Error` for it, `is_informati
 10089 should instead set a delayed market data type (`switch_market_data_type`); TWS then sends
 10167, which stays an advisory, before the delayed ticks.
 
+
+### 57. `TimeInForce` gains `Minutes`
+
+IB uses the time in force `Minutes` for cryptocurrency limit orders on PAXOS: an unfilled order
+is cancelled after 5 minutes. 5.x decoded it as `TimeInForce::Unknown("Minutes")`. It is now
+`TimeInForce::Minutes`, set by `OrderBuilder::minutes()`, and it encodes back to `Minutes`.
+
+The compiler finds an exhaustive `match` on `TimeInForce` that lacks the new arm. It doesn't catch
+a comparison or match against `Unknown("Minutes")`: that code still compiles and no longer
+matches. Serialized, `TimeInForce` is the wire string, so an `Order` with it writes `"Minutes"`
+and reads back as the new variant.
