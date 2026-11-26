@@ -509,6 +509,32 @@ subscription (which ended on it) and `order_update_stream`, and came with no sta
 - A filled or cancelled order drew 10148, never 161.
 - **Not probed:** a cancel of a partly filled order, or one sent while a fill is in flight.
 
+### Orders TWS names in 1104
+
+*Live 2026-11-25 and 2026-11-26 (US pre-market, FX open), paper TWS, server 223; internet cut
+for 15 s, 2 min, 20 min (Wi-Fi) and 2 min (router uplink); AAPL BUY 1 LMT 1.00; #1300.*
+
+- With the 1100, TWS sent 1104 with request id -1, listing the orders it had not created, and a
+  second 1104 1 s later as the list grew. Run of 2026-11-26, 20 minutes:
+
+  ```text
+  12:00:53.861 status order 55 ApiPending filled 0 remaining 1
+  12:01:12.622 NOTICE code=1104 req=None msg="Pending to create 1 orders: 55"
+  12:01:13.627 NOTICE code=1104 req=None msg="Pending to create 2 orders: 55, 57"
+  12:01:14.621 NOTICE code=200 req=Some(57) msg="No security definition has been found for the request"
+  12:27:13.069 [10147] OrderId 55 that needs to be cancelled is not found.
+  ```
+
+- An order placed after the cut and before the 1100 (55, 60) was never created, also after
+  the 1102: no status after ApiPending, no error, absent from every open-orders reply (25 in
+  the 20-minute run), and a cancel at the end drew 10147. 4 of 4 runs.
+- An order placed 1.0 s after the 1100 (57, 62) was named in the second 1104, then rejected
+  with 200 on its order id, 1.0 s and 21.0 s after it was placed.
+- The ids follow `": "` and are separated by `", "`.
+- `Notice::pending_order_ids` reads the ids.
+- **Not probed:** a 1104 without a 1100; an outage that ends in 1101; a named order TWS creates
+  later; IB Gateway; live accounts.
+
 ### Cash quantity
 
 *Live 2026-11-23 23:18-23:20Z, paper TWS, server 223; EUR.USD on IDEALPRO and AAPL on SMART.*
