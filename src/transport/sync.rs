@@ -20,6 +20,7 @@ use crate::connection::common::STARTUP_STALL;
 use crate::connection::sync::Connection;
 
 use super::common::{lock, log_orphan, read_lock, report_unroutable_frame, validate_frame_length, write_lock, Lease, LeaseRef, LiveExecutions};
+use super::farm_watch::sync_impl::FarmWatch;
 use super::order_taps::{NewTap, OrderTaps};
 use super::rate_limiter::RateLimiter;
 use super::raw_capture::RawFrameTap;
@@ -186,19 +187,21 @@ impl SharedChannels {
     // write so the count and the wire agree, and the registration comes
     // under it, before the write, so no response can arrive ahead of it and
     // unanswered requests are counted in wire order. `account` is the
-    // account-updates account, checked before anything is registered.
+    // account-updates account, checked before anything is registered;
+    // `write` is told whether that account's updates are live already.
     fn subscribe(
         &self,
         message_type: OutgoingMessages,
         account: Option<&AccountId>,
         sender: Sender<RoutedItem>,
         lease: LeaseRef,
-        write: impl FnOnce() -> Result<(), Error>,
+        write: impl FnOnce(bool) -> Result<(), Error>,
     ) -> Result<SharedTicket, Error> {
         let mut counts = lock(&self.counts);
         counts.check_account_updates(account)?;
         self.add(message_type, sender, lease.clone());
-        if let Err(e) = write() {
+        let live = account.is_some_and(|account| counts.is_account_updates_live(account));
+        if let Err(e) = write(live) {
             self.remove(&lease);
             self.subscribers().unanswered.withdraw(message_type);
             return Err(e);
@@ -300,6 +303,8 @@ impl SharedChannels {
 pub(crate) struct NoticeBroadcaster {
     /// `None` once closed.
     senders: Mutex<Option<Vec<Sender<Notice>>>>,
+    /// Fed every notice before the fan-out; reset by the bus on a transport drop.
+    pub(crate) farms: FarmWatch,
 }
 
 impl super::common::NoticeSink for NoticeBroadcaster {
@@ -312,6 +317,7 @@ impl NoticeBroadcaster {
     pub(crate) fn new() -> Self {
         Self {
             senders: Mutex::new(Some(Vec::new())),
+            farms: FarmWatch::default(),
         }
     }
 
@@ -326,6 +332,7 @@ impl NoticeBroadcaster {
     }
 
     pub(crate) fn broadcast(&self, notice: Notice) {
+        self.farms.observe(&notice);
         if let Some(senders) = lock(&self.senders).as_mut() {
             senders.retain(|s| {
                 let sent = s.send(notice.clone()).is_ok();
@@ -341,6 +348,7 @@ impl NoticeBroadcaster {
     /// every later subscription on arrival.
     pub(crate) fn close(&self) {
         *lock(&self.senders) = None;
+        self.farms.close();
     }
 }
 
@@ -546,6 +554,7 @@ impl<S: Stream> TcpMessageBus<S> {
         self.executions_requested.clear();
         self.live_executions.clear();
         self.order_taps.reset();
+        self.connection.notice_broadcaster.farms.reset();
     }
 
     // The three cleanup handlers below remove a registration only when it
@@ -1005,7 +1014,15 @@ impl<S: Stream> TcpMessageBus<S> {
 
     // Registers a subscription of `message_type` and writes its request;
     // `account` for account updates (see `SharedCounts`).
-    fn send_shared(&self, message_type: OutgoingMessages, account: Option<&AccountId>, message: &[u8]) -> Result<InternalSubscription, Error> {
+    // `unsubscribe` goes out ahead of `message` when `account`'s updates are
+    // live already; see `MessageBus::send_account_updates_request`.
+    fn send_shared(
+        &self,
+        message_type: OutgoingMessages,
+        account: Option<&AccountId>,
+        message: &[u8],
+        unsubscribe: Option<&[u8]>,
+    ) -> Result<InternalSubscription, Error> {
         // See `open_request`.
         let session = self.session_generation();
         self.ensure_connected()?;
@@ -1014,10 +1031,19 @@ impl<S: Stream> TcpMessageBus<S> {
         // a failed write takes the registration with it.
         let (sender, receiver) = channel::unbounded();
         let lease = Lease::new();
+        if let Some(unsubscribe) = unsubscribe {
+            self.throttle(unsubscribe);
+        }
         self.throttle(message);
+        let write = |live: bool| {
+            if let Some(unsubscribe) = unsubscribe.filter(|_| live) {
+                self.write_now(unsubscribe)?;
+            }
+            self.write_now(message)
+        };
         let ticket = self
             .shared_channels
-            .subscribe(message_type, account, sender.clone(), lease.downgrade(), || self.write_now(message))?;
+            .subscribe(message_type, account, sender.clone(), lease.downgrade(), write)?;
 
         // The lease is the drop signal's identity: `Signal::Shared` removes
         // exactly this registration.
@@ -1111,11 +1137,11 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
     }
 
     fn send_shared_request(&self, message_type: OutgoingMessages, message: &[u8]) -> Result<InternalSubscription, Error> {
-        self.send_shared(message_type, None, message)
+        self.send_shared(message_type, None, message, None)
     }
 
-    fn send_account_updates_request(&self, account: &AccountId, message: &[u8]) -> Result<InternalSubscription, Error> {
-        self.send_shared(OutgoingMessages::RequestAccountData, Some(account), message)
+    fn send_account_updates_request(&self, account: &AccountId, message: &[u8], unsubscribe: &[u8]) -> Result<InternalSubscription, Error> {
+        self.send_shared(OutgoingMessages::RequestAccountData, Some(account), message, Some(unsubscribe))
     }
 
     fn cancel_shared_subscription(&self, ticket: SharedTicket, message: Option<&[u8]>) -> Result<(), Error> {
@@ -1147,6 +1173,10 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
 
     fn session_generation(&self) -> u64 {
         self.session_generation.load(Ordering::Acquire)
+    }
+
+    fn farm_watch(&self) -> &FarmWatch {
+        &self.connection.notice_broadcaster.farms
     }
 }
 

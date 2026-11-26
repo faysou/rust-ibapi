@@ -30,6 +30,7 @@ use tokio::task;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 
+use super::farm_watch::async_impl::FarmWatch;
 use crate::accounts::types::AccountId;
 use crate::client::handshake_state::HandshakeState;
 use crate::client::ids::{OrderId, RequestId, WireId};
@@ -112,6 +113,8 @@ impl ChannelClass {
 pub(crate) struct NoticeBroadcaster {
     /// `None` once closed.
     sender: std::sync::Mutex<Option<broadcast::Sender<Notice>>>,
+    /// Fed every notice before the fan-out; reset by the bus on a transport drop.
+    pub(crate) farms: FarmWatch,
 }
 
 impl super::common::NoticeSink for NoticeBroadcaster {
@@ -124,6 +127,7 @@ impl NoticeBroadcaster {
     pub(crate) fn new(sender: broadcast::Sender<Notice>) -> Self {
         Self {
             sender: std::sync::Mutex::new(Some(sender)),
+            farms: FarmWatch::default(),
         }
     }
 
@@ -137,6 +141,7 @@ impl NoticeBroadcaster {
     }
 
     pub(crate) fn broadcast(&self, notice: Notice) {
+        self.farms.observe(&notice);
         if let Some(sender) = lock(&self.sender).as_ref() {
             let _ = sender.send(notice);
         }
@@ -146,6 +151,7 @@ impl NoticeBroadcaster {
     /// every later subscription on arrival.
     pub(crate) fn close(&self) {
         *lock(&self.sender) = None;
+        self.farms.close();
     }
 }
 
@@ -211,8 +217,16 @@ pub trait AsyncMessageBus: Send + Sync {
     async fn send_shared_request(&self, message_type: OutgoingMessages, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error>;
 
     /// `send_shared_request` for `RequestAccountData`, refused with
-    /// `Error::AccountUpdatesInUse` while another account is live.
-    async fn send_account_updates_request(&self, account: &AccountId, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error>;
+    /// `Error::AccountUpdatesInUse` while another account is live. While
+    /// `account` is live already, writes `unsubscribe` ahead of `message`:
+    /// TWS answers a repeated subscribe with nothing, but an unsubscribe and
+    /// subscribe with the full initial dump, which reaches every subscription.
+    async fn send_account_updates_request(
+        &self,
+        account: &AccountId,
+        message: Vec<u8>,
+        unsubscribe: Vec<u8>,
+    ) -> Result<AsyncInternalSubscription, Error>;
 
     async fn send_message(&self, message: Vec<u8>) -> Result<(), Error>;
 
@@ -257,6 +271,10 @@ pub trait AsyncMessageBus: Send + Sync {
     /// cleanup here, so it runs even when the drop is on a thread with no
     /// runtime of its own.
     fn runtime_handle(&self) -> &Handle;
+
+    /// Historical-data farm state from the global notices, which
+    /// `Client::resubscribing` waits on after a 10182.
+    fn farm_watch(&self) -> &super::farm_watch::async_impl::FarmWatch;
 }
 
 /// Internal subscription for async implementation.
@@ -916,6 +934,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         self.shared_channels.notify_all(|| Error::ConnectionReset.into());
         self.shared_channels.reset_counts().await;
         self.order_taps.reset();
+        self.connection.notice_broadcaster.farms.reset();
     }
 
     /// Shut down, then release the socket, which retained clients and
@@ -1198,18 +1217,30 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 
     // Registers a subscription of `message_type` and writes its request;
     // `account` for account updates (see `SharedCounts`).
+    /// `unsubscribe` goes out ahead of `message` when `account`'s updates are
+    /// live already; see `AsyncMessageBus::send_account_updates_request`.
     async fn send_shared(
         &self,
         message_type: OutgoingMessages,
         account: Option<&AccountId>,
         message: Vec<u8>,
+        unsubscribe: Option<Vec<u8>>,
     ) -> Result<AsyncInternalSubscription, Error> {
         // See `open_route`.
         let session = self.session_generation();
         self.ensure_connected()?;
+        if let Some(unsubscribe) = &unsubscribe {
+            self.throttle(unsubscribe).await;
+        }
         self.throttle(&message).await;
 
-        let (receiver, ticket, skip) = self.shared_channels.subscribe(message_type, account, || self.write_now(&message)).await?;
+        let write = |live: bool| async move {
+            if let Some(unsubscribe) = unsubscribe.filter(|_| live) {
+                self.write_now(&unsubscribe).await?;
+            }
+            self.write_now(&message).await
+        };
+        let (receiver, ticket, skip) = self.shared_channels.subscribe(message_type, account, write).await?;
 
         Ok(AsyncInternalSubscription::with_cleanup(receiver, self.cleanup_sender.clone())
             .shared(ticket, skip)
@@ -1241,11 +1272,17 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
     }
 
     async fn send_shared_request(&self, message_type: OutgoingMessages, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
-        self.send_shared(message_type, None, message).await
+        self.send_shared(message_type, None, message, None).await
     }
 
-    async fn send_account_updates_request(&self, account: &AccountId, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
-        self.send_shared(OutgoingMessages::RequestAccountData, Some(account), message).await
+    async fn send_account_updates_request(
+        &self,
+        account: &AccountId,
+        message: Vec<u8>,
+        unsubscribe: Vec<u8>,
+    ) -> Result<AsyncInternalSubscription, Error> {
+        self.send_shared(OutgoingMessages::RequestAccountData, Some(account), message, Some(unsubscribe))
+            .await
     }
 
     async fn cancel_shared_subscription(&self, ticket: SharedTicket, message: Option<Vec<u8>>) -> Result<(), Error> {
@@ -1330,6 +1367,10 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
 
     fn session_generation(&self) -> u64 {
         self.session_generation.load(Ordering::Acquire)
+    }
+
+    fn farm_watch(&self) -> &super::farm_watch::async_impl::FarmWatch {
+        &self.connection.notice_broadcaster.farms
     }
 
     fn runtime_handle(&self) -> &Handle {
