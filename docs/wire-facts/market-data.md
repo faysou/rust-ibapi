@@ -170,6 +170,28 @@ for 30 s on AAPL Dec 2026 350 call and put, Nov 27 350 call and Dec 500 call, an
   without `bar_count` (#1057), for which stocks and futures need up-to-the-second data (2188 on
   the probing account).
 
+*Live 2026-11-23 Mon 18:55-19:05 ET (FX, crypto and CME Globex open, US equities after
+hours), paper TWS, server 223; raw capture; #1285.*
+
+- `reqRealTimeBars` MIDPOINT, BID and ASK, EUR.USD, XAUUSD and BTC (PAXOS): `volume` (7) and
+  `WAP` (8) **sent** as `"-1"` and `count` as `-1` in every frame, where server 226 left volume
+  and WAP out. TRADES and AGGTRADES on BTC send real values.
+- `reqHistoricalData` MIDPOINT, BID, ASK and BID_ASK, 1-hour bars (AAPL, ES, EUR.USD, an AAPL
+  option, a CBOT corn option, the IBUS500 CFD, XAUUSD, BTC) and daily bars (AAPL, ES,
+  EUR.USD): `-1` for all three, as on server 226. An SPX TRADES bar sends `volume` and `WAP`
+  as `"0"` with a real `barCount`.
+- The corn option (OZC, price magnifier 100) sends the non-TRADES `WAP` as `"-100"`, `-1` times
+  the magnifier. `volume` and `barCount` stay `-1`.
+- Volatility and adjusted bars (2026-11-25 Wed 11:10 ET, US equities open, same server; decoded
+  values, 1-hour bars over 2 days, AAPL): ADJUSTED_LAST sent real volume, WAP and count, the
+  same as TRADES (9 bars). HISTORICAL_VOLATILITY (1 bar) and OPTION_IMPLIED_VOLATILITY (10 bars)
+  sent volume `1` and count `0` on every bar, with the WAP a volatility (`0.289`, `0.260`), as
+  on server 226.
+- Settles that a realtime bar can carry either form, and that the WAP sentinel scales with the
+  price magnifier, so only a volume test can tell it from a price.
+- **Not probed:** realtime bars on a magnified contract; TRADES `keepUpToDate` updates (BTC draws
+  10299 for TRADES and 321 "Source price not supported with live updates" for AGGTRADES).
+
 ### One-second bars reach back at most 2000 S
 
 *Live 2026-11-23 21:21-21:32Z (after the US close; the ES runs during the 21:15-21:30Z CME halt
@@ -267,23 +289,6 @@ regular hours, ending 21:00 UTC.*
 - **Not probed:** where these sizes' limits lie, including the 3 D and longer that `between`
   asks for over a range of more than one day; whether the 10 D request ends in data or an
   error; other instruments; the Gateway.
-
-*Live 2026-11-23 Mon 18:55-19:05 ET (FX, crypto and CME Globex open, US equities after
-hours), paper TWS, server 223; raw capture; #1285.*
-
-- `reqRealTimeBars` MIDPOINT, BID and ASK, EUR.USD, XAUUSD and BTC (PAXOS): `volume` (7) and
-  `WAP` (8) **sent** as `"-1"` and `count` as `-1` in every frame, where server 226 left volume
-  and WAP out. TRADES and AGGTRADES on BTC send real values.
-- `reqHistoricalData` MIDPOINT, BID, ASK and BID_ASK, 1-hour bars (AAPL, ES, EUR.USD, an AAPL
-  option, a CBOT corn option, the IBUS500 CFD, XAUUSD, BTC) and daily bars (AAPL, ES,
-  EUR.USD): `-1` for all three, as on server 226. An SPX TRADES bar sends `volume` and `WAP`
-  as `"0"` with a real `barCount`.
-- The corn option (OZC, price magnifier 100) sends the non-TRADES `WAP` as `"-100"`, `-1` times
-  the magnifier. `volume` and `barCount` stay `-1`.
-- Settles that a realtime bar can carry either form, and that the WAP sentinel scales with the
-  price magnifier, so only a volume test can tell it from a price.
-- **Not probed:** realtime bars on a magnified contract; TRADES `keepUpToDate` updates (BTC draws
-  10299 for TRADES and 321 "Source price not supported with live updates" for AGGTRADES).
 
 ### Trade-price `whatToShow` by security type
 
