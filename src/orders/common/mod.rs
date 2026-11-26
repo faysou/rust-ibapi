@@ -7,6 +7,7 @@ pub(crate) mod lookup;
 pub mod order_builder;
 pub(crate) mod stream_decoders;
 pub(super) mod verify;
+pub(super) mod what_if;
 
 #[cfg(test)]
 pub(super) mod test_tables;
