@@ -408,6 +408,77 @@ async fn executions() {
     );
 }
 
+fn executions_reply_rows() -> Vec<crate::messages::ResponseMessage> {
+    let request_id = crate::common::test_utils::helpers::TEST_REQ_ID_FIRST;
+    vec![
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data().request_id(request_id).execution_id("e1").encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report().execution_id("e1").commission_and_fees(1.25).encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data().request_id(request_id).execution_id("e2").encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data()
+                .request_id(request_id)
+                .execution_id("x1")
+                .option_exercise_type(1)
+                .encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report().execution_id("r9").commission_and_fees(0.5).encode_proto(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn executions_pair_to_fills() {
+    let mut responses = executions_reply_rows();
+    responses.push(proto_response(IncomingMessages::ExecutionDataEnd, execution_data_end().encode_proto()));
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+
+    let mut subscription = client.executions(ExecutionFilter::default()).await.expect("executions");
+    let rows = subscription
+        .collect_to_end_within(Duration::from_secs(5))
+        .await
+        .expect("reply read to its end");
+    let (fills, unpaired) = crate::orders::FillMatcher::new().pair_executions(rows);
+
+    let fills: Vec<(&str, Option<f64>)> = fills
+        .iter()
+        .map(|fill| {
+            (
+                fill.execution.execution.execution_id.as_str(),
+                fill.commission.as_ref().map(|report| report.commission_and_fees),
+            )
+        })
+        .collect();
+    let unpaired_executions: Vec<&str> = unpaired.executions.iter().map(|data| data.execution.execution_id.as_str()).collect();
+    let unpaired_reports: Vec<&str> = unpaired.reports.iter().map(|report| report.execution_id.as_str()).collect();
+    assert_eq!(fills, vec![("e1", Some(1.25)), ("x1", None)]);
+    assert_eq!(unpaired_executions, vec!["e2"]);
+    assert_eq!(unpaired_reports, vec!["r9"]);
+}
+
+#[tokio::test]
+async fn executions_without_end_marker_is_an_error_not_fills() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(executions_reply_rows()));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+
+    let mut subscription = client.executions(ExecutionFilter::default()).await.expect("executions");
+    let result = subscription.collect_to_end_within(Duration::from_secs(5)).await;
+
+    assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "got {result:?}");
+}
+
 #[tokio::test]
 async fn submit_order() {
     let message_bus = Arc::new(MessageBusStub::default());
