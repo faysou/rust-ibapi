@@ -65,6 +65,43 @@ pub(crate) const HMDS_ERROR_CODE: i32 = 162;
 /// "Error validating request" (e.g. an invalid account code).
 pub(crate) const REQUEST_VALIDATION_CODE: i32 = 321;
 
+/// "Requested market data is not subscribed": a market data, realtime bars
+/// or market depth request without the exchange's data permission.
+pub(crate) const MARKET_DATA_NOT_SUBSCRIBED_CODE: i32 = 354;
+
+/// "Invalid Real-time Query": a realtime bars request without the exchange's
+/// data permission, or with a `whatToShow` the contract has no data for
+/// (`TRADES` on a forex pair).
+pub(crate) const REALTIME_QUERY_INVALID_CODE: i32 = 420;
+
+/// "Requested market data is not subscribed. Delayed market data is not
+/// enabled." A market data request without the permission.
+pub(crate) const MARKET_DATA_DELAYED_NOT_ENABLED_CODE: i32 = 10168;
+
+/// "Failed to request tick-by-tick data" (e.g. no market data permission).
+pub(crate) const TICK_BY_TICK_FAILED_CODE: i32 = 10189;
+
+/// "Requested market data requires additional subscription for API ... Delayed market data is
+/// available." Ends the request at TWS whatever the market data type: nothing follows it, and
+/// a cancel draws 300. With a delayed type set, a contract TWS has delayed data for draws 10167
+/// instead (`docs/wire-facts/market-data.md#market-data-type-and-permission-notices`).
+pub(crate) const MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE: i32 = 10089;
+
+/// "Expected what to show is AGGTRADES, please use that instead of TRADES" (or the reverse
+/// for non-crypto). On a historical bar request TWS goes on with the `whatToShow` it names
+/// and sends that series (`docs/wire-facts/market-data.md#10299-whattoshow-substitution`).
+pub(crate) const WHAT_TO_SHOW_SUBSTITUTED_CODE: i32 = 10299;
+
+/// "Failed to request live updates (disconnected)." Ends a keep-up-to-date historical bar
+/// request when its HMDS farm breaks; TWS sends nothing more for it
+/// (`docs/wire-facts/market-data.md#streams-across-an-internet-outage`).
+pub(crate) const SUBSCRIPTION_DISCONNECTED_CODE: i32 = 10182;
+
+/// "No market data during competing live session". On a market data request TWS resumes
+/// ticks on the same request afterwards
+/// (`docs/wire-facts/market-data.md#streams-across-an-internet-outage`).
+pub(crate) const COMPETING_LIVE_SESSION_CODE: i32 = 10197;
+
 /// Range of error codes that are considered warnings: the whole `21xx` band.
 ///
 /// IB's published table stops at 2169, but the gateway keeps adding codes above
@@ -109,6 +146,8 @@ pub(crate) fn classify(code: i32, message: &str) -> NoticeCategory {
         NoticeCategory::SystemMessage
     } else if REQUEST_ERROR_CODES.contains(&code) {
         NoticeCategory::RequestError
+    } else if let Some(&(_, category)) = ORDER_CODE_CATEGORIES.iter().find(|(c, _)| *c == code) {
+        category
     } else if ORDER_REJECTION_CODE_RANGE.contains(&code) {
         NoticeCategory::OrderRejection
     } else {
@@ -117,9 +156,9 @@ pub(crate) fn classify(code: i32, message: &str) -> NoticeCategory {
 }
 
 /// Check if an error code is informational: every [`NoticeCategory`] except
-/// `RequestError`, `OrderRejection`, `Error` and `UnhandledFrame`.
-/// Client-synthesized codes never come off the wire, so for them this decides
-/// only [`Notice::is_error`].
+/// `RequestError`, `OrderRejection`, `OrderChangeRejection`, `Error` and `UnhandledFrame`.
+/// Client-synthesized codes never come off the wire, so for them this decides only
+/// [`Notice::is_error`].
 ///
 /// For these TWS proceeds with the request, the frame confirms an outcome the
 /// caller asked for, or the frame reports a connection-wide state change
@@ -142,7 +181,11 @@ pub(crate) fn is_informational_code(code: i32, message: &str) -> bool {
         | NoticeCategory::Warning
         | NoticeCategory::SystemMessage
         | NoticeCategory::ClientSynthesized => true,
-        NoticeCategory::RequestError | NoticeCategory::OrderRejection | NoticeCategory::Error | NoticeCategory::UnhandledFrame => false,
+        NoticeCategory::RequestError
+        | NoticeCategory::OrderRejection
+        | NoticeCategory::OrderChangeRejection
+        | NoticeCategory::Error
+        | NoticeCategory::UnhandledFrame => false,
     }
 }
 
@@ -176,14 +219,13 @@ pub const SYSTEM_MESSAGE_CODES: [i32; 4] = [
 ///   before applying any new entries. A depth subscription yields it as
 ///   [`MarketDepths::Reset`](crate::market_data::realtime::MarketDepths::Reset).
 /// - 2188: Up-to-the-second historical data requires additional subscription for the API.
-/// - 10089: Requested market data requires additional subscription for API; delayed market data is available.
 /// - 10090: Part of requested market data is not subscribed. Subscription-independent ticks are still active.
 /// - 10091: Part of requested market data requires additional subscription for API.
 /// - 10167: Requested market data is not subscribed. Displaying delayed market data.
 ///
 /// A slice rather than an array so that adding a code is not a type change
 /// for callers that bind the constant explicitly.
-pub const DATA_ADVISORY_CODES: &[i32] = &[MARKET_DEPTH_RESET_CODE, 2188, 10089, 10090, 10091, 10167];
+pub const DATA_ADVISORY_CODES: &[i32] = &[MARKET_DEPTH_RESET_CODE, 2188, 10090, 10091, 10167];
 
 /// Request-error codes inside [`ORDER_REJECTION_CODE_RANGE`]: a request other
 /// than an order failed (market data, depth, historical data, scanner, session
@@ -249,6 +291,44 @@ fn farm_entry(code: i32) -> Option<(DataFarmKind, ConnectivityStatus)> {
 /// [`NoticeCategory::OrderRejection`] unless an earlier rule claims it; see
 /// [`NoticeCategory`] for the precedence chain.
 pub const ORDER_REJECTION_CODE_RANGE: std::ops::RangeInclusive<i32> = 200..=399;
+
+/// Order codes outside [`ORDER_REJECTION_CODE_RANGE`] whose meaning was verified live, with their
+/// category. Every entry answered an order request with no change of status; all but 10242
+/// carried the order id.
+///
+/// Leave a code out until a live probe settles whether it rejects the order or only the
+/// request: a code wrongly
+/// classified as an [`OrderRejection`](NoticeCategory::OrderRejection) makes a consumer drop an
+/// order that is still working. 161 stays [`Error`](NoticeCategory::Error): it answered a refused
+/// cancel, and also a cancel that ended the order (`docs/wire-facts/orders.md#cancel-refusals`).
+const ORDER_CODE_CATEGORIES: &[(i32, NoticeCategory)] = &[
+    // docs/wire-facts/orders.md#order-rejections-outside-the-200-399-band
+    (103, NoticeCategory::OrderRejection),
+    // docs/wire-facts/orders.md#order-rejections-outside-the-200-399-band
+    (110, NoticeCategory::OrderRejection),
+    // docs/wire-facts/orders.md#order-rejections-outside-the-200-399-band
+    (10244, NoticeCategory::OrderRejection),
+    // docs/wire-facts/orders.md#order-rejections-outside-the-200-399-band
+    (10317, NoticeCategory::OrderRejection),
+    // docs/wire-facts/orders.md#orders-tws-discards-461-and-10311
+    (461, NoticeCategory::OrderRejection),
+    // docs/wire-facts/orders.md#orders-tws-discards-461-and-10311
+    (10311, NoticeCategory::OrderRejection),
+    // docs/wire-facts/orders.md#refused-modifies-leave-the-order-working
+    (104, NoticeCategory::OrderChangeRejection),
+    // docs/wire-facts/orders.md#refused-modifies-leave-the-order-working
+    (105, NoticeCategory::OrderChangeRejection),
+    // docs/wire-facts/orders.md#refused-modifies-leave-the-order-working
+    (10067, NoticeCategory::OrderChangeRejection),
+    // docs/wire-facts/orders.md#refused-modifies-leave-the-order-working
+    (10241, NoticeCategory::OrderChangeRejection),
+    // docs/wire-facts/orders.md#refused-modifies-leave-the-order-working
+    (10242, NoticeCategory::OrderChangeRejection),
+    // docs/wire-facts/orders.md#cancel-refusals
+    (10147, NoticeCategory::OrderChangeRejection),
+    // docs/wire-facts/orders.md#cancel-refusals
+    (10148, NoticeCategory::OrderChangeRejection),
+];
 
 /// Synthesized notice code emitted when a handshake-time frame's recognized
 /// [`IncomingMessages`](super::IncomingMessages) kind has no typed `StartupMessage` variant. A frame
@@ -383,7 +463,9 @@ pub(crate) fn order_lag_notice(skipped: u64) -> Notice {
 /// connection-status notices (1100 lost, 1101/1102 restored) it derives
 /// durable conclusions from, so a silent skip is not survivable: losing a
 /// 1101 voids every market-data request server-side yet leaves the client's
-/// subscriptions looking healthy forever, and losing a restoration notice
+/// subscriptions looking healthy forever (only streams wrapped in
+/// `Client::resubscribing` reopen on 1101, since the client sees it before
+/// the fan-out), and losing a restoration notice
 /// after a recorded 1100 holds every pending reopen forever. On receiving
 /// this notice the stream's conclusions are unknown — any of them may rest
 /// on notices that were dropped — so the consumer must resynchronize rather
@@ -489,9 +571,13 @@ pub(crate) fn order_update_gap_notice() -> Notice {
 /// 6. [`SystemMessage`](Self::SystemMessage) — 1100, 1101, 1102, 1300.
 /// 7. [`RequestError`](Self::RequestError) — [`REQUEST_ERROR_CODES`]. Ahead of
 ///    [`ORDER_REJECTION_CODE_RANGE`], which they sit inside.
-/// 8. [`OrderRejection`](Self::OrderRejection) — [`ORDER_REJECTION_CODE_RANGE`],
+/// 8. Order codes outside the band, each verified live:
+///    [`OrderRejection`](Self::OrderRejection) for 103, 110, 461, 10244, 10311 and 10317;
+///    [`OrderChangeRejection`](Self::OrderChangeRejection) for 104, 105, 10067,
+///    10147, 10148, 10241 and 10242.
+/// 9. [`OrderRejection`](Self::OrderRejection) — [`ORDER_REJECTION_CODE_RANGE`],
 ///    excluding the cases above.
-/// 9. [`Error`](Self::Error) — everything else.
+/// 10. [`Error`](Self::Error) — everything else.
 ///
 /// Each `Notice::is_*` category predicate ([`Notice::is_cancellation`],
 /// [`Notice::is_warning`], ...) is `category() == X` for its variant `X`, so the
@@ -526,9 +612,25 @@ pub enum NoticeCategory {
     Warning,
     /// Connectivity / system status (codes 1100, 1101, 1102, 1300).
     SystemMessage,
-    /// Order rejection ([`ORDER_REJECTION_CODE_RANGE`], excluding the cases
-    /// above it in the precedence chain).
+    /// TWS rejected an order request ([`ORDER_REJECTION_CODE_RANGE`] excluding the
+    /// cases above it in the precedence chain, and 103, 110, 461, 10244, 10311, 10317).
+    ///
+    /// For a new order, TWS created no order. For a modify of a working order, TWS
+    /// rejected the modification only: the order goes on working with its previous
+    /// terms and status (live: 201 for an off-tick price and for
+    /// margin, 321 for a zero size; `docs/wire-facts/orders.md#refused-modifies-leave-the-order-working`).
+    /// Only the caller knows which request the order id answers, so check for a status
+    /// already seen for the order before treating it as gone.
     OrderRejection,
+    /// TWS refused a request to cancel or modify an existing order, and the request
+    /// changed nothing. The order keeps the state it had: still working (105, 10067,
+    /// 10241, 10242), finished (104, 10148), or never created (10147). Its statuses, or
+    /// `open_orders`, tell which.
+    ///
+    /// 10242 arrives with request id 0, not the order id
+    /// (`docs/wire-facts/orders.md#refused-modifies-leave-the-order-working`). 161 is
+    /// not in this category: one live cancel drew it after it ended the order.
+    OrderChangeRejection,
     /// A request other than an order failed ([`REQUEST_ERROR_CODES`]): market
     /// data, depth, historical data, scanner, session setup. Terminal.
     RequestError,
@@ -767,6 +869,9 @@ impl Notice {
     /// Returns `true` if this notice is an order rejection
     /// ([`NoticeCategory::OrderRejection`]).
     ///
+    /// On a modify of a working order, it rejects the modification only and the
+    /// order goes on working; see [`NoticeCategory::OrderRejection`].
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -778,6 +883,31 @@ impl Notice {
     /// ```
     pub fn is_order_rejection(&self) -> bool {
         self.category() == NoticeCategory::OrderRejection
+    }
+
+    /// Returns `true` if TWS refused a cancel or modify of an order and the
+    /// request changed nothing ([`NoticeCategory::OrderChangeRejection`]).
+    ///
+    /// The order keeps whatever state it had, which may be working, finished, or
+    /// never created; do not treat it as ended on this notice alone.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::Notice;
+    ///
+    /// let notice = Notice {
+    ///     request_id: Some(7),
+    ///     code: 10148,
+    ///     message: "OrderId 7 that needs to be cancelled cannot be cancelled, state: Filled.".into(),
+    ///     error_time: None,
+    ///     advanced_order_reject_json: String::new(),
+    /// };
+    /// assert!(notice.is_order_change_rejection());
+    /// assert!(!notice.is_order_rejection());
+    /// ```
+    pub fn is_order_change_rejection(&self) -> bool {
+        self.category() == NoticeCategory::OrderChangeRejection
     }
 
     /// Returns `true` if a request other than an order failed
@@ -858,6 +988,7 @@ impl Notice {
     ///     | NoticeCategory::ClientSynthesized => "informational",
     ///     NoticeCategory::RequestError
     ///     | NoticeCategory::OrderRejection
+    ///     | NoticeCategory::OrderChangeRejection
     ///     | NoticeCategory::Error
     ///     | NoticeCategory::UnhandledFrame => "error",
     ///     _ => "unknown",
@@ -927,8 +1058,8 @@ impl Notice {
     /// System connectivity codes are graded by how much they matter: 1102
     /// (restored, data maintained) → info; 1101 (restored, data lost —
     /// resubscribe required) → warn; 1100 (connectivity lost) and 1300 (socket
-    /// reset) → error. Request errors, order rejections, errors and unhandled
-    /// frames log at `error`.
+    /// reset) → error. Request errors, order rejections, refused order changes,
+    /// errors and unhandled frames log at `error`.
     fn log_level(&self) -> log::Level {
         use log::Level;
         match self.category() {
@@ -948,7 +1079,11 @@ impl Notice {
                 CONNECTIVITY_RESTORED_DATA_LOST_CODE => Level::Warn,
                 _ => Level::Error,
             },
-            NoticeCategory::RequestError | NoticeCategory::OrderRejection | NoticeCategory::Error | NoticeCategory::UnhandledFrame => Level::Error,
+            NoticeCategory::RequestError
+            | NoticeCategory::OrderRejection
+            | NoticeCategory::OrderChangeRejection
+            | NoticeCategory::Error
+            | NoticeCategory::UnhandledFrame => Level::Error,
         }
     }
 
