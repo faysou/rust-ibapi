@@ -214,9 +214,9 @@ pub(crate) fn is_undeclared(ids: &[IncomingMessages], message: &ResponseMessage)
 /// else passes through.
 ///
 /// Shared by both drivers for the same reason as [`is_undeclared`].
-pub(crate) fn continuing_error_as_notice<T: StreamDecoder<T>>(item: RoutedItem) -> RoutedItem {
+pub(crate) fn continuing_error_as_notice<T: StreamDecoder<T>>(item: RoutedItem, context: &DecoderContext) -> RoutedItem {
     match item {
-        RoutedItem::Error(Error::Notice(notice)) if T::error_continues_request(&notice) => RoutedItem::Notice(notice),
+        RoutedItem::Error(Error::Notice(notice)) if T::error_continues_request(&notice, context) => RoutedItem::Notice(notice),
         item => item,
     }
 }
@@ -332,7 +332,10 @@ pub(crate) trait StreamDecoder<T> {
     /// instead of ending. Opt in only where wire-verified that data follows the
     /// error (10197 on market data). Default: `false`, the error ends the
     /// stream.
-    fn error_continues_request(_notice: &Notice) -> bool {
+    ///
+    /// `context` is the subscription's request context, as for
+    /// [`rejection_ends_request`](Self::rejection_ends_request).
+    fn error_continues_request(_notice: &Notice, _context: &DecoderContext) -> bool {
         false
     }
 

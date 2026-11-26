@@ -303,8 +303,8 @@ fn error_continues_request_only_for_10197_on_market_data() {
     use crate::market_data::historical::HistoricalDataFrame;
     use crate::market_data::realtime::{Bar, MarketDepths, TickBidAsk, TickLast, TickMidpoint, TickTypes};
 
-    type Hook = fn(&Notice) -> bool;
-    let continues = |hook: Hook, code| hook(&Notice::synthesized(code, String::new()));
+    type Hook = fn(&Notice, &DecoderContext) -> bool;
+    let continues = |hook: Hook, code| hook(&Notice::synthesized(code, String::new()), &DecoderContext::default());
     assert!(continues(TickTypes::error_continues_request, 10197));
     assert!(!continues(TickTypes::error_continues_request, 200));
     let siblings: [(&str, Hook); 6] = [

@@ -460,7 +460,7 @@ impl StreamDecoder<TickTypes> for TickTypes {
 
     /// Live: after 10197 during an internet outage TWS resumed ticks on the
     /// same request once its farms were back.
-    fn error_continues_request(notice: &Notice) -> bool {
+    fn error_continues_request(notice: &Notice, _context: &DecoderContext) -> bool {
         notice.code == COMPETING_LIVE_SESSION_CODE
     }
 
