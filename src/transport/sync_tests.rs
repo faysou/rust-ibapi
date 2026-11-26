@@ -3772,19 +3772,22 @@ fn wait_connected_returns_shutdown_when_the_bus_shuts_down() {
     assert!(start.elapsed() < Duration::from_secs(5), "wait_connected did not return on shutdown");
 }
 
-/// Writes fail, reads delegate to a `MemoryStream`. Stands in for a write
-/// refused after the registration went in: the session went down between the
-/// registering call's first state check and its write.
+/// Writes fail while the flag is set, reads delegate to a `MemoryStream`.
+/// Stands in for a write refused after the registration went in: the session
+/// went down between the registering call's first state check and its write.
 #[derive(Clone, Debug)]
-struct FailingWriteStream(MemoryStream);
+struct FailingWriteStream(MemoryStream, Arc<AtomicBool>);
 
 impl Io for FailingWriteStream {
     fn read_message(&self) -> Result<Vec<u8>, Error> {
         self.0.read_message()
     }
 
-    fn write_all(&self, _buf: &[u8]) -> Result<(), Error> {
-        Err(Error::ConnectionReset)
+    fn write_all(&self, buf: &[u8]) -> Result<(), Error> {
+        if self.1.load(Ordering::SeqCst) {
+            return Err(Error::ConnectionReset);
+        }
+        self.0.write_all(buf)
     }
 
     fn close(&self) {
@@ -3810,7 +3813,8 @@ impl Stream for FailingWriteStream {}
 /// and its write.
 #[test]
 fn failed_write_leaves_no_registration() {
-    let connection = Connection::stubbed(FailingWriteStream(MemoryStream::default()), 28);
+    let stream = FailingWriteStream(MemoryStream::default(), Arc::new(AtomicBool::new(true)));
+    let connection = Connection::stubbed(stream, 28);
     connection.set_server_version_for_test(crate::server_versions::PROTOBUF_REST_MESSAGES_3);
     let bus = Arc::new(TcpMessageBus::new(connection));
     let mb: &dyn MessageBus = bus.as_ref();
@@ -3827,6 +3831,29 @@ fn failed_write_leaves_no_registration() {
         0,
         "a failed write must leave no shared subscription registered"
     );
+}
+
+/// A modify or cancel whose write fails never reached TWS, so it leaves the
+/// earlier subscription on the order id as it was: TWS rejecting the order
+/// still ends it.
+#[test]
+fn failed_order_write_leaves_the_earlier_subscription_not_superseded() -> Result<(), Error> {
+    let inbound = MemoryStream::default();
+    let failing = Arc::new(AtomicBool::new(false));
+    let connection = Connection::stubbed(FailingWriteStream(inbound.clone(), failing.clone()), CLIENT_ID);
+    connection.set_server_version_for_test(crate::server_versions::PROTOBUF_REST_MESSAGES_3);
+    let bus = Arc::new(TcpMessageBus::new(connection));
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    failing.store(true, Ordering::SeqCst);
+    let modify = bus.send_order_request(OrderId::from(7), &[]);
+
+    inbound.push_inbound(error_frame(7, 201, "Order rejected - reason:"));
+    bus.dispatch()?;
+
+    let place_first = place.next_timeout_routed(TICK).map(routed_label);
+    assert!(matches!(modify, Err(Error::ConnectionReset)), "{modify:?}");
+    assert_eq!(place_first.as_deref(), Some("error [201] Order rejected - reason:"));
+    Ok(())
 }
 
 #[test]

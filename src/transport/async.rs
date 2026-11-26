@@ -1115,6 +1115,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             routes.remove_if_same(id, &lease_ref);
             return Err(e);
         }
+        routes.supersede_earlier(&id, &lease_ref);
 
         Ok(subscription)
     }
