@@ -164,7 +164,10 @@ impl_wire_enum!(SecurityType, fallback Other);
 /// `Contract::bond_cusip`, `Contract::bond_isin`, `Contract::spread`) or the
 /// field-minimal [`ContractBuilder::new`] — they set the correct field types and
 /// sensible defaults for you. A bare struct literal with `..Default::default()` also
-/// works when you need full control over individual fields.
+/// works when you need full control over individual fields. Its defaults are uneven: exchange
+/// `SMART`, security type [`SecurityType::Stock`] and an empty currency (see [`Currency`]),
+/// where the stock, option and futures builders default to USD. [`ContractBuilder::new`]
+/// leaves the exchange empty instead of `SMART`.
 ///
 /// # Examples
 ///
@@ -185,10 +188,11 @@ pub struct Contract {
     /// unset (stocks, an open futures query).
     #[serde(default, deserialize_with = "types::deserialize_optional_expiry")]
     pub last_trade_date_or_contract_month: Option<Expiry>,
-    /// The option's strike price. For a contract whose
-    /// [`price_magnifier`](ContractDetails::price_magnifier) is above 1, TWS expects it in the
-    /// market-data sub-unit (`450` cents for a $4.50 corn option) but reports it in contract
-    /// details in the currency unit (`4.5`).
+    /// The option's strike price. `0.0` is not sent. `f64::MAX`, the Python client's unset
+    /// value, is sent, and TWS reads it as unset in contract details (live: 2026-11-23, paper).
+    /// For a contract whose [`price_magnifier`](ContractDetails::price_magnifier) is above 1,
+    /// TWS expects it in the market-data sub-unit (`450` cents for a $4.50 corn option) but
+    /// reports it in contract details in the currency unit (`4.5`).
     pub strike: f64,
     /// Option type (only meaningful when `security_type == SecurityType::Option`).
     /// `None` on non-option contracts. Wire values are `"C"` (Call) and `"P"` (Put).
@@ -199,7 +203,12 @@ pub struct Contract {
     pub exchange: Exchange,
     /// The underlying's currency.
     pub currency: Currency,
-    /// The contract's symbol within its primary exchange For options, this will be the OCC symbol.
+    /// The contract's symbol within its primary exchange. For US options, this is the OCC symbol.
+    ///
+    /// Other exchanges use their own layouts: `HSI25600L6` on HKFE (class, strike, month and right
+    /// letter, one-digit year), `K200992L6.KS` on KSE, `TCH DEC26 640 C` for a SEHK stock option,
+    /// a 9-digit exchange code on OSE.JPN. Read the strike, right and expiry from their fields
+    /// rather than parsing this (live: 2026-11-24, server 223; `docs/wire-facts/contracts.md#local-symbols-of-hkfe-ose-and-kse-options`).
     pub local_symbol: String,
     /// The contract's primary exchange.
     /// For smart routed contracts, used to define contract in case of ambiguity.
@@ -241,7 +250,7 @@ impl Default for Contract {
             right: None,
             multiplier: String::new(),
             exchange: Exchange::default(), // "SMART"
-            currency: Currency::default(),
+            currency: Currency::default(), // Empty: TWS resolves it
             local_symbol: String::new(),
             primary_exchange: Exchange::from(""), // Empty, not "SMART"
             trading_class: String::new(),
@@ -351,6 +360,63 @@ impl Contract {
     /// ```
     pub fn continuous_futures(symbol: impl Into<Symbol>) -> ContinuousFuturesBuilder<Symbol> {
         ContinuousFuturesBuilder::new(symbol)
+    }
+
+    /// Creates a query contract that lists the option contracts of `underlying` through
+    /// `contract_details`.
+    ///
+    /// `underlying` needs its symbol and currency, as `contract_details` returns it. A future
+    /// gives a futures option query on the future's exchange; a stock, ETF or index gives an
+    /// option query on `SMART`. The query names no strike, right, trading class or expiry
+    /// unless you add them, and TWS answers with every listed contract that matches in one
+    /// reply.
+    ///
+    /// Use this to get the contracts. `option_chain` (`reqSecDefOptParams`) returns, per
+    /// exchange and trading class, a list of expiries and a list of strikes, and most of their
+    /// combinations are not listed: AAPL's chain on one exchange spans 24 expiries and 133
+    /// strikes (6,384 calls and puts) while 3,546 AAPL options exist, and the same chain comes
+    /// once for each of 22 exchanges. Requesting each combination costs one request per
+    /// candidate and an error 200 for each missing one. `option_chain` stays the cheap way to
+    /// see which expiries and strikes exist: it answers in milliseconds.
+    ///
+    /// What TWS returns (live 2026-11-24, paper TWS, server 223):
+    ///
+    /// - Futures options of several futures come back for one date or month: ES December 2026
+    ///   options belong to ESZ6 and ESH7, so keep the rows whose
+    ///   [`under_contract_id`](ContractDetails::under_contract_id) is the future's.
+    /// - TWS filters expiries by one date ([`expiring`](OptionsQueryBuilder::expiring)) or one
+    ///   month ([`expiring_in`](OptionsQueryBuilder::expiring_in)) only; filter a range of
+    ///   expiries or strikes from the rows. Strikes in the rows are in currency units, while
+    ///   `option_chain` strikes of a magnified product are in its sub-unit (ZC: `3.6` against
+    ///   `360`; see [`price_magnifier`](ContractDetails::price_magnifier)).
+    /// - Without an expiry the reply arrives all at once after 40 to 75 seconds for a large
+    ///   underlying (AAPL 3,546 rows, SPX 33,502, ES 25,847). One month took 0.7 to 21 seconds
+    ///   (SPX December, 13,156 rows) and one date at most 5. Asking per month bounds each reply.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::{Contract, ContractDetails, ContractMonth};
+    ///
+    /// // AAPL as contract_details returns it.
+    /// let mut aapl = Contract::stock("AAPL").build();
+    /// aapl.contract_id = 265598;
+    ///
+    /// let query = Contract::options_on(&aapl).expiring_in(ContractMonth::new(2026, 12)?).calls().build();
+    /// // let rows = client.contract_details(&query).await?;
+    ///
+    /// // The contracts of this underlying with strikes in [250, 300].
+    /// fn near_the_money(rows: &[ContractDetails], underlying_id: i32) -> Vec<&ContractDetails> {
+    ///     rows.iter()
+    ///         .filter(|row| row.under_contract_id == underlying_id)
+    ///         .filter(|row| (250.0..=300.0).contains(&row.contract.strike))
+    ///         .collect()
+    /// }
+    /// assert!(near_the_money(&[], aapl.contract_id).is_empty());
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    pub fn options_on(underlying: &Contract) -> OptionsQueryBuilder {
+        OptionsQueryBuilder::new(underlying)
     }
 
     /// Creates a forex contract builder.
@@ -832,6 +898,11 @@ pub struct ContractDetails {
     /// If populated for the bond in IB's database. For Bonds only.
     pub notes: String,
     /// Order's minimal size.
+    ///
+    /// For TSE and SEHK stocks this is the board lot (7203 on TSEJ: 100; 5 on SEHK: 400), and
+    /// [`size_increment`](Self::size_increment) equals it. TWS rejects a smaller order with 388 and
+    /// one that is not a multiple of it with 461
+    /// (live: 2026-11-24, server 223; `docs/wire-facts/contracts.md#board-lots-min_size-and-size_increment`).
     ///
     /// `None` when TWS reports no size rules for the contract (field absent,
     /// empty, or an "unset" sentinel); `Some(0.0)` is a real zero.
