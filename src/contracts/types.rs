@@ -1,5 +1,6 @@
 //! Strong types for contract building with validation.
 
+use crate::contracts::tick_types::TickType;
 use crate::{Error, ToField};
 use std::fmt;
 use std::str::FromStr;
@@ -217,6 +218,29 @@ impl OptionRight {
         match self {
             OptionRight::Call => "C",
             OptionRight::Put => "P",
+        }
+    }
+
+    /// The tick type that carries the open interest of an option with this right.
+    ///
+    /// With generic tick [`OPTION_OPEN_INTEREST`](crate::market_data::realtime::generic_tick::OPTION_OPEN_INTEREST)
+    /// (`101`), market data for an option or a futures option sends its open interest as a
+    /// size tick of this type, and `0` on the other right's tick. Read only this one: the
+    /// other's `0` is not the contract's open interest.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::tick_types::TickType;
+    /// use ibapi::contracts::OptionRight;
+    ///
+    /// assert_eq!(OptionRight::Call.open_interest_tick(), TickType::OptionCallOpenInterest);
+    /// assert_eq!(OptionRight::Put.open_interest_tick(), TickType::OptionPutOpenInterest);
+    /// ```
+    pub fn open_interest_tick(&self) -> TickType {
+        match self {
+            OptionRight::Call => TickType::OptionCallOpenInterest,
+            OptionRight::Put => TickType::OptionPutOpenInterest,
         }
     }
 
