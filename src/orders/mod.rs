@@ -65,6 +65,9 @@ use std::convert::From;
 use std::fmt::Debug;
 
 use serde::{Deserialize, Serialize};
+use time::format_description::FormatItem;
+use time::macros::format_description;
+use time::{OffsetDateTime, PrimitiveDateTime};
 
 use crate::contracts::{Contract, SecurityType};
 
@@ -1011,6 +1014,11 @@ pub enum TimeInForce {
     Auction,
     /// Good until Crossing (GTX).
     GoodTillCrossing,
+    /// Minutes: the order is cancelled after a few minutes if it has not filled. IB uses it for
+    /// cryptocurrency limit orders on PAXOS, which it cancels after 5 minutes; a crypto BUY order
+    /// must be `Minutes` or [`ImmediateOrCancel`](Self::ImmediateOrCancel). The wire text is
+    /// `Minutes`.
+    Minutes,
     /// Time-in-force string not modeled by this version of the API. Carries the
     /// raw wire value so callers can log, store, or act on it, rather than
     /// having an unrecognized value silently decode as [`Day`](Self::Day).
@@ -1035,6 +1043,7 @@ impl TimeInForce {
             TimeInForce::DayTillCanceled => "DTC",
             TimeInForce::Auction => "AUC",
             TimeInForce::GoodTillCrossing => "GTX",
+            TimeInForce::Minutes => "Minutes",
             TimeInForce::Unknown(raw) => raw,
         }
     }
@@ -1050,6 +1059,7 @@ impl TimeInForce {
             "DTC" => Some(TimeInForce::DayTillCanceled),
             "AUC" => Some(TimeInForce::Auction),
             "GTX" => Some(TimeInForce::GoodTillCrossing),
+            "Minutes" => Some(TimeInForce::Minutes),
             _ => None,
         }
     }
@@ -1465,10 +1475,33 @@ pub struct OrderState {
     pub warning_text: String,
     /// Timestamp when the order completed, passed through unparsed. Rendered like
     /// [`Execution::time`], except the UTC format has no trailing `Z` (`yyyymmdd-HH:MM:SS`).
+    /// [`completed_time_utc`](Self::completed_time_utc) returns that form as an instant.
     pub completed_time: String,
     /// Free-form descriptive status sent at completion (e.g. `"Cancelled by Trader"`,
     /// `"Filled Size: 1"`). For the canonical lifecycle state, use [`status`](Self::status).
     pub completed_status: String,
+}
+
+impl OrderState {
+    /// [`completed_time`](Self::completed_time) as an instant, when TWS sent the UTC rendering
+    /// `yyyymmdd-HH:MM:SS` (gateway setting "UTC format"). `None` for the zone-named renderings,
+    /// which this crate does not resolve, and for an empty field.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::orders::OrderState;
+    /// use time::macros::datetime;
+    ///
+    /// let state = OrderState {
+    ///     completed_time: "20261111-02:17:28".to_string(),
+    ///     ..OrderState::default()
+    /// };
+    /// assert_eq!(state.completed_time_utc(), Some(datetime!(2026-11-11 02:17:28 UTC)));
+    /// ```
+    pub fn completed_time_utc(&self) -> Option<OffsetDateTime> {
+        parse_utc_date_time(&self.completed_time)
+    }
 }
 
 /// Allocation of an order across accounts.
@@ -1665,7 +1698,8 @@ pub struct Execution {
     /// The execution's server time, passed through unparsed. The gateway setting "Send
     /// instrument-specific attributes for dual-mode API client in" picks the rendering:
     /// `yyyymmdd HH:MM:SS <zone>` in the instrument's or operator's zone
-    /// (`20261110 20:17:28 US/Central`), or `yyyymmdd-HH:MM:SSZ` under UTC format.
+    /// (`20261110 20:17:28 US/Central`), or `yyyymmdd-HH:MM:SSZ` under UTC format, which
+    /// [`time_utc`](Self::time_utc) returns as an instant.
     pub time: String,
     /// The account to which the order was allocated.
     pub account_number: String,
@@ -1729,6 +1763,41 @@ impl Execution {
     pub fn expects_commission_report(&self) -> bool {
         self.option_exercise_type != OptionExerciseType::Exercise
     }
+
+    /// [`time`](Self::time) as an instant, when TWS sent the UTC rendering `yyyymmdd-HH:MM:SSZ`
+    /// (gateway setting "UTC format"). `None` for the zone-named renderings, which this crate
+    /// does not resolve, and for an empty field.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::orders::Execution;
+    /// use time::macros::datetime;
+    ///
+    /// let utc = Execution {
+    ///     time: "20261111-02:17:28Z".to_string(),
+    ///     ..Execution::default()
+    /// };
+    /// let zoned = Execution {
+    ///     time: "20261110 20:17:28 US/Central".to_string(),
+    ///     ..Execution::default()
+    /// };
+    /// assert_eq!(utc.time_utc(), Some(datetime!(2026-11-11 02:17:28 UTC)));
+    /// assert_eq!(zoned.time_utc(), None);
+    /// ```
+    pub fn time_utc(&self) -> Option<OffsetDateTime> {
+        parse_utc_date_time(&self.time)
+    }
+}
+
+/// The gateway's UTC rendering, `yyyymmdd-HH:MM:SS`: `Execution::time` adds a trailing `Z`,
+/// `OrderState::completed_time` does not.
+const UTC_DATE_TIME: &[FormatItem<'static>] = format_description!("[year][month][day]-[hour]:[minute]:[second]");
+
+/// `text` in [`UTC_DATE_TIME`], with or without a trailing `Z`, as an instant.
+fn parse_utc_date_time(text: &str) -> Option<OffsetDateTime> {
+    let text = text.strip_suffix('Z').unwrap_or(text);
+    PrimitiveDateTime::parse(text, UTC_DATE_TIME).ok().map(PrimitiveDateTime::assume_utc)
 }
 
 /// Contains execution information including the request ID, contract, and execution details.

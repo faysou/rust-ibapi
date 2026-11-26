@@ -437,8 +437,8 @@ fn all_open_orders() {
 #[test]
 fn auto_open_orders() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
-        IncomingMessages::OpenOrderEnd,
-        open_order_end().encode_proto(),
+        IncomingMessages::OpenOrder,
+        open_order().order_id(7).encode_proto(),
     )]));
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
@@ -446,8 +446,10 @@ fn auto_open_orders() {
 
     assert_request(&message_bus, 0, &auto_open_orders_request().auto_bind(true));
     let subscription = results.expect("auto_open_orders");
-    // OpenOrderEnd is terminal for auto_open_orders too: the stream ends rather than waiting for binds.
-    assert!(subscription.next().is_none(), "OpenOrderEnd alone must end the stream with no orders");
+    match subscription.next() {
+        Some(Ok(SubscriptionItem::Data(Orders::OrderData(order)))) => assert_eq!(order.order.order_id, 7),
+        other => panic!("expected the bound order, got {other:?}"),
+    }
 }
 
 #[test]
@@ -493,76 +495,6 @@ fn executions() {
         subscription.next().is_none(),
         "ExecutionDataEnd alone must end the stream with no executions"
     );
-}
-
-fn executions_reply_rows() -> Vec<crate::messages::ResponseMessage> {
-    let request_id = crate::common::test_utils::helpers::TEST_REQ_ID_FIRST;
-    vec![
-        proto_response(
-            IncomingMessages::ExecutionData,
-            execution_data().request_id(request_id).execution_id("e1").encode_proto(),
-        ),
-        proto_response(
-            IncomingMessages::CommissionsAndFeesReport,
-            commission_and_fees_report().execution_id("e1").commission_and_fees(1.25).encode_proto(),
-        ),
-        proto_response(
-            IncomingMessages::ExecutionData,
-            execution_data().request_id(request_id).execution_id("e2").encode_proto(),
-        ),
-        proto_response(
-            IncomingMessages::ExecutionData,
-            execution_data()
-                .request_id(request_id)
-                .execution_id("x1")
-                .option_exercise_type(1)
-                .encode_proto(),
-        ),
-        proto_response(
-            IncomingMessages::CommissionsAndFeesReport,
-            commission_and_fees_report().execution_id("r9").commission_and_fees(0.5).encode_proto(),
-        ),
-    ]
-}
-
-#[test]
-fn executions_pair_to_fills() {
-    let mut responses = executions_reply_rows();
-    responses.push(proto_response(IncomingMessages::ExecutionDataEnd, execution_data_end().encode_proto()));
-    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
-    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
-
-    let subscription = client.executions(ExecutionFilter::default()).expect("executions");
-    let rows = subscription
-        .collect_to_end_within(std::time::Duration::from_secs(5))
-        .expect("reply read to its end");
-    let (fills, unpaired) = crate::orders::FillMatcher::new().pair_executions(rows);
-
-    let fills: Vec<(&str, Option<f64>)> = fills
-        .iter()
-        .map(|fill| {
-            (
-                fill.execution.execution.execution_id.as_str(),
-                fill.commission.as_ref().map(|report| report.commission_and_fees),
-            )
-        })
-        .collect();
-    let unpaired_executions: Vec<&str> = unpaired.executions.iter().map(|data| data.execution.execution_id.as_str()).collect();
-    let unpaired_reports: Vec<&str> = unpaired.reports.iter().map(|report| report.execution_id.as_str()).collect();
-    assert_eq!(fills, vec![("e1", Some(1.25)), ("x1", None)]);
-    assert_eq!(unpaired_executions, vec!["e2"]);
-    assert_eq!(unpaired_reports, vec!["r9"]);
-}
-
-#[test]
-fn executions_without_end_marker_is_an_error_not_fills() {
-    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(executions_reply_rows()));
-    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
-
-    let subscription = client.executions(ExecutionFilter::default()).expect("executions");
-    let result = subscription.collect_to_end_within(std::time::Duration::from_secs(5));
-
-    assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "got {result:?}");
 }
 
 fn executions_reply_rows() -> Vec<crate::messages::ResponseMessage> {
@@ -1222,6 +1154,111 @@ fn analyze_reports_end_of_stream_when_no_order_arrives() {
     assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "got {result:?}");
 }
 
+// Live (server 223): TWS answers a US stock limit what-if with a warning-only frame, then the
+// frame with margins and commission. `analyze` returns the second, keeping the first's warning.
+#[test]
+fn analyze_waits_past_the_warning_only_frame() {
+    let (client, _bus) = create_blocking_test_client_with_ordered_proto_responses(vec![
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .commission_and_fees(0.0)
+                .warning_text("If your order is not immediately executable")
+                .encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .initial_margin_before(257638.32)
+                .commission_and_fees(1.00003)
+                .encode_proto(),
+        ),
+    ]);
+    client.id_manager().raise_order_id(OrderId::from(9090));
+    let contract = Contract::stock("AAPL").build();
+
+    let state = client.order(&contract).buy(100).limit(50.0).analyze().expect("analyze should succeed");
+
+    assert_eq!(state.initial_margin_before, Some(257638.32));
+    assert_eq!(state.commission_and_fees, Some(1.00003));
+    assert_eq!(state.warning_text, "If your order is not immediately executable");
+}
+
+// Live (server 223): an order the account's margin cannot carry is answered with margins and a
+// suggested size, then a 201. `analyze` returns the 201, not the margins.
+#[test]
+fn analyze_surfaces_the_rejection_after_an_over_margin_frame() {
+    let (client, _bus) = create_blocking_test_client_with_ordered_proto_responses(vec![
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .initial_margin_before(257664.09)
+                .suggested_size("4000")
+                .encode_proto(),
+        ),
+        proto_error_response(9090, 201, "Order rejected - reason:YOUR ORDER IS NOT ACCEPTED."),
+    ]);
+    client.id_manager().raise_order_id(OrderId::from(9090));
+    let contract = Contract::stock("AAPL").build();
+
+    let err = client
+        .order(&contract)
+        .buy(10_000_000)
+        .limit(1.0)
+        .analyze()
+        .expect_err("an over-margin what-if order must surface the rejection");
+
+    assert_tws_error_message(err, 201, "YOUR ORDER IS NOT ACCEPTED");
+}
+
+// `analyze_order` takes an order built elsewhere: it sends a what-if copy under the caller's order
+// id, moves the client's id generator past it, applies the same frame rules as `analyze`, and
+// leaves the caller's order unchanged.
+#[test]
+fn analyze_order_sends_a_what_if_copy_under_the_given_order_id() {
+    let (client, bus) = create_blocking_test_client_with_ordered_proto_responses(vec![
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .commission_and_fees(0.0)
+                .warning_text("If your order is not immediately executable")
+                .encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .initial_margin_before(257638.32)
+                .commission_and_fees(1.00003)
+                .encode_proto(),
+        ),
+    ]);
+    let contract = Contract::stock("AAPL").build();
+    let mut order = order_builder::limit_order(Action::Buy, 10.0, 100.0);
+    order.order_id = 77;
+
+    let state = client.analyze_order(9090, &contract, &order).expect("analyze_order should succeed");
+
+    let request: crate::proto::PlaceOrderRequest = decode_request_proto(&bus, 0);
+    assert_eq!(request.order_id, Some(9090));
+    assert_eq!(request.order.expect("request carries an order").what_if, Some(true));
+    assert_eq!(state.initial_margin_before, Some(257638.32));
+    assert_eq!(state.commission_and_fees, Some(1.00003));
+    assert_eq!(state.warning_text, "If your order is not immediately executable");
+    assert!(!order.what_if, "the caller's order keeps what_if unset");
+    assert_eq!(order.order_id, 77);
+    assert_eq!(client.next_order_id(), 9091, "a later order cannot reuse the what-if's id");
+}
+
 // The `submit` family, against `Client::stubbed` rather than a mock client that
 // carried its own copy of each method. The shadows dated from before the
 // builder had a real seam to test against; #735 moved `analyze` off its shadow
@@ -1738,6 +1775,7 @@ fn find_order_rechecks_completed_orders_until_the_bound() {
     // busy machine can merge the last two.
     let completed_reads = request_message_count(&message_bus) - 1;
     assert!((3..=4).contains(&completed_reads), "{completed_reads} completed-orders reads");
+}
 
 fn assert_linked_places(bus: &MessageBusStub, orders: &[(Contract, Order)], count: usize) {
     for (i, (contract, order)) in test_tables::linked_orders_as_sent(orders).iter().take(count).enumerate() {
@@ -1912,4 +1950,44 @@ fn is_unsent_matches_whether_the_order_call_wrote() {
         assert_eq!(err.is_unsent(), written == 0, "{name}: {err:?}, {written} requests written");
         assert_eq!(written, usize::from(failing_sends), "{name}: requests written");
     }
+}
+
+#[test]
+fn executions_filter_by_utc_time_and_read_utc_execution_time() {
+    use time::macros::datetime;
+
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data()
+                .request_id(crate::common::test_utils::helpers::TEST_REQ_ID_FIRST)
+                .time("20261111-02:37:49Z")
+                .encode_proto(),
+        ),
+        proto_response(IncomingMessages::ExecutionDataEnd, execution_data_end().encode_proto()),
+    ]));
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+
+    let filter = ExecutionFilter {
+        time: Some(datetime!(2026-11-10 20:30:00 -6)),
+        ..ExecutionFilter::default()
+    };
+    let subscription = client.executions(filter).expect("failed to get executions");
+    let execution = match subscription.next() {
+        Some(Ok(SubscriptionItem::Data(Executions::ExecutionData(data)))) => data.execution,
+        other => panic!("Expected Executions::ExecutionData, got {other:?}"),
+    };
+
+    assert_eq!(execution.time_utc(), Some(datetime!(2026-11-11 02:37:49 UTC)));
+    let expected_filter = ExecutionFilter {
+        time: Some(datetime!(2026-11-11 02:30:00 UTC)),
+        ..ExecutionFilter::default()
+    };
+    assert_request(
+        &message_bus,
+        0,
+        &executions_request()
+            .request_id(crate::common::test_utils::helpers::TEST_REQ_ID_FIRST)
+            .filter(expected_filter),
+    );
 }
