@@ -480,6 +480,147 @@ async fn executions_without_end_marker_is_an_error_not_fills() {
     assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "got {result:?}");
 }
 
+fn executions_reply_rows() -> Vec<crate::messages::ResponseMessage> {
+    let request_id = crate::common::test_utils::helpers::TEST_REQ_ID_FIRST;
+    vec![
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data().request_id(request_id).execution_id("e1").encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report().execution_id("e1").commission_and_fees(1.25).encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data().request_id(request_id).execution_id("e2").encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data()
+                .request_id(request_id)
+                .execution_id("x1")
+                .option_exercise_type(1)
+                .encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report().execution_id("r9").commission_and_fees(0.5).encode_proto(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn executions_pair_to_fills() {
+    let mut responses = executions_reply_rows();
+    responses.push(proto_response(IncomingMessages::ExecutionDataEnd, execution_data_end().encode_proto()));
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+
+    let mut subscription = client.executions(ExecutionFilter::default()).await.expect("executions");
+    let rows = subscription
+        .collect_to_end_within(Duration::from_secs(5))
+        .await
+        .expect("reply read to its end");
+    let (fills, unpaired) = crate::orders::FillMatcher::new().pair_executions(rows);
+
+    let fills: Vec<(&str, Option<f64>)> = fills
+        .iter()
+        .map(|fill| {
+            (
+                fill.execution.execution.execution_id.as_str(),
+                fill.commission.as_ref().map(|report| report.commission_and_fees),
+            )
+        })
+        .collect();
+    let unpaired_executions: Vec<&str> = unpaired.executions.iter().map(|data| data.execution.execution_id.as_str()).collect();
+    let unpaired_reports: Vec<&str> = unpaired.reports.iter().map(|report| report.execution_id.as_str()).collect();
+    assert_eq!(fills, vec![("e1", Some(1.25)), ("x1", None)]);
+    assert_eq!(unpaired_executions, vec!["e2"]);
+    assert_eq!(unpaired_reports, vec!["r9"]);
+}
+
+#[tokio::test]
+async fn executions_pair_combo_fills() {
+    let request_id = crate::common::test_utils::helpers::TEST_REQ_ID_FIRST;
+    let perm_id = 1290491156;
+    let execution = |execution_id: &str, security_type: &str, contract_id: i32| {
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data()
+                .request_id(request_id)
+                .execution_id(execution_id)
+                .security_type(security_type)
+                .contract_id(contract_id)
+                .perm_id(perm_id)
+                .shares(1.0)
+                .encode_proto(),
+        )
+    };
+    let report = |execution_id: &str, commission_and_fees: f64| {
+        proto_response(
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report()
+                .execution_id(execution_id)
+                .commission_and_fees(commission_and_fees)
+                .encode_proto(),
+        )
+    };
+    let responses = vec![
+        execution("0000e1a7.6b0717ad.01.01", "BAG", 16472979),
+        execution("0000e1a7.6b0717ad.02.01", "FUT", 649180684),
+        execution("0000e1a7.6b0717ad.03.01", "FUT", 515416632),
+        report("0000e1a7.6b0717ad.02.01", 2.16),
+        report("0000e1a7.6b0717ad.03.01", 2.17),
+        proto_response(IncomingMessages::ExecutionDataEnd, execution_data_end().encode_proto()),
+    ];
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+
+    let mut subscription = client.executions(ExecutionFilter::default()).await.expect("executions");
+    let rows = subscription
+        .collect_to_end_within(Duration::from_secs(5))
+        .await
+        .expect("reply read to its end");
+    let (fills, unpaired) = crate::orders::FillMatcher::new().pair_executions(rows);
+
+    assert_eq!(fills.len(), 1, "{fills:?}");
+    let combo = &fills[0];
+    let legs: Vec<(&str, i32, Option<f64>)> = combo
+        .legs
+        .iter()
+        .map(|leg| {
+            (
+                leg.execution.execution.execution_id.as_str(),
+                leg.execution.contract.contract_id,
+                leg.commission.as_ref().map(|report| report.commission_and_fees),
+            )
+        })
+        .collect();
+    assert_eq!(combo.execution.execution.execution_id, "0000e1a7.6b0717ad.01.01");
+    assert_eq!(combo.execution.contract.security_type, SecurityType::Spread);
+    assert!(combo.commission.is_none());
+    assert_eq!(
+        legs,
+        vec![
+            ("0000e1a7.6b0717ad.02.01", 649180684, Some(2.16)),
+            ("0000e1a7.6b0717ad.03.01", 515416632, Some(2.17)),
+        ]
+    );
+    assert!(unpaired.executions.is_empty() && unpaired.reports.is_empty() && unpaired.fills.is_empty());
+}
+
+#[tokio::test]
+async fn executions_without_end_marker_is_an_error_not_fills() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(executions_reply_rows()));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+
+    let mut subscription = client.executions(ExecutionFilter::default()).await.expect("executions");
+    let result = subscription.collect_to_end_within(Duration::from_secs(5)).await;
+
+    assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "got {result:?}");
+}
+
 #[tokio::test]
 async fn submit_order() {
     let message_bus = Arc::new(MessageBusStub::default());
@@ -1462,7 +1603,7 @@ async fn wait_for_fill_fails_on_connection_reset() {
 #[tokio::test]
 async fn find_order_reports_each_outcome() {
     for case in crate::orders::common::test_tables::lookup_cases() {
-        let message_bus = Arc::new(MessageBusStub::with_replies(case.replies));
+        let message_bus = Arc::new(MessageBusStub::with_responses_per_request(case.replies));
         let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
         let result = match case.perm_id {
@@ -1502,7 +1643,7 @@ async fn find_order_by_perm_id_rejects_a_perm_id_below_one() {
 async fn find_order_rechecks_completed_orders_until_the_bound() {
     let open = proto_response(IncomingMessages::OpenOrderEnd, open_order_end().encode_proto());
     let none = proto_response(IncomingMessages::CompletedOrdersEnd, completed_orders_end().encode_proto());
-    let message_bus = Arc::new(MessageBusStub::with_replies(
+    let message_bus = Arc::new(MessageBusStub::with_responses_per_request(
         std::iter::once(vec![open]).chain(std::iter::repeat_n(vec![none], 20)).collect(),
     ));
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
