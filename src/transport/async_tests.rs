@@ -9,6 +9,7 @@
 use crate::client::handshake_state::{HandshakeState, ServerVersion};
 use crate::common::test_utils::helpers::order_status_frame;
 use crate::orders::OrderStatusKind;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -3050,11 +3051,11 @@ async fn wait_connected_returns_shutdown_when_the_bus_shuts_down() {
     assert!(matches!(result, Err(Error::Shutdown)), "got: {result:?}");
 }
 
-/// Writes fail, reads delegate to a `MemoryStream`. Stands in for a write
-/// refused after the registration went in: the session went down between the
-/// registering call's first state check and its write.
-#[derive(Clone, Debug, Default)]
-struct FailingWriteStream(MemoryStream);
+/// Writes fail while the flag is set, reads delegate to a `MemoryStream`.
+/// Stands in for a write refused after the registration went in: the session
+/// went down between the registering call's first state check and its write.
+#[derive(Clone, Debug)]
+struct FailingWriteStream(MemoryStream, Arc<AtomicBool>);
 
 #[async_trait::async_trait]
 impl AsyncIo for FailingWriteStream {
@@ -3062,8 +3063,11 @@ impl AsyncIo for FailingWriteStream {
         self.0.read_message().await
     }
 
-    async fn write_all(&self, _buf: &[u8]) -> Result<(), Error> {
-        Err(Error::ConnectionReset)
+    async fn write_all(&self, buf: &[u8]) -> Result<(), Error> {
+        if self.1.load(Ordering::SeqCst) {
+            return Err(Error::ConnectionReset);
+        }
+        self.0.write_all(buf).await
     }
 
     async fn close(&self) {
@@ -3090,7 +3094,8 @@ impl AsyncStream for FailingWriteStream {}
 /// and its write.
 #[tokio::test]
 async fn failed_write_leaves_no_registration() {
-    let connection = AsyncConnection::stubbed(FailingWriteStream::default(), 28);
+    let stream = FailingWriteStream(MemoryStream::default(), Arc::new(AtomicBool::new(true)));
+    let connection = AsyncConnection::stubbed(stream, 28);
     connection.set_server_version_for_test(server_versions::PROTOBUF_REST_MESSAGES_3);
     let bus = Arc::new(AsyncTcpMessageBus::new(connection));
     let mb: &dyn AsyncMessageBus = bus.as_ref();
@@ -3110,6 +3115,28 @@ async fn failed_write_leaves_no_registration() {
         0,
         "a failed write must leave no request awaiting a reply"
     );
+}
+
+/// A modify or cancel whose write fails never reached TWS, so it leaves the
+/// earlier subscription on the order id as it was: TWS rejecting the order
+/// still ends it.
+#[tokio::test]
+async fn failed_order_write_leaves_the_earlier_subscription_not_superseded() {
+    let inbound = MemoryStream::default();
+    let failing = Arc::new(AtomicBool::new(false));
+    let connection = AsyncConnection::stubbed(FailingWriteStream(inbound.clone(), failing.clone()), CLIENT_ID);
+    connection.set_server_version_for_test(server_versions::PROTOBUF_REST_MESSAGES_3);
+    let bus = Arc::new(AsyncTcpMessageBus::new(connection));
+    let mut place = bus.send_order_request(OrderId::from(7), vec![]).await.unwrap();
+    failing.store(true, Ordering::SeqCst);
+    let modify = bus.send_order_request(OrderId::from(7), vec![]).await;
+
+    inbound.push_inbound(error_frame(7, 201, "Order rejected - reason:"));
+    bus.read_and_route_message().await.unwrap();
+
+    let place_first = place.try_next_routed().map(routed_label);
+    assert!(matches!(modify, Err(Error::ConnectionReset)));
+    assert_eq!(place_first.as_deref(), Some("error [201] Order rejected - reason:"));
 }
 
 #[tokio::test]

@@ -1082,6 +1082,7 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
             self.orders.remove_if_same(order_id, &lease_ref);
             return Err(e);
         }
+        self.orders.supersede_earlier(&order_id, &lease_ref);
 
         let subscription = SubscriptionBuilder::new()
             .receiver(receiver)
@@ -1186,10 +1187,11 @@ struct Entry<V> {
     lease: LeaseRef,
     /// The unread-item cap of a route opened with a `send_request_capped` bound.
     bound: Option<BoundState>,
-    /// Another entry was registered under this entry's key after it, so an
-    /// error frame on the key may answer that later request: it reaches this
-    /// entry as [`RoutedItem::for_earlier_subscription`], also once the later
-    /// entry is gone.
+    /// Another entry was registered under this entry's key after it and its
+    /// request was written, so an error frame on the key may answer that later
+    /// request: it reaches this entry as
+    /// [`RoutedItem::for_earlier_subscription`], also once the later entry is
+    /// gone.
     superseded: bool,
 }
 
@@ -1292,18 +1294,32 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         self.insert_entry(id, entry);
     }
 
-    /// Register `entry` under `id` beside the entries already there, which it
-    /// supersedes. An entry with the same lease is replaced, so one
-    /// subscription never holds two entries under a key and never receives a
-    /// frame twice.
+    /// Register `entry` under `id` beside the entries already there. An entry
+    /// with the same lease is replaced, so one subscription never holds two
+    /// entries under a key and never receives a frame twice.
     fn insert_entry(&self, id: K, entry: Entry<V>) {
         let mut senders = self.write();
         let registered = senders.entry(id).or_default();
         registered.retain(|other| !other.lease.is(&entry.lease));
-        for other in registered.iter_mut() {
-            other.superseded = true;
-        }
         registered.push(entry);
+    }
+
+    /// Mark the entries registered under `id` before the one holding `lease`
+    /// as superseded, once that entry's request is written. Until then they
+    /// already receive [`RoutedItem::for_earlier_subscription`] as earlier
+    /// entries; the mark keeps it so after the newer entry is gone. A request
+    /// whose write fails marks nothing.
+    pub fn supersede_earlier(&self, id: &K, lease: &LeaseRef) {
+        let mut senders = self.write();
+        let Some(registered) = senders.get_mut(id) else {
+            return;
+        };
+        let Some(position) = registered.iter().position(|entry| entry.lease.is(lease)) else {
+            return;
+        };
+        for entry in &mut registered[..position] {
+            entry.superseded = true;
+        }
     }
 
     /// Remove `id`'s entry that holds `lease`, and `id` once none is left.

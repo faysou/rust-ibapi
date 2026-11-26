@@ -31,10 +31,11 @@ pub(super) struct Route {
     pub(super) sender: BroadcastSender,
     pub(super) lease: LeaseRef,
     bound: Option<RouteBound>,
-    /// Another route was registered under this route's key after it, so an
-    /// error frame on the key may answer that later request: it reaches this
-    /// route as [`RoutedItem::for_earlier_subscription`], also once the later
-    /// route is gone.
+    /// Another route was registered under this route's key after it and its
+    /// request was written, so an error frame on the key may answer that later
+    /// request: it reaches this route as
+    /// [`RoutedItem::for_earlier_subscription`], also once the later route is
+    /// gone.
     superseded: bool,
 }
 
@@ -142,18 +143,32 @@ impl<K: Hash + Eq + Display + Debug> SenderHash<K> {
         write_lock(&self.routes)
     }
 
-    /// Registers `route` under `id` beside the routes already there, which
-    /// it supersedes. A route with the same lease is replaced, so one
-    /// subscription never holds two routes under a key and never receives a
-    /// frame twice.
+    /// Registers `route` under `id` beside the routes already there. A route
+    /// with the same lease is replaced, so one subscription never holds two
+    /// routes under a key and never receives a frame twice.
     pub(super) fn insert(&self, id: K, route: Route) {
         let mut routes = self.write();
         let registered = routes.entry(id).or_default();
         registered.retain(|other| !other.lease.is(&route.lease));
-        for other in registered.iter_mut() {
-            other.superseded = true;
-        }
         registered.push(route);
+    }
+
+    /// Mark the routes registered under `id` before the one holding `lease`
+    /// as superseded, once that route's request is written. Until then they
+    /// already receive [`RoutedItem::for_earlier_subscription`] as earlier
+    /// routes; the mark keeps it so after the newer route is gone. A request
+    /// whose write fails marks nothing.
+    pub(super) fn supersede_earlier(&self, id: &K, lease: &LeaseRef) {
+        let mut routes = self.write();
+        let Some(registered) = routes.get_mut(id) else {
+            return;
+        };
+        let Some(position) = registered.iter().position(|route| route.lease.is(lease)) else {
+            return;
+        };
+        for route in &mut registered[..position] {
+            route.superseded = true;
+        }
     }
 
     /// Run `f` on the newest of `id`'s routes while holding the read lock, so

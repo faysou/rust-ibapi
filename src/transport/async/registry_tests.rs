@@ -92,6 +92,7 @@ fn superseded_route_gets_errors_as_notices_after_the_newer_route_goes() {
     let (lone, mut lone_receiver, _lone_lease) = route();
     routes.insert(OrderId::from(7), first);
     routes.insert(OrderId::from(7), second);
+    routes.supersede_earlier(&OrderId::from(7), &second_lease.downgrade());
     routes.remove_if_same(OrderId::from(7), &second_lease.downgrade());
     routes.insert(OrderId::from(8), lone);
     let refusal = || RoutedItem::Error(Error::Notice(crate::Notice::synthesized(10148, "can not be cancelled".into())));
@@ -108,6 +109,36 @@ fn superseded_route_gets_errors_as_notices_after_the_newer_route_goes() {
     assert!(
         matches!(lone_items.as_slice(), [RoutedItem::Error(Error::Notice(n))] if n.code == 10148),
         "{lone_items:?}"
+    );
+}
+
+/// `supersede_earlier` marks only the routes registered before the given
+/// lease: a route registered after it, whose request is still being written,
+/// keeps getting errors once the given route goes.
+#[test]
+fn supersede_earlier_spares_routes_registered_after_the_lease() {
+    let routes = SenderHash::new();
+    let (first, mut first_receiver, _first_lease) = route();
+    let (second, _second_receiver, second_lease) = route();
+    let (third, mut third_receiver, _third_lease) = route();
+    routes.insert(OrderId::from(7), first);
+    routes.insert(OrderId::from(7), second);
+    routes.insert(OrderId::from(7), third);
+    routes.supersede_earlier(&OrderId::from(7), &second_lease.downgrade());
+    routes.remove_if_same(OrderId::from(7), &second_lease.downgrade());
+    let refusal = RoutedItem::Error(Error::Notice(crate::Notice::synthesized(105, "does not match".into())));
+
+    routes.deliver(&OrderId::from(7), refusal).unwrap();
+
+    let first_items = items(&mut first_receiver);
+    let third_items = items(&mut third_receiver);
+    assert!(
+        matches!(first_items.as_slice(), [RoutedItem::Notice(n)] if n.code == 105),
+        "{first_items:?}"
+    );
+    assert!(
+        matches!(third_items.as_slice(), [RoutedItem::Error(Error::Notice(n))] if n.code == 105),
+        "{third_items:?}"
     );
 }
 
