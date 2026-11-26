@@ -303,7 +303,7 @@ fn error_continues_request_only_for_10299_on_historical_bars() {
     use crate::market_data::historical::HistoricalDataFrame;
     use crate::market_data::realtime::TickTypes;
 
-    let continues = |hook: fn(&Notice) -> bool, code| hook(&Notice::synthesized(code, String::new()));
+    let continues = |hook: fn(&Notice, &DecoderContext) -> bool, code| hook(&Notice::synthesized(code, String::new()), &DecoderContext::default());
     assert!(continues(HistoricalDataFrame::error_continues_request, 10299));
     assert!(!continues(HistoricalDataFrame::error_continues_request, 162));
     assert!(!continues(TickTypes::error_continues_request, 10299));

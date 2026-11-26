@@ -668,7 +668,7 @@ impl StreamDecoder<HistoricalDataFrame> for HistoricalDataFrame {
     /// (AGGTRADES for crypto `TRADES`, TRADES for AGGTRADES on stocks and
     /// futures), then the window. With `keep_up_to_date` it streams the
     /// updates too, and a later cancel draws 162.
-    fn error_continues_request(notice: &Notice) -> bool {
+    fn error_continues_request(notice: &Notice, _context: &DecoderContext) -> bool {
         notice.code == WHAT_TO_SHOW_SUBSTITUTED_CODE
     }
 }

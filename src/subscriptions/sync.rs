@@ -365,7 +365,7 @@ impl<T: StreamDecoder<T>> Subscription<T> {
     }
 
     fn handle_response(&self, response: Option<RoutedItem>) -> NextAction<Result<SubscriptionItem<T>, Error>> {
-        match response.map(continuing_error_as_notice::<T>) {
+        match response.map(|item| continuing_error_as_notice::<T>(item, &self.context)) {
             Some(RoutedItem::Response(message)) if is_undeclared(T::RESPONSE_MESSAGE_IDS, &message) => {
                 log::trace!("skipping {:?} — not declared by this subscription's decoder", message.message_type());
                 NextAction::Skip
