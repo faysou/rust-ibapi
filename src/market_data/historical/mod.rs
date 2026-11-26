@@ -28,7 +28,7 @@ use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
 use crate::contracts::SecurityType;
 use crate::market_data::common::decoders::BarTradeFields;
-use crate::messages::{IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE};
+use crate::messages::{IncomingMessages, Notice, ResponseMessage, HMDS_ERROR_CODE, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
@@ -690,10 +690,12 @@ impl StreamDecoder<HistoricalDataFrame> for HistoricalDataFrame {
 
     /// Without `keep_up_to_date`, any error: a one-shot query has nothing to
     /// continue after one. Verified live for 162, 200 and 10314, where TWS
-    /// answers a cancel with 366 (no query found). With it, only 200, after
-    /// which TWS answers the cancel with 366.
+    /// answers a cancel with 366 (no query found). With it, only 200, 162 (no
+    /// market data permissions, invalid step) or 321 (end date or source price
+    /// not supported with live updates), after which TWS answers the cancel
+    /// with 366.
     fn rejection_ends_request(notice: &Notice, context: &DecoderContext) -> bool {
-        !context.keep_up_to_date || notice.code == NO_SECURITY_DEFINITION_CODE
+        !context.keep_up_to_date || matches!(notice.code, NO_SECURITY_DEFINITION_CODE | HMDS_ERROR_CODE | REQUEST_VALIDATION_CODE)
     }
 }
 
@@ -792,9 +794,9 @@ pub enum WhatToShow {
     ///
     /// The trade-price series for crypto. A crypto `TRADES` bar request draws
     /// notice 10299 ("Expected what to show is AGGTRADES") and is then served
-    /// this series; historical ticks are refused with 10299. With `keepUpToDate`
-    /// ([`subscribe_with_updates`](HistoricalDataBuilder::subscribe_with_updates))
-    /// TWS refuses `AGGTRADES` with error 321, so a crypto stream needs
+    /// this series; historical ticks are refused with 10299. With
+    /// `keepUpToDate` ([`stream`](HistoricalDataBuilder::stream)) TWS refuses
+    /// `AGGTRADES` with error 321, so a crypto stream needs
     /// [`Trades`](Self::Trades). On stocks and futures `AGGTRADES` draws 10299
     /// and the `TRADES` bars; on forex, 10299 then 162.
     /// [`trades_for`](Self::trades_for) and [`trades_for_stream`](Self::trades_for_stream) pick
@@ -818,9 +820,8 @@ impl WhatToShow {
     ///
     /// - Crypto: [`AggTrades`](Self::AggTrades). TWS serves `TRADES` bars too, the same data, after
     ///   notice 10299; it refuses `TRADES` historical ticks with 10299. A keep-up-to-date
-    ///   [`subscribe_with_updates`](HistoricalDataBuilder::subscribe_with_updates) on
-    ///   crypto must use [`Trades`](Self::Trades) instead, which
-    ///   [`trades_for_stream`](Self::trades_for_stream) returns.
+    ///   [`stream`](HistoricalDataBuilder::stream) on crypto must use [`Trades`](Self::Trades)
+    ///   instead, which [`trades_for_stream`](Self::trades_for_stream) returns.
     /// - Forex pairs, commodities (`XAUUSD`) and CFDs: `None`. TWS answers `TRADES` with error 162
     ///   ("No historical market data"); request [`MidPoint`](Self::MidPoint), [`Bid`](Self::Bid)
     ///   or [`Ask`](Self::Ask) instead.
@@ -849,8 +850,7 @@ impl WhatToShow {
     }
 
     /// The `whatToShow` that streams trade-price bars for `security_type` with keep-up-to-date
-    /// ([`subscribe_with_updates`](HistoricalDataBuilder::subscribe_with_updates)), or `None`
-    /// where TWS has no trade data for it.
+    /// ([`stream`](HistoricalDataBuilder::stream)), or `None` where TWS has no trade data for it.
     ///
     /// The same as [`trades_for`](Self::trades_for) except for crypto, which takes
     /// [`Trades`](Self::Trades): TWS refuses `AGGTRADES` with keep-up-to-date (error 321, "Source

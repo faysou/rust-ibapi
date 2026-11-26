@@ -28,31 +28,116 @@ Connection, request ids, cancels and end markers. Format: [README](README.md).
 
 ### Cancel after a request-bound terminal error
 
-*Live 2026-10-26, paper Gateway; #1094, #1097, #1096.*
+*Live 2026-11-24 off-hours, paper TWS, server 223, sync and async; first sweep 2026-10-26, paper
+Gateway; #1094, #1097, #1096.*
 
-TWS reply to a cancel sent after the request already failed. Observed while every type still
-sent the safety-net cancel; types whose code is verified here now skip it, so the reply no
-longer occurs for them.
+TWS reply to a cancel sent after the request already failed. Observed while the type still sent
+the cancel; types whose code is verified here now skip it, so the reply no longer occurs for them.
 
 | Request | Terminal error | Cancel reply |
-|---|---|---|
-| market_data, realtime_bars, tick_by_tick | 200 | 300 |
-| market_depth | 200 | 310 |
+| --- | --- | --- |
+| market_data (stream and snapshot) | 200, 354, 10168 | 300 |
+| realtime_bars | 200, 354, 420 | 300 |
+| tick_by_tick | 200, 10189 | 300 |
+| market_depth | 200, 354 | 310 |
+| market_depth | 10092 (no depth for the security type and exchange) | none |
 | historical_data (stream / fetch) | 200, 162, 10314 | 366 "No historical data query found" |
+| historical_data (subscribe_with_updates) | 162, 321 | 366 |
 | pnl | 321 | 10185 |
 | pnl_single | 321 | 10186 |
 | scanner | 162 (disabled scan code) | 365 |
 | contract_details, historical_ticks | 200 | none |
+| historical_ticks | 10299 | none |
 | account_summary | 321 | none |
 
+- 354, 10168 and 10189 came from a CME future and a US stock without real-time permission. The
+  same ES market data request drew 10168 in one run and 354 in the next, minutes apart.
+- 420 on realtime bars (*live 2026-11-24 17:47-17:48 UTC, US market open, paper TWS, server
+  223, market data types real-time and delayed*): IBM `TRADES` ("Invalid Real-time Query:No
+  market data permissions for NYSE STK ..."), ESZ6 `TRADES` ("... for CME FUT") and EUR.USD
+  `TRADES` ("... No historical market data for EUR/CASH@FXSUBPIP Last 0"). No bar followed for
+  that request id, and the cancel the client sent drew 300 "Can't find EId with
+  tickerId:1500000001" 1 to 2 ms later, under both types. The same session's EUR.USD `MIDPOINT`
+  bars streamed. With the delayed type, ESZ6 drew 354 instead and MSFT drew 10089 under both
+  types (420 at 16:42 UTC). Market data, tick-by-tick and keep-up-to-date requests on these
+  contracts drew 10089, 354, 162 or 321, never 420.
 - The reply has no recipient; the transport logs `no recipient for error` at INFO. It does not
   reach `notice_stream()`. Cost: one wasted write and one log line.
+- A cancel that draws no reply proves nothing either way, so those types keep cancelling.
 - `positions_multi` / `account_updates_multi`: TWS accepts a made-up account (DU0000000) with
   no error, so no terminal error could be provoked.
 - 10314 came from a 1975 end date (IB rejects that old a date), not a format problem.
 - Skipping the cancel is opt-in per verified code (`StreamDecoder::rejection_ends_request`). A
   global skip was rejected: a code we treat as terminal may not end the request at TWS (10197
-  market data), and skipping would leak TWS resources.
+  market data, 10299 below), and skipping would leak TWS resources.
+- **Not probed:** 354 and 10168 on market data during RTH; 10197; market depth 354 on a stock.
+
+### Cancel after a rejected keepUpToDate historical request
+
+*Live 2026-11-25 09:57-10:01 UTC off-hours, paper TWS, server 223, sync.*
+
+- Raw `reqHistoricalData` with `keepUpToDate` true, then `cancelHistoricalData` 1.5 s after the
+  error, under the same request id. Every rejection below drew 366 "No historical data query
+  found for ticker id:<id>" within 1 ms of the cancel, so TWS had ended the request:
+  - 200 "No security definition has been found for the request" (ZZZZQX stock, and 005930 on
+    KSE).
+  - 162 "Historical Market Data Service error message:No market data permissions for IBIS STK"
+    (SAP on IBIS, 1 h `TRADES` bars, 1 day).
+  - 162 "Historical Market Data Service error message:invalid step: 1" (EUR.USD, 1 s
+    `MIDPOINT` bars, 2 days).
+  - 321 "Error validating request.-'D' : cause - End date not supported with live updates"
+    (EUR.USD, end date set).
+  - 321 "Error validating request.-'D' : cause - Source price not supported with live
+    updates" (AAPL `ADJUSTED_LAST`; BTC `AGGTRADES`).
+- The same requests with `keepUpToDate` false drew the same 200 and 162 errors, and the same
+  366 to a cancel; with an end date or `ADJUSTED_LAST` / `AGGTRADES` they were served.
+- Requests that streamed answered the cancel with 162 "API historical data query cancelled:
+  <id>" instead: EUR.USD `MIDPOINT` (updates every ~5 s), and ESZ6 (CME) and 7203 (TSE)
+  `TRADES`, whose bars came without a permission error and then no update or error for 12 to
+  45 s.
+- `HistoricalDataFrame::rejection_ends_request` matches 200, 162 and 321 by code under `keep_up_to_date`.
+- **Not probed:** 354 and 10182 on a historical request (neither could be provoked: no
+  contract tried drew 354, and no HMDS farm disconnect happened), pacing-violation 162, and RTH.
+
+### Cancel after a request TWS finished
+
+*Live 2026-11-24 off-hours, paper TWS, server 223.*
+
+- Snapshot market data (EUR.USD, BTC) ends with TickSnapshotEnd; no cancel is sent after it.
+- historical_data `subscribe()` (EUR.USD, ES) ends with HistoricalDataEnd; no cancel.
+- historical_ticks (EUR.USD midpoint) ends on the batch flagged done; no cancel.
+- contract_details (AAPL) ends with ContractDataEnd; no cancel.
+- Still-live requests answer the cancel without error: streaming market data, tick-by-tick and
+  market depth on EUR.USD, account_summary after its End (the stream stays open), pnl. A
+  `stream()` historical request answers it with 162 "API historical data query cancelled".
+
+### 10089 ends the request without an end marker
+
+*Live 2026-11-24 off-hours, paper TWS, server 223, market data type real-time.*
+
+- AAPL snapshot, AAPL streaming market data and AAPL realtime bars each drew 10089 "Requested
+  market data requires additional subscription for API ... Delayed market data is available",
+  then nothing for 12-15 s: no ticks, no TickSnapshotEnd. A cancel afterwards drew 300 every
+  time, so TWS had already ended the request.
+- The client classifies 10089 as a data advisory (`DATA_ADVISORY_CODES`), so the stream stays
+  open and its drop still sends the cancel.
+- With market data type delayed (3) or delayed-frozen (4), the same requests drew 10167 and
+  delayed ticks; frozen (2) drew 10168.
+- **Not probed:** RTH, and an account with delayed data enabled for the API.
+
+### 10299 does not end a historical request
+
+*Live 2026-11-24 off-hours, paper TWS, server 223.*
+
+- historical_data TRADES on BTC (PAXOS crypto) drew 10299 "Expected what to show is AGGTRADES,
+  please use that instead of TRADES", then TWS sent the bars and HistoricalDataEnd for the same
+  request id anyway, about 180 ms later.
+- With `keepUpToDate` (`stream()`), TWS sent the bars after the 10299 and kept sending updates
+  every ~5 s. A cancel sent right after the 10299 drew 366 "No historical data query found",
+  and the updates kept coming for the 37 s left in the session.
+- The client ends the stream on the 10299, so those frames reach no recipient.
+- historical_ticks TRADES on BTC drew the same 10299 and no ticks afterwards.
+- **Not probed:** whether a later cancel stops the updates.
 
 ### Cancel of a running historical bar request (162)
 

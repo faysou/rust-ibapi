@@ -19,7 +19,10 @@ use time::OffsetDateTime;
 use crate::common::error_helpers;
 use crate::contracts::{OptionComputation, SecurityType};
 use crate::market_data::common::decoders::BarTradeFields;
-use crate::messages::{IncomingMessages, Notice, ResponseMessage, MARKET_DEPTH_RESET_CODE, NO_SECURITY_DEFINITION_CODE};
+use crate::messages::{
+    IncomingMessages, Notice, ResponseMessage, MARKET_DATA_DELAYED_NOT_ENABLED_CODE, MARKET_DATA_NOT_SUBSCRIBED_CODE, MARKET_DEPTH_RESET_CODE,
+    NO_SECURITY_DEFINITION_CODE, REALTIME_QUERY_INVALID_CODE, TICK_BY_TICK_FAILED_CODE,
+};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::Error;
 
@@ -64,9 +67,9 @@ impl StreamDecoder<TickBidAsk> for TickBidAsk {
         common::encoders::encode_cancel_tick_by_tick(request_id)
     }
 
-    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    /// Live: after 200 or 10189 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(notice.code, NO_SECURITY_DEFINITION_CODE | TICK_BY_TICK_FAILED_CODE)
     }
 }
 
@@ -85,9 +88,9 @@ impl StreamDecoder<TickMidpoint> for TickMidpoint {
         common::encoders::encode_cancel_tick_by_tick(request_id)
     }
 
-    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    /// Live: after 200 or 10189 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(notice.code, NO_SECURITY_DEFINITION_CODE | TICK_BY_TICK_FAILED_CODE)
     }
 }
 
@@ -179,9 +182,12 @@ impl StreamDecoder<Bar> for Bar {
         common::encoders::encode_cancel_realtime_bars(request_id)
     }
 
-    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    /// Live: after 200, 354 or 420 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(
+            notice.code,
+            NO_SECURITY_DEFINITION_CODE | MARKET_DATA_NOT_SUBSCRIBED_CODE | REALTIME_QUERY_INVALID_CODE
+        )
     }
 }
 
@@ -200,9 +206,9 @@ impl StreamDecoder<TickLast> for TickLast {
         common::encoders::encode_cancel_tick_by_tick(request_id)
     }
 
-    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    /// Live: after 200 or 10189 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(notice.code, NO_SECURITY_DEFINITION_CODE | TICK_BY_TICK_FAILED_CODE)
     }
 }
 
@@ -429,9 +435,9 @@ impl StreamDecoder<MarketDepths> for MarketDepths {
         common::encoders::encode_cancel_market_depth(request_id, context.map(|c| c.is_smart_depth).unwrap_or(false))
     }
 
-    /// Live: after 200 TWS answers the cancel with 310 (no such request).
+    /// Live: after 200 or 354 TWS answers the cancel with 310 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(notice.code, NO_SECURITY_DEFINITION_CODE | MARKET_DATA_NOT_SUBSCRIBED_CODE)
     }
 
     /// Live: a rerouted depth request holds no depth slot (309 never fires).
@@ -516,9 +522,12 @@ impl StreamDecoder<TickTypes> for TickTypes {
         common::encoders::encode_cancel_market_data(request_id)
     }
 
-    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    /// Live: after 200, 354 or 10168 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(
+            notice.code,
+            NO_SECURITY_DEFINITION_CODE | MARKET_DATA_NOT_SUBSCRIBED_CODE | MARKET_DATA_DELAYED_NOT_ENABLED_CODE
+        )
     }
 
     fn is_snapshot_end(&self, _context: &DecoderContext) -> bool {
