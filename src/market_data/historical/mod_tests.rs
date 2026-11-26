@@ -404,7 +404,7 @@ fn what_to_show_trades_for_security_type() {
 }
 
 #[test]
-fn what_to_show_trades_for_stream_security_type() {
+fn what_to_show_trades_for_updates_security_type() {
     let cases = [
         (SecurityType::Crypto, Some(WhatToShow::Trades)),
         (SecurityType::ForexPair, None),
@@ -418,6 +418,6 @@ fn what_to_show_trades_for_stream_security_type() {
         (SecurityType::Other("XYZ".into()), Some(WhatToShow::Trades)),
     ];
     for (security_type, expected) in cases {
-        assert_eq!(WhatToShow::trades_for_stream(&security_type), expected, "{security_type:?}");
+        assert_eq!(WhatToShow::trades_for_updates(&security_type), expected, "{security_type:?}");
     }
 }
