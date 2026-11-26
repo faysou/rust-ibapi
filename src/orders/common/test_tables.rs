@@ -540,6 +540,7 @@ pub(crate) fn lookup_cases() -> Vec<LookupCase> {
             requests: 1,
         },
     ]
+}
 
 /// Ids of the parent and two children [`linked_orders`] returns.
 pub(crate) const LINKED_ORDER_IDS: [i32; 3] = [9400, 9401, 9402];
