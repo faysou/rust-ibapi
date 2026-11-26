@@ -116,3 +116,20 @@ fn bar_deserialize_applies_the_decoder_trade_fields_rule() {
         assert_eq!(back, bar);
     }
 }
+
+#[test]
+fn what_to_show_trades_for_security_type() {
+    let cases = [
+        (SecurityType::Crypto, Some(WhatToShow::AggTrades)),
+        (SecurityType::ForexPair, None),
+        (SecurityType::Commodity, None),
+        (SecurityType::CFD, None),
+        (SecurityType::Stock, Some(WhatToShow::Trades)),
+        (SecurityType::Future, Some(WhatToShow::Trades)),
+        (SecurityType::Index, Some(WhatToShow::Trades)),
+        (SecurityType::Other("XYZ".into()), Some(WhatToShow::Trades)),
+    ];
+    for (security_type, expected) in cases {
+        assert_eq!(WhatToShow::trades_for(&security_type), expected, "{security_type:?}");
+    }
+}

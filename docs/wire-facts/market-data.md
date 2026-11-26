@@ -256,15 +256,66 @@ hours), paper TWS, server 223; raw capture; #1285.*
   as `"0"` with a real `barCount`.
 - The corn option (OZC, price magnifier 100) sends the non-TRADES `WAP` as `"-100"`, `-1` times
   the magnifier. `volume` and `barCount` stay `-1`.
-- Volatility and adjusted bars (2026-11-25 Wed 11:10 ET, US equities open, same server; decoded
-  values, 1-hour bars over 2 days, AAPL): ADJUSTED_LAST sent real volume, WAP and count, the
-  same as TRADES (9 bars). HISTORICAL_VOLATILITY (1 bar) and OPTION_IMPLIED_VOLATILITY (10 bars)
-  sent volume `1` and count `0` on every bar, with the WAP a volatility (`0.289`, `0.260`), as
-  on server 226.
 - Settles that a realtime bar can carry either form, and that the WAP sentinel scales with the
   price magnifier, so only a volume test can tell it from a price.
 - **Not probed:** realtime bars on a magnified contract; TRADES `keepUpToDate` updates (BTC draws
   10299 for TRADES and 321 "Source price not supported with live updates" for AGGTRADES).
+
+### Trade-price `whatToShow` by security type
+
+*Live 2026-11-23 Mon 18:55-19:05 ET (FX, crypto and CME Globex open, US equities after hours),
+paper TWS, server 223. Contracts: AAPL, ES Dec 26, EUR.USD, SPX, an AAPL option, a CBOT corn
+option (OZC), the IBUS500 index CFD, XAUUSD, BTC on PAXOS.*
+
+Accepted trade-price `whatToShow`, or the error a rejected one drew:
+
+| Security type      | Historical bars                      | Realtime bars       | Historical ticks   |
+| ------------------ | ------------------------------------ | ------------------- | ------------------ |
+| STK, FUT, OPT, FOP | TRADES                               | not probed          | TRADES             |
+| IND (SPX)          | TRADES (volume `0`)                  | not probed          | TRADES             |
+| CASH (EUR.USD)     | none: TRADES 162                     | none: TRADES 420    | none: see below    |
+| CMDTY (XAUUSD)     | none: TRADES 162                     | none: TRADES 420    | none: no answer    |
+| CFD (IBUS500)      | none: TRADES 162                     | not probed          | none: no answer    |
+| CRYPTO (BTC)       | AGGTRADES; TRADES after notice 10299 | AGGTRADES or TRADES | none: TRADES 10299 |
+
+- AGGTRADES drew 10299 on historical bars for every type except crypto, and 420 on realtime bars
+  for EUR.USD and XAUUSD. After that 10299, AAPL and ES historical bars arrive anyway as the
+  TRADES series; EUR.USD draws 162 (2026-11-24, #1298). "Not probed" realtime cells drew 10089, 354 or 420 for missing
+  real-time permission. SPX drew 10187 for BID_ASK and MIDPOINT historical ticks.
+- MIDPOINT, BID and ASK bars worked for every type except IND (162). ADJUSTED_LAST follows TRADES.
+  HISTORICAL_VOLATILITY and OPTION_IMPLIED_VOLATILITY drew 162 except OPTION_IMPLIED_VOLATILITY
+  on AAPL and SPX.
+- 10299 names the expected value: "Expected what to show is AGGTRADES, please use that instead
+  of TRADES" for BTC, and the reverse for the other types. 162 reads "No historical market data
+  for EUR/CASH@FXSUBPIP Last 3600" (XAUUSD: `CMDTYBBO`, IBUS500: `UKBBO`).
+- Realtime TRADES and AGGTRADES on BTC sent identical bars for five 5-second intervals in a row,
+  so the realtime 10299 for crypto TRADES that the `AggTrades` rustdoc stated is not what this
+  server does.
+- 10299 on crypto TRADES bars is a substitution notice, not a rejection: TWS then sends the bars
+  and `HistoricalDataEnd`, identical to an AGGTRADES request (BTC and ETH, 2026-11-24). It is a
+  rejection only for historical ticks, where nothing follows it. Clients before #1298 ended the
+  request on the notice and dropped the bars, which is what the first run here recorded.
+- With `keepUpToDate`, BTC and ETH TRADES draw 10299, then the bars, `HistoricalDataEnd` and live
+  updates; a later cancel draws 162. AGGTRADES draws 321 "Source price not supported with live
+  updates" and nothing else, so TRADES is the only way to stream crypto trade bars. AAPL, ES and
+  EUR.USD AGGTRADES with `keepUpToDate` draw 10299, then 321 (2026-11-24, #1298).
+- Historical ticks TRADES on EUR.USD: TWS answers with one `HistoricalTicks` frame (midpoint
+  ticks, size `"0"`, `done`), not `HistoricalTicksLast`. `historical_ticks(..).last()` does not
+  read it and waits until its deadline. XAUUSD and IBUS500 drew no ticks and no error in 30 s, and were not
+  captured raw.
+- A stock CFD (AAPL, rerouted on `reqMktData`) drew no answer to TRADES or MIDPOINT historical
+  bars within 40 s; realtime bars drew notice 2127 and no bars.
+- The account has crypto market data (BTC on PAXOS) though it has no crypto trading permission.
+- **Streaming requests during US hours** (*live 2026-11-24 16:41-16:43 UTC, paper TWS, server
+  223; BTC on PAXOS and MSFT*): BTC realtime bars stream for `TRADES`, `AGGTRADES` and
+  `MIDPOINT`; keep-up-to-date `TRADES` draws 10299, then the batch, `HistoricalDataEnd` and an
+  update every 5 seconds, and `AGGTRADES` draws 321 alone. Tick-by-tick `Last`, `AllLast` and
+  `BidAsk` stream BTC; tick-by-tick takes no `whatToShow`. MSFT, without real-time permission:
+  realtime `TRADES` bars draw 420 ("No market data permissions for ISLAND STK"), `AGGTRADES`,
+  `MIDPOINT` and every tick-by-tick type draw 10089, keep-up-to-date `TRADES` draws 162 ("HMDS
+  query returned no data"), and `AGGTRADES` draws 10299 and then 321.
+- **Not probed:** realtime bars for STK, FUT, OPT, FOP, IND and CFD with real-time permission;
+  BOND, WAR, FUND, IOPT, EC, BAG; crypto on ZEROHASH; live accounts.
 
 ### Historical bars for a continuous future take no end date
 
