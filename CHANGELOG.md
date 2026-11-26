@@ -49,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ExerciseOptionsBuilder::customer_account` and `ExerciseOptionsBuilder::professional_customer` send a customer account and the professional-customer flag with an exercise request, the `customerAccount` and `professionalCustomer` parameters of IBKR's `exerciseOptions`. Previously neither was sent (#1226).
 
 ### Changed
+- `Currency::default()`, and so the currency of `Contract::default()` and of a `Contract` struct literal ending in `..Default::default()`, is empty instead of `"USD"`. TWS resolves an empty currency when the other fields name one listing, so a non-USD future, index or stock built that way (HSI on HKFE, `700` on SEHK) no longer fails with error 200. A stock on `SMART` listed in several currencies now needs its currency set for market data and orders. The builders still default to USD. See `docs/migration-6.0.md` §55 (#1292).
 - Bracket `submit_all` (sync and async) returns `Result<BracketOrderIds, LinkedOrdersError>` instead of `Result<_, Error>`, so a failure says which orders reached TWS and whether their cancels were sent. `?` into `Error` still works. See `docs/migration-6.0.md` §50 (#1272).
 
 - Deserializing a historical or realtime `Bar` applies the decoder's rule for volume, WAP and count: a stored `-1` volume or count reads as `None`, and so does the WAP of a bar with no volume, so a bar saved by 5.x with the `-1` TWS sends for MIDPOINT, BID and ASK bars no longer keeps the sentinel inside `Some`. See `docs/migration-6.0.md` §38 (#1285).
