@@ -2429,6 +2429,91 @@ fn commission_and_fees_report_routes_via_execution_id_mapping() -> Result<(), Er
     Ok(())
 }
 
+/// `cancel_order` registers its own subscription under the order id. The
+/// `place_order` subscription keeps the order's frames that follow, the fill
+/// a cancel races included, and each subscription gets each frame once.
+#[test]
+fn order_subscription_keeps_frames_after_a_cancel_subscription_opens() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    let cancel = bus.send_order_request(OrderId::from(7), &[])?;
+
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::PendingCancel));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-1"));
+    stream.push_inbound(commission_frame("exec-1"));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Cancelled));
+    stream.push_inbound(error_frame(7, 202, "Order Canceled - reason:"));
+    for _ in 0..5 {
+        bus.dispatch()?;
+    }
+
+    let expected = ["OrderStatus", "ExecutionData", "CommissionsAndFeesReport", "OrderStatus", "notice 202"];
+    for (name, sub) in [("place", &place), ("cancel", &cancel)] {
+        let items: Vec<String> = std::iter::from_fn(|| sub.next_timeout_routed(TICK)).map(routed_label).collect();
+        assert_eq!(items, expected, "{name}");
+    }
+    Ok(())
+}
+
+/// A refused modify draws a TWS error on the order id while the order goes on
+/// working. Only the newest subscription on the id, the modify's, ends on it;
+/// the `place_order` subscription receives it as a notice and keeps the
+/// order's frames that follow.
+#[test]
+fn order_error_ends_only_the_newest_subscription_on_the_order_id() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    let modify = bus.send_order_request(OrderId::from(7), &[])?;
+
+    stream.push_inbound(error_frame(7, 105, "Order being modified does not match original order."));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Submitted));
+    for _ in 0..2 {
+        bus.dispatch()?;
+    }
+
+    let place_items: Vec<String> = std::iter::from_fn(|| place.next_timeout_routed(TICK)).map(routed_label).collect();
+    let modify_first = modify.next_timeout_routed(TICK).map(routed_label);
+    assert_eq!(place_items, ["notice 105", "OrderStatus"]);
+    assert_eq!(
+        modify_first.as_deref(),
+        Some("error [105] Order being modified does not match original order.")
+    );
+    Ok(())
+}
+
+/// `let _ = client.cancel_order(id)?;` drops the cancel's subscription before
+/// TWS answers. Its refusal still reaches the `place_order` subscription as a
+/// notice: the later request superseded it, so it does not end on the error.
+#[test]
+fn order_error_after_the_newer_subscription_drops_is_a_notice() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let handle = bus.start_cleanup_thread();
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    let cancel = bus.send_order_request(OrderId::from(7), &[])?;
+    drop(cancel);
+    drain_cleanup_signals(&bus);
+
+    stream.push_inbound(error_frame(7, 10148, "OrderId 7 that needs to be cancelled can not be cancelled."));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Filled));
+    for _ in 0..2 {
+        bus.dispatch()?;
+    }
+
+    let place_items: Vec<String> = std::iter::from_fn(|| place.next_timeout_routed(TICK)).map(routed_label).collect();
+    bus.request_shutdown();
+    handle.join().expect("cleanup thread join");
+    assert_eq!(place_items, ["notice 10148", "OrderStatus"]);
+    Ok(())
+}
+
+fn routed_label(item: RoutedItem) -> String {
+    match item {
+        RoutedItem::Response(message) => format!("{:?}", message.message_type()),
+        RoutedItem::Notice(notice) => format!("notice {}", notice.code),
+        RoutedItem::Error(e) => format!("error {e}"),
+    }
+}
+
 #[test]
 fn completed_order_routes_to_shared_channel() -> Result<(), Error> {
     let (stream, bus) = make_bus();
@@ -3763,19 +3848,22 @@ fn wait_connected_returns_shutdown_when_the_bus_shuts_down() {
     assert!(start.elapsed() < Duration::from_secs(5), "wait_connected did not return on shutdown");
 }
 
-/// Writes fail, reads delegate to a `MemoryStream`. Stands in for a write
-/// refused after the registration went in: the session went down between the
-/// registering call's first state check and its write.
+/// Writes fail while the flag is set, reads delegate to a `MemoryStream`.
+/// Stands in for a write refused after the registration went in: the session
+/// went down between the registering call's first state check and its write.
 #[derive(Clone, Debug)]
-struct FailingWriteStream(MemoryStream);
+struct FailingWriteStream(MemoryStream, Arc<AtomicBool>);
 
 impl Io for FailingWriteStream {
     fn read_message(&self) -> Result<Vec<u8>, Error> {
         self.0.read_message()
     }
 
-    fn write_all(&self, _buf: &[u8]) -> Result<(), Error> {
-        Err(Error::ConnectionReset)
+    fn write_all(&self, buf: &[u8]) -> Result<(), Error> {
+        if self.1.load(Ordering::SeqCst) {
+            return Err(Error::ConnectionReset);
+        }
+        self.0.write_all(buf)
     }
 
     fn close(&self) {
@@ -3801,7 +3889,8 @@ impl Stream for FailingWriteStream {}
 /// and its write.
 #[test]
 fn failed_write_leaves_no_registration() {
-    let connection = Connection::stubbed(FailingWriteStream(MemoryStream::default()), 28);
+    let stream = FailingWriteStream(MemoryStream::default(), Arc::new(AtomicBool::new(true)));
+    let connection = Connection::stubbed(stream, 28);
     connection.set_server_version_for_test(crate::server_versions::PROTOBUF_REST_MESSAGES_3);
     let bus = Arc::new(TcpMessageBus::new(connection));
     let mb: &dyn MessageBus = bus.as_ref();
@@ -3818,6 +3907,29 @@ fn failed_write_leaves_no_registration() {
         0,
         "a failed write must leave no shared subscription registered"
     );
+}
+
+/// A modify or cancel whose write fails never reached TWS, so it leaves the
+/// earlier subscription on the order id as it was: TWS rejecting the order
+/// still ends it.
+#[test]
+fn failed_order_write_leaves_the_earlier_subscription_not_superseded() -> Result<(), Error> {
+    let inbound = MemoryStream::default();
+    let failing = Arc::new(AtomicBool::new(false));
+    let connection = Connection::stubbed(FailingWriteStream(inbound.clone(), failing.clone()), CLIENT_ID);
+    connection.set_server_version_for_test(crate::server_versions::PROTOBUF_REST_MESSAGES_3);
+    let bus = Arc::new(TcpMessageBus::new(connection));
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    failing.store(true, Ordering::SeqCst);
+    let modify = bus.send_order_request(OrderId::from(7), &[]);
+
+    inbound.push_inbound(error_frame(7, 201, "Order rejected - reason:"));
+    bus.dispatch()?;
+
+    let place_first = place.next_timeout_routed(TICK).map(routed_label);
+    assert!(matches!(modify, Err(Error::ConnectionReset)), "{modify:?}");
+    assert_eq!(place_first.as_deref(), Some("error [201] Order rejected - reason:"));
+    Ok(())
 }
 
 #[test]

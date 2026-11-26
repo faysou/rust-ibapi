@@ -1294,3 +1294,26 @@ terms. Treat the order as gone only when no status has been seen for it. For an
 
 A refused cancel or modify that arrives before any status for the order no longer starts an
 `order_status_stream`, so `wait_for_fill` does not report it as `OrderOutcome::Rejected`.
+
+### 52. A cancel or modify no longer ends the order's earlier subscription
+
+5.x kept one subscription per order ID: `cancel_order`, or a modify through another
+`place_order` with the same ID, replaced the earlier subscription, which ended at once. Fills
+that arrived after the cancel went only to `order_update_stream`. Every subscription on the ID
+now stays live and receives each of the order's frames once.
+
+- **After `cancel_order`**: the `place_order` subscription yields the `Cancelled` status, the
+  202 notice, and any fills and commission reports that follow. The `cancel_order` subscription
+  yields the same statuses and notice. Code that stopped reading the `place_order` subscription
+  because it ended, and read the outcome from the cancel, can read both from it.
+- **After a modify**: the earlier `place_order` subscription keeps yielding the order's events
+  beside the new one. Drop the subscription you no longer read.
+- **A refused modify or cancel**: TWS sends its error (105, 104, 10148, ...) on the order ID
+  without saying which request it answers, so it ends only the newest subscription on the ID.
+  Every subscription opened before another one on the ID yields it as `SubscriptionItem::Notice`
+  and keeps going, also after the later subscription is dropped (`let _ = client.cancel_order(id)?;`).
+  Code that read the refusal from the `place_order` subscription as an `Err` reads it as a notice
+  there, or from the modify's or cancel's own subscription.
+- **A modify sent with `submit_order`** opens no subscription. If the `place_order` subscription
+  is the order's only one, it is the newest, and a refusal of that modify ends it with the error
+  although the order is still working, as in 5.x. Send modifies with `place_order` to keep it.

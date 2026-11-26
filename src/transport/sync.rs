@@ -996,6 +996,7 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
             self.orders.remove_if_same(order_id, &lease_ref);
             return Err(e);
         }
+        self.orders.supersede_earlier(&order_id, &lease_ref);
 
         let subscription = SubscriptionBuilder::new()
             .receiver(receiver)
@@ -1096,11 +1097,22 @@ struct Entry<V> {
     lease: LeaseRef,
     /// The unread-item cap of a route opened with a `send_request_capped` bound.
     bound: Option<BoundState>,
+    /// Another entry was registered under this entry's key after it and its
+    /// request was written, so an error frame on the key may answer that later
+    /// request: it reaches this entry as
+    /// [`RoutedItem::for_earlier_subscription`], also once the later entry is
+    /// gone.
+    superseded: bool,
 }
 
 impl<V> Entry<V> {
     fn new(sender: Sender<V>, lease: LeaseRef) -> Self {
-        Self { sender, lease, bound: None }
+        Self {
+            sender,
+            lease,
+            bound: None,
+            superseded: false,
+        }
     }
 
     fn closed(&self) -> bool {
@@ -1138,9 +1150,12 @@ impl Entry<RoutedItem> {
     }
 }
 
+/// Routes keyed by request id, order id, or execution id. A key can hold
+/// several entries: every subscription opened on one order id (`place_order`,
+/// a modify, `cancel_order`) receives that order's frames.
 #[derive(Debug)]
 struct SenderHash<K, V> {
-    senders: RwLock<HashMap<K, Entry<V>>>,
+    senders: RwLock<HashMap<K, Vec<Entry<V>>>>,
 }
 
 impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K, V> {
@@ -1150,11 +1165,11 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         }
     }
 
-    fn read(&self) -> RwLockReadGuard<'_, HashMap<K, Entry<V>>> {
+    fn read(&self) -> RwLockReadGuard<'_, HashMap<K, Vec<Entry<V>>>> {
         read_lock(&self.senders)
     }
 
-    fn write(&self) -> RwLockWriteGuard<'_, HashMap<K, Entry<V>>> {
+    fn write(&self) -> RwLockWriteGuard<'_, HashMap<K, Vec<Entry<V>>>> {
         write_lock(&self.senders)
     }
 
@@ -1168,12 +1183,12 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         self.with_entry(&id, |entry| entry.lease.clone())
     }
 
-    /// Run `f` on `id`'s entry while holding the read lock, so no removal can
-    /// land between the lookup and `f`.
+    /// Run `f` on the newest of `id`'s entries while holding the read lock, so
+    /// no removal can land between the lookup and `f`.
     #[cfg(test)]
     fn with_entry<R>(&self, id: &K, f: impl FnOnce(&Entry<V>) -> R) -> Option<R> {
         let senders = self.read();
-        senders.get(id).map(f)
+        senders.get(id).and_then(|entries| entries.last()).map(f)
     }
 
     pub fn insert(&self, id: K, sender: Sender<V>, lease: LeaseRef) {
@@ -1189,29 +1204,62 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         self.insert_entry(id, entry);
     }
 
+    /// Register `entry` under `id` beside the entries already there. An entry
+    /// with the same lease is replaced, so one subscription never holds two
+    /// entries under a key and never receives a frame twice.
     fn insert_entry(&self, id: K, entry: Entry<V>) {
-        self.write().insert(id, entry);
+        let mut senders = self.write();
+        let registered = senders.entry(id).or_default();
+        registered.retain(|other| !other.lease.is(&entry.lease));
+        registered.push(entry);
     }
 
-    /// Remove the entry for `id` only if it holds `lease`. Returns whether an
-    /// entry was removed. Used by signal cleanup so a stale signal cannot
-    /// remove a newer registration under the same key.
-    pub fn remove_if_same(&self, id: K, lease: &LeaseRef) -> bool {
-        match self.write().entry(id) {
-            hash_map::Entry::Occupied(registered) if registered.get().lease.is(lease) => {
-                registered.remove();
-                true
-            }
-            _ => false,
+    /// Mark the entries registered under `id` before the one holding `lease`
+    /// as superseded, once that entry's request is written. Until then they
+    /// already receive [`RoutedItem::for_earlier_subscription`] as earlier
+    /// entries; the mark keeps it so after the newer entry is gone. A request
+    /// whose write fails marks nothing.
+    pub fn supersede_earlier(&self, id: &K, lease: &LeaseRef) {
+        let mut senders = self.write();
+        let Some(registered) = senders.get_mut(id) else {
+            return;
+        };
+        let Some(position) = registered.iter().position(|entry| entry.lease.is(lease)) else {
+            return;
+        };
+        for entry in &mut registered[..position] {
+            entry.superseded = true;
         }
+    }
+
+    /// Remove `id`'s entry that holds `lease`, and `id` once none is left.
+    /// Returns whether an entry was removed. Used by signal cleanup so a
+    /// stale signal cannot remove another registration under the same key.
+    pub fn remove_if_same(&self, id: K, lease: &LeaseRef) -> bool {
+        let mut senders = self.write();
+        let hash_map::Entry::Occupied(mut registered) = senders.entry(id) else {
+            return false;
+        };
+        let before = registered.get().len();
+        registered.get_mut().retain(|entry| !entry.lease.is(lease));
+        let removed = registered.get().len() < before;
+        if registered.get().is_empty() {
+            registered.remove();
+        }
+        removed
     }
 
     /// Remove every entry holding `lease`. Returns how many were removed.
     pub fn remove_all_same(&self, lease: &LeaseRef) -> usize {
         let mut senders = self.write();
-        let before = senders.len();
-        senders.retain(|_, registered| !registered.lease.is(lease));
-        before - senders.len()
+        let mut removed = 0;
+        senders.retain(|_, registered| {
+            let before = registered.len();
+            registered.retain(|entry| !entry.lease.is(lease));
+            removed += before - registered.len();
+            !registered.is_empty()
+        });
+        removed
     }
 
     pub fn contains(&self, id: &K) -> bool {
@@ -1231,13 +1279,13 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
 }
 
 impl<K: std::hash::Hash + Eq + std::fmt::Debug> SenderHash<K, RoutedItem> {
-    /// Deliver `item` to `id`'s route; hands it back when nothing is
+    /// Deliver `item` to each of `id`'s routes; hands it back when nothing is
     /// registered under `id`.
     pub fn deliver(&self, id: &K, item: RoutedItem) -> Result<(), RoutedItem> {
         self.deliver_then(id, item, |_| {})
     }
 
-    /// Deliver `item` to `id`'s route, then alias that route under `alias`
+    /// Deliver `item` to each of `id`'s routes, then alias each under `alias`
     /// in `aliases` while still holding `id`'s read lock, so a concurrent
     /// cleanup either removes the registration first (no alias is stored) or
     /// prunes the alias after it. Lock order: `self` (read), then `aliases`
@@ -1257,15 +1305,22 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug> SenderHash<K, RoutedItem> {
         })
     }
 
-    /// Deliver `item` to `id`'s route and run `then` on it, both under the
-    /// read lock.
-    fn deliver_then(&self, id: &K, item: RoutedItem, then: impl FnOnce(&Entry<RoutedItem>)) -> Result<(), RoutedItem> {
+    /// Deliver `item` to each of `id`'s routes and run `then` on each, all
+    /// under the read lock. Superseded entries, every one but the newest and
+    /// the newest too once a later entry was removed, receive
+    /// [`RoutedItem::for_earlier_subscription`].
+    fn deliver_then(&self, id: &K, item: RoutedItem, then: impl Fn(&Entry<RoutedItem>)) -> Result<(), RoutedItem> {
         let senders = self.read();
-        let Some(entry) = senders.get(id) else {
+        let Some((newest, earlier)) = senders.get(id).and_then(|registered| registered.split_last()) else {
             return Err(item);
         };
-        entry.deliver(id, item);
-        then(entry);
+        for entry in earlier {
+            entry.deliver(id, item.for_earlier_subscription());
+            then(entry);
+        }
+        let item = if newest.superseded { item.for_earlier_subscription() } else { item };
+        newest.deliver(id, item);
+        then(newest);
         Ok(())
     }
 
@@ -1279,7 +1334,7 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug> SenderHash<K, RoutedItem> {
         F: Fn() -> RoutedItem,
     {
         let mut senders = self.write();
-        for entry in senders.values().filter(|entry| !entry.closed()) {
+        for entry in senders.values().flatten().filter(|entry| !entry.closed()) {
             let _ = entry.sender.send(message_fn());
         }
         senders.clear();
