@@ -782,7 +782,7 @@ pub enum WhatToShow {
     /// TWS refuses `AGGTRADES` with error 321, so a crypto stream needs
     /// [`Trades`](Self::Trades). On stocks and futures `AGGTRADES` draws 10299
     /// and the `TRADES` bars; on forex, 10299 then 162.
-    /// [`trades_for`](Self::trades_for) and [`trades_for_stream`](Self::trades_for_stream) pick
+    /// [`trades_for`](Self::trades_for) and [`trades_for_updates`](Self::trades_for_updates) pick
     /// between the two.
     AggTrades,
     /// Historical volatility computed by IB.
@@ -805,7 +805,7 @@ impl WhatToShow {
     ///   notice 10299; it refuses `TRADES` historical ticks with 10299. A keep-up-to-date
     ///   [`subscribe_with_updates`](HistoricalDataBuilder::subscribe_with_updates) on
     ///   crypto must use [`Trades`](Self::Trades) instead, which
-    ///   [`trades_for_stream`](Self::trades_for_stream) returns.
+    ///   [`trades_for_updates`](Self::trades_for_updates) returns.
     /// - Forex pairs, commodities (`XAUUSD`) and CFDs: `None`. TWS answers `TRADES` with error 162
     ///   ("No historical market data"); request [`MidPoint`](Self::MidPoint), [`Bid`](Self::Bid)
     ///   or [`Ask`](Self::Ask) instead.
@@ -851,11 +851,11 @@ impl WhatToShow {
     /// use ibapi::contracts::SecurityType;
     /// use ibapi::market_data::historical::WhatToShow;
     ///
-    /// assert_eq!(WhatToShow::trades_for_stream(&SecurityType::Crypto), Some(WhatToShow::Trades));
-    /// assert_eq!(WhatToShow::trades_for_stream(&SecurityType::Future), Some(WhatToShow::Trades));
-    /// assert_eq!(WhatToShow::trades_for_stream(&SecurityType::ForexPair), None);
+    /// assert_eq!(WhatToShow::trades_for_updates(&SecurityType::Crypto), Some(WhatToShow::Trades));
+    /// assert_eq!(WhatToShow::trades_for_updates(&SecurityType::Future), Some(WhatToShow::Trades));
+    /// assert_eq!(WhatToShow::trades_for_updates(&SecurityType::ForexPair), None);
     /// ```
-    pub fn trades_for_stream(security_type: &SecurityType) -> Option<Self> {
+    pub fn trades_for_updates(security_type: &SecurityType) -> Option<Self> {
         match security_type {
             SecurityType::Crypto => Some(Self::Trades),
             _ => Self::trades_for(security_type),
