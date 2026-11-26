@@ -125,10 +125,11 @@ impl ClientIdManager {
         self.order_ids.raise(order_id.value());
     }
 
-    /// Raises the order ID from a reconnect handshake's next valid ID. A value
-    /// in the request range is still applied — the server will not accept
-    /// lower ids — but logged, since every order placed from it will be
-    /// rejected ([`OrderId::checked`]).
+    /// Raises the order ID to a floor the server enforces: a reconnect
+    /// handshake's next valid ID, or one past an order TWS listed for another
+    /// client. A value in the request range is still applied — the server will
+    /// not accept lower ids — but logged, since every order placed from it
+    /// will be rejected ([`OrderId::checked`]).
     pub(crate) fn raise_order_id_from_server(&self, next_valid_id: i32) {
         let order_id = OrderId::from(next_valid_id);
         if order_id.checked().is_err() {
