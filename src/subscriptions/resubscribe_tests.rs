@@ -410,7 +410,7 @@ fn reopens_after_last_hmds_ok() -> Vec<Step> {
         Step::Item("data"),
         notice(&RESTORED),
         Step::Opens(2),
-        Step::Wire("RCR"),
+        Step::Wire("RR"),
     ]);
     steps
 }
@@ -424,6 +424,7 @@ fn market_data_farm_without_ok_does_not_block() -> Vec<Step> {
         Step::Opens(1),
         notice(&CASHHMDS_OK),
         Step::Opens(2),
+        Step::Wire("RR"),
         bars(1),
         Step::Item("data"),
     ]);
@@ -442,6 +443,7 @@ fn repeated_10182_waits_again() -> Vec<Step> {
         Step::Opens(2),
         notice(&CASHHMDS_OK),
         Step::Opens(3),
+        Step::Wire("RRR"),
         bars(2),
         Step::Item("data"),
     ]);
@@ -457,6 +459,7 @@ fn transport_loss_during_wait_reconnects() -> Vec<Step> {
         Step::TransportLost,
         Step::Item("gap"),
         Step::Opens(2),
+        Step::Wire("RR"),
         bars(1),
         Step::Item("data"),
     ]);
@@ -471,10 +474,10 @@ fn inactive_then_ok_reopens_again() -> Vec<Step> {
     steps.extend([
         notice(&CASHHMDS_INACTIVE),
         Step::Opens(2),
-        Step::Wire("RCR"),
+        Step::Wire("RR"),
         notice(&CASHHMDS_OK),
         Step::Opens(3),
-        Step::Wire("RCRCR"),
+        Step::Wire("RRCR"),
         bars(2),
         Step::Item("data"),
         notice(&RESTORED),
@@ -491,7 +494,7 @@ fn inactive_then_restored_reopens_again() -> Vec<Step> {
         Step::Opens(2),
         notice(&RESTORED),
         Step::Opens(3),
-        Step::Wire("RCRCR"),
+        Step::Wire("RRCR"),
         bars(2),
         Step::Item("data"),
     ]);
@@ -505,10 +508,10 @@ fn timeout_then_ok_reopens_again() -> Vec<Step> {
     steps.extend([
         Step::Opens(1),
         Step::Opens(2),
-        Step::Wire("RCR"),
+        Step::Wire("RR"),
         notice(&CASHHMDS_OK),
         Step::Opens(3),
-        Step::Wire("RCRCR"),
+        Step::Wire("RRCR"),
         bars(2),
         Step::Item("data"),
     ]);
@@ -525,7 +528,7 @@ fn timeout_then_data_keeps_request() -> Vec<Step> {
         Step::Item("data"),
         notice(&CASHHMDS_OK),
         Step::Opens(2),
-        Step::Wire("RCR"),
+        Step::Wire("RR"),
     ]);
     steps
 }
@@ -540,7 +543,7 @@ fn timeout_then_staggered_oks_reopen_once() -> Vec<Step> {
         Step::Opens(2),
         notice(&CASHHMDS_OK),
         Step::Opens(3),
-        Step::Wire("RCRCR"),
+        Step::Wire("RRCR"),
         bars(2),
         Step::Item("data"),
         notice(&RESTORED),
@@ -929,25 +932,25 @@ fn data_lost_during_farm_wait_reopens_once(kind: &LiveKind) -> Vec<Live> {
             "Failed to request live updates (disconnected).",
         )),
         Live::Expect("notice [10182] Failed to request live updates (disconnected)."),
-        Live::Wire("RC"),
+        Live::Wire("R"),
         Live::Pull,
         live_notice(&LOST),
         live_notice(&DATA_LOST),
         Live::Opens(2),
-        Live::Wire("RCR"),
+        Live::Wire("RR"),
         (kind.data)(1),
         Live::Expect("data"),
         Live::Pull,
         (kind.data)(1),
         Live::Expect("data"),
         Live::Opens(2),
-        Live::Wire("RCR"),
+        Live::Wire("RR"),
         Live::Pull,
         live_notice(&DATA_LOST),
         Live::Expect(DATA_LOST_ITEM),
         Live::Pull,
         Live::Opens(3),
-        Live::Wire("RCRCR"),
+        Live::Wire("RRCR"),
         (kind.data)(2),
         Live::Expect("data"),
     ]);
