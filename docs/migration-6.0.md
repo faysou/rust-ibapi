@@ -898,10 +898,10 @@ let volume = bar.volume.unwrap_or(0.0); // where a plain number is wanted
 
 The compiler finds every use as `f64` or `i32`. It doesn't catch the serialized form: both
 types derive `Serialize` / `Deserialize`, and an absent value now serializes as `null`; the
-`utoipa` schemas mark the three fields nullable. JSON written by 5.x still deserializes, by
-the decoder's rule: a stored `-1` volume or count reads back as `None`, and so does the WAP of
-a bar with no volume. A realtime bar's stored `0` volume still reads as `Some(0.0)`, since 5.x
-wrote the same `0` for a quiet TRADES bar; re-fetch where that distinction matters.
+`utoipa` schemas mark the three fields nullable. JSON written by 5.x still deserializes, but a
+stored `-1` reads back as `Some(-1.0)` / `Some(-1)`, not `None`, and a realtime bar's stored
+`0` volume as `Some(0.0)`. Re-fetch, or map `-1` to `None` after loading, where the
+distinction matters.
 
 ### 39. Tick-by-tick and historical ticks share `TickLast`, `TickBidAsk` and `TickMidpoint`
 
