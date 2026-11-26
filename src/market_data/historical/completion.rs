@@ -2,7 +2,7 @@
 
 use time::OffsetDateTime;
 
-use super::{Bar, BarSize, BarTimestamp, HistoricalBarUpdate};
+use super::{Bar, BarSize, BarTimestamp, HistoricalDataFrame};
 
 #[cfg(test)]
 #[path = "completion_tests.rs"]
@@ -20,10 +20,11 @@ pub enum StreamedBar {
 
 /// Turns the items of a keep-up-to-date historical data stream into completed bars.
 ///
-/// [`HistoricalDataBuilder::stream`](super::HistoricalDataBuilder::stream) yields the forming
-/// bar again on every [`HistoricalBarUpdate::Update`] and never marks one as final. Feed each
-/// item to [`apply`](Self::apply): it returns each bar as [`StreamedBar::Completed`] exactly
-/// once, oldest first, and every other value as [`StreamedBar::Forming`].
+/// [`HistoricalDataBuilder::subscribe_with_updates`](super::HistoricalDataBuilder::subscribe_with_updates)
+/// yields the forming bar again on every [`HistoricalDataFrame::Update`] and never marks one as
+/// final. Feed each item to [`apply`](Self::apply): it returns each bar as
+/// [`StreamedBar::Completed`] exactly once, oldest first, and every other value as
+/// [`StreamedBar::Forming`].
 ///
 /// TWS sends an update about every 5 seconds, just after each 5-second boundary of the wall
 /// clock, carrying the bar that holds the 5 seconds just ended, changed or not. A bar completes
@@ -70,7 +71,7 @@ let subscription = client
     .historical_data(&contract, BarSize::Min)
     .what_to_show(WhatToShow::MidPoint)
     .duration(1.days())
-    .stream()
+    .subscribe_with_updates()
     .expect("streaming request failed");
 
 let mut completion = BarCompletion::new(BarSize::Min);
@@ -102,7 +103,7 @@ async fn main() {
         .historical_data(&contract, HistoricalBarSize::Min)
         .what_to_show(HistoricalWhatToShow::MidPoint)
         .duration(1.days())
-        .stream()
+        .subscribe_with_updates()
         .await
         .expect("streaming request failed");
 
@@ -148,12 +149,12 @@ impl BarCompletion {
     }
 
     /// Applies one stream item and returns the bars it completes, oldest first, then the bar it
-    /// leaves forming, if any. [`End`](HistoricalBarUpdate::End) returns nothing.
+    /// leaves forming, if any. [`End`](HistoricalDataFrame::End) returns nothing.
     ///
     /// # Examples
     ///
     /// ```
-    /// use ibapi::market_data::historical::{Bar, BarCompletion, BarSize, BarTimestamp, HistoricalBarUpdate, StreamedBar};
+    /// use ibapi::market_data::historical::{Bar, BarCompletion, BarSize, BarTimestamp, HistoricalDataFrame, StreamedBar};
     /// use time::macros::datetime;
     ///
     /// let bar = |at| Bar { date: BarTimestamp::DateTime(at), ..Bar::default() };
@@ -161,22 +162,22 @@ impl BarCompletion {
     ///
     /// // The batch's last bar may still be forming.
     /// let batch = vec![bar(datetime!(2026-04-14 9:30 UTC)), bar(datetime!(2026-04-14 9:31 UTC))];
-    /// let items = completion.apply(HistoricalBarUpdate::Historical(batch));
+    /// let items = completion.apply(HistoricalDataFrame::Bars(batch));
     /// assert_eq!(items[0], StreamedBar::Completed(bar(datetime!(2026-04-14 9:30 UTC))));
     /// assert_eq!(items[1], StreamedBar::Forming(bar(datetime!(2026-04-14 9:31 UTC))));
     ///
     /// // An update received after the bar's end completes it.
-    /// let items = completion.apply(HistoricalBarUpdate::Update(bar(datetime!(2026-04-14 9:31 UTC))));
+    /// let items = completion.apply(HistoricalDataFrame::Update(bar(datetime!(2026-04-14 9:31 UTC))));
     /// assert_eq!(items, vec![StreamedBar::Completed(bar(datetime!(2026-04-14 9:31 UTC)))]);
     /// ```
-    pub fn apply(&mut self, update: HistoricalBarUpdate) -> Vec<StreamedBar> {
+    pub fn apply(&mut self, update: HistoricalDataFrame) -> Vec<StreamedBar> {
         self.apply_at(update, OffsetDateTime::now_utc())
     }
 
-    fn apply_at(&mut self, update: HistoricalBarUpdate, now: OffsetDateTime) -> Vec<StreamedBar> {
+    fn apply_at(&mut self, update: HistoricalDataFrame, now: OffsetDateTime) -> Vec<StreamedBar> {
         let mut items = Vec::new();
         match update {
-            HistoricalBarUpdate::Historical(bars) => {
+            HistoricalDataFrame::Bars(bars) => {
                 self.forming = None;
                 let mut bars = bars.into_iter();
                 let last = bars.next_back();
@@ -188,7 +189,7 @@ impl BarCompletion {
                     items.push(StreamedBar::Forming(bar));
                 }
             }
-            HistoricalBarUpdate::Update(bar) => {
+            HistoricalDataFrame::Update(bar) => {
                 if !self.is_new(&bar) {
                     return items;
                 }
@@ -203,7 +204,7 @@ impl BarCompletion {
                     items.push(StreamedBar::Forming(bar));
                 }
             }
-            HistoricalBarUpdate::End { .. } => {}
+            HistoricalDataFrame::End { .. } => {}
         }
         items
     }
@@ -229,12 +230,12 @@ impl BarCompletion {
     /// # Examples
     ///
     /// ```
-    /// use ibapi::market_data::historical::{Bar, BarCompletion, BarSize, BarTimestamp, HistoricalBarUpdate};
+    /// use ibapi::market_data::historical::{Bar, BarCompletion, BarSize, BarTimestamp, HistoricalDataFrame};
     /// use time::macros::datetime;
     ///
     /// let mut completion = BarCompletion::new(BarSize::Min);
     /// let bar = Bar { date: BarTimestamp::DateTime(datetime!(2026-04-14 9:31 UTC)), ..Bar::default() };
-    /// completion.apply(HistoricalBarUpdate::Historical(vec![bar]));
+    /// completion.apply(HistoricalDataFrame::Bars(vec![bar]));
     ///
     /// // Long after 9:32, with no update since the batch, the forming bar completes.
     /// assert_eq!(completion.expire(time::Duration::seconds(10)), Some(bar));
@@ -261,14 +262,14 @@ impl BarCompletion {
     /// # Examples
     ///
     /// ```
-    /// use ibapi::market_data::historical::{Bar, BarCompletion, BarSize, BarTimestamp, HistoricalBarUpdate};
+    /// use ibapi::market_data::historical::{Bar, BarCompletion, BarSize, BarTimestamp, HistoricalDataFrame};
     /// use time::macros::datetime;
     ///
     /// let mut completion = BarCompletion::new(BarSize::Min);
     /// assert_eq!(completion.forming_end(), None);
     ///
     /// let bar = Bar { date: BarTimestamp::DateTime(datetime!(2026-04-14 9:31 UTC)), ..Bar::default() };
-    /// completion.apply(HistoricalBarUpdate::Historical(vec![bar]));
+    /// completion.apply(HistoricalDataFrame::Bars(vec![bar]));
     /// assert_eq!(completion.forming_end(), Some(datetime!(2026-04-14 9:32 UTC)));
     /// ```
     pub fn forming_end(&self) -> Option<OffsetDateTime> {

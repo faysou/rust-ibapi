@@ -826,7 +826,7 @@ async fn historical_data_streaming_bar_completion() {
     let mut subscription = client
         .historical_data(&contract, BarSize::Min)
         .duration(Duration::days(1))
-        .stream()
+        .subscribe_with_updates()
         .await
         .expect("streaming request should succeed");
 

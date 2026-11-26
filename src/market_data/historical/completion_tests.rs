@@ -17,8 +17,8 @@ fn daily(on: time::Date, close: f64) -> Bar {
     }
 }
 
-fn update(bar: Bar) -> HistoricalBarUpdate {
-    HistoricalBarUpdate::Update(bar)
+fn update(bar: Bar) -> HistoricalDataFrame {
+    HistoricalDataFrame::Update(bar)
 }
 
 #[test]
@@ -30,7 +30,7 @@ fn batch_completes_all_but_the_last_bar() {
         bar(datetime!(2026-11-24 9:16 UTC), 3.0),
     ];
 
-    let items = completion.apply_at(HistoricalBarUpdate::Historical(bars), datetime!(2026-11-24 9:16:34 UTC));
+    let items = completion.apply_at(HistoricalDataFrame::Bars(bars), datetime!(2026-11-24 9:16:34 UTC));
 
     assert_eq!(
         items,
@@ -47,7 +47,7 @@ fn batch_completes_all_but_the_last_bar() {
 fn update_revising_the_last_batch_bar_keeps_it_forming() {
     let mut completion = BarCompletion::new(BarSize::Min);
     completion.apply_at(
-        HistoricalBarUpdate::Historical(vec![bar(datetime!(2026-11-24 9:16 UTC), 3.0)]),
+        HistoricalDataFrame::Bars(vec![bar(datetime!(2026-11-24 9:16 UTC), 3.0)]),
         datetime!(2026-11-24 9:16:34 UTC),
     );
 
@@ -61,7 +61,7 @@ fn update_revising_the_last_batch_bar_keeps_it_forming() {
 fn update_for_a_later_bar_completes_the_forming_one() {
     let mut completion = BarCompletion::new(BarSize::Sec30);
     completion.apply_at(
-        HistoricalBarUpdate::Historical(vec![bar(datetime!(2026-11-24 9:21:30 UTC), 1.0)]),
+        HistoricalDataFrame::Bars(vec![bar(datetime!(2026-11-24 9:21:30 UTC), 1.0)]),
         datetime!(2026-11-24 9:22:06 UTC),
     );
 
@@ -122,7 +122,7 @@ fn resubscription_replay_completes_the_discarded_forming_bar_once() {
         bar(datetime!(2026-11-24 9:18 UTC), 3.0),
     ];
 
-    let items = completion.apply_at(HistoricalBarUpdate::Historical(replay), datetime!(2026-11-24 9:18:10 UTC));
+    let items = completion.apply_at(HistoricalDataFrame::Bars(replay), datetime!(2026-11-24 9:18:10 UTC));
 
     assert_eq!(
         items,
@@ -154,8 +154,8 @@ fn end_and_empty_batch_return_nothing() {
     let mut completion = BarCompletion::new(BarSize::Min);
     let now = datetime!(2026-11-24 9:00 UTC);
 
-    let batch = completion.apply_at(HistoricalBarUpdate::Historical(vec![]), now);
-    let end = completion.apply_at(HistoricalBarUpdate::End { start: now, end: now }, now);
+    let batch = completion.apply_at(HistoricalDataFrame::Bars(vec![]), now);
+    let end = completion.apply_at(HistoricalDataFrame::End { start: now, end: now }, now);
 
     assert_eq!(batch, vec![]);
     assert_eq!(end, vec![]);
@@ -196,7 +196,7 @@ fn span_of_each_bar_size() {
 fn forming_batch_bar() -> BarCompletion {
     let mut completion = BarCompletion::new(BarSize::Min);
     completion.apply_at(
-        HistoricalBarUpdate::Historical(vec![bar(datetime!(2026-11-24 9:15 UTC), 2.0), bar(datetime!(2026-11-24 9:16 UTC), 3.0)]),
+        HistoricalDataFrame::Bars(vec![bar(datetime!(2026-11-24 9:15 UTC), 2.0), bar(datetime!(2026-11-24 9:16 UTC), 3.0)]),
         datetime!(2026-11-24 9:16:34 UTC),
     );
     completion
@@ -237,7 +237,7 @@ fn update_for_an_expired_bar_is_dropped() {
 fn expire_leaves_a_daily_bar_forming() {
     let mut completion = BarCompletion::new(BarSize::Day);
     completion.apply_at(
-        HistoricalBarUpdate::Historical(vec![daily(date!(2026 - 11 - 24), 3.0)]),
+        HistoricalDataFrame::Bars(vec![daily(date!(2026 - 11 - 24), 3.0)]),
         datetime!(2026-11-24 9:16:34 UTC),
     );
 

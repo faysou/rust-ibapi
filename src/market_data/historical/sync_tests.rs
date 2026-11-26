@@ -926,7 +926,7 @@ fn historical_data_streaming_bar_completion() {
     let subscription = client
         .historical_data(&contract, BarSize::Min)
         .duration(Duration::days(1))
-        .stream()
+        .subscribe_with_updates()
         .expect("streaming request should succeed");
 
     let mut completion = BarCompletion::new(BarSize::Min);
