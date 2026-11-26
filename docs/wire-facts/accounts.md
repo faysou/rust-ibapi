@@ -85,3 +85,15 @@ Positions, PnL and account updates by model. End-marker behavior for account str
   not re-probed (no stock fills placed).
 - **Not probed:** positions in non-US contracts (none held); a stock whose primary listing is
   not its usual SMART destination.
+
+### A second `reqAccountUpdates` for the subscribed account draws no reply
+
+*Live 2026-11-25 off-hours, paper TWS, server 223.*
+
+- `reqAccountUpdates(true, account)` while the first subscription for that account was live,
+  written after the first dump's `AccountDownloadEnd`: no frame in the next 6 s. TWS does not
+  send a second dump, unlike `reqPositions`, `reqOpenOrders` and `reqCompletedOrders`
+  ([overlapping open-order requests](orders.md#overlapping-open-order-requests)). A second
+  `account_updates` caller gets only later periodic updates, never the initial values.
+- **Not probed:** a second request written before the first dump ends, and how long until the
+  next periodic update reaches it.
