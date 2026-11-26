@@ -40,6 +40,10 @@ pub const ORDER_CANCELLED_CODE: i32 = 202;
 /// Generic order-message code whose text determines whether TWS reports a warning or an error.
 pub const ORDER_MESSAGE_CODE: i32 = 399;
 
+/// "Pending to create N orders: 55, 57": after a 1100 (connectivity lost), the orders TWS has
+/// not created. [`Notice::pending_order_ids`] reads the ids.
+pub const ORDER_CREATION_PENDING_CODE: i32 = 1104;
+
 /// "Market depth data has been RESET". A [`DATA_ADVISORY_CODES`] entry; a
 /// depth subscription yields it as [`MarketDepths::Reset`](crate::market_data::realtime::MarketDepths::Reset).
 pub(crate) const MARKET_DEPTH_RESET_CODE: i32 = 317;
@@ -1043,6 +1047,42 @@ impl Notice {
             .filter(|name| !name.is_empty())
             .map(str::to_owned);
         Some(DataFarm { kind, status, name })
+    }
+
+    /// The order ids a 1104 notice names ("Pending to create 2 orders: 55, 57"); `None` for
+    /// any other notice, or when an entry after the colon is not an order id.
+    ///
+    /// TWS sends 1104 with request id -1 alongside a 1100 (connectivity lost), and again as
+    /// the list grows. Live, TWS never created a named order, even after connectivity
+    /// returned: it got no status, was absent from open orders, and a cancel drew 10147. An
+    /// order placed after the 1100 was named too, then rejected with 200. Once connectivity
+    /// is restored, request open orders and treat a named order that is absent as not placed
+    /// (`docs/wire-facts/orders.md#orders-tws-names-in-1104`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::{Notice, ORDER_CREATION_PENDING_CODE};
+    ///
+    /// let notice = Notice {
+    ///     request_id: None,
+    ///     code: ORDER_CREATION_PENDING_CODE,
+    ///     message: "Pending to create 2 orders: 55, 57".into(),
+    ///     error_time: None,
+    ///     advanced_order_reject_json: String::new(),
+    /// };
+    /// assert_eq!(notice.pending_order_ids(), Some(vec![55, 57]));
+    /// ```
+    pub fn pending_order_ids(&self) -> Option<Vec<i32>> {
+        if self.code != ORDER_CREATION_PENDING_CODE {
+            return None;
+        }
+        let (_, ids) = self.message.rsplit_once(':')?;
+        ids.split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| id.parse().ok())
+            .collect()
     }
 
     /// Log severity for this notice, derived from [`Notice::category`] so that
