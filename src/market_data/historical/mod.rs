@@ -758,9 +758,9 @@ pub enum WhatToShow {
     ///
     /// The trade-price series for crypto. A crypto `TRADES` bar request draws
     /// notice 10299 ("Expected what to show is AGGTRADES") and is then served
-    /// this series; historical ticks are refused with 10299. With
-    /// `keepUpToDate` ([`stream`](HistoricalDataBuilder::stream)) TWS refuses
-    /// `AGGTRADES` with error 321, so a crypto stream needs
+    /// this series; historical ticks are refused with 10299. With `keepUpToDate`
+    /// ([`subscribe_with_updates`](HistoricalDataBuilder::subscribe_with_updates))
+    /// TWS refuses `AGGTRADES` with error 321, so a crypto stream needs
     /// [`Trades`](Self::Trades). On stocks and futures `AGGTRADES` draws 10299
     /// and the `TRADES` bars; on forex, 10299 then 162.
     /// [`trades_for`](Self::trades_for) and [`trades_for_stream`](Self::trades_for_stream) pick
@@ -784,8 +784,9 @@ impl WhatToShow {
     ///
     /// - Crypto: [`AggTrades`](Self::AggTrades). TWS serves `TRADES` bars too, the same data, after
     ///   notice 10299; it refuses `TRADES` historical ticks with 10299. A keep-up-to-date
-    ///   [`stream`](HistoricalDataBuilder::stream) on crypto must use [`Trades`](Self::Trades)
-    ///   instead, which [`trades_for_stream`](Self::trades_for_stream) returns.
+    ///   [`subscribe_with_updates`](HistoricalDataBuilder::subscribe_with_updates) on
+    ///   crypto must use [`Trades`](Self::Trades) instead, which
+    ///   [`trades_for_stream`](Self::trades_for_stream) returns.
     /// - Forex pairs, commodities (`XAUUSD`) and CFDs: `None`. TWS answers `TRADES` with error 162
     ///   ("No historical market data"); request [`MidPoint`](Self::MidPoint), [`Bid`](Self::Bid)
     ///   or [`Ask`](Self::Ask) instead.
@@ -814,7 +815,8 @@ impl WhatToShow {
     }
 
     /// The `whatToShow` that streams trade-price bars for `security_type` with keep-up-to-date
-    /// ([`stream`](HistoricalDataBuilder::stream)), or `None` where TWS has no trade data for it.
+    /// ([`subscribe_with_updates`](HistoricalDataBuilder::subscribe_with_updates)), or `None`
+    /// where TWS has no trade data for it.
     ///
     /// The same as [`trades_for`](Self::trades_for) except for crypto, which takes
     /// [`Trades`](Self::Trades): TWS refuses `AGGTRADES` with keep-up-to-date (error 321, "Source
