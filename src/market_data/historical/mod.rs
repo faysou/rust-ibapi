@@ -28,7 +28,9 @@ use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
 use crate::contracts::SecurityType;
 use crate::market_data::common::decoders::BarTradeFields;
-use crate::messages::{IncomingMessages, Notice, ResponseMessage, HMDS_ERROR_CODE, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE};
+use crate::messages::{
+    IncomingMessages, Notice, ResponseMessage, HMDS_ERROR_CODE, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE, WHAT_TO_SHOW_SUBSTITUTED_CODE,
+};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
@@ -700,6 +702,14 @@ impl StreamDecoder<HistoricalDataFrame> for HistoricalDataFrame {
     /// with 366.
     fn rejection_ends_request(notice: &Notice, context: &DecoderContext) -> bool {
         !context.keep_up_to_date || matches!(notice.code, NO_SECURITY_DEFINITION_CODE | HMDS_ERROR_CODE | REQUEST_VALIDATION_CODE)
+    }
+
+    /// Live: after 10299 TWS sends the bars of the series the error names
+    /// (AGGTRADES for crypto `TRADES`, TRADES for AGGTRADES on stocks and
+    /// futures), then the window. With `keep_up_to_date` it streams the
+    /// updates too, and a later cancel draws 162.
+    fn error_continues_request(notice: &Notice) -> bool {
+        notice.code == WHAT_TO_SHOW_SUBSTITUTED_CODE
     }
 }
 
