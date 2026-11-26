@@ -3,10 +3,11 @@ use std::time::{Duration, Instant};
 
 use super::common::fill::{lookup_wait, FillTracker};
 use super::common::lookup::{recheck_delay, OrderKey};
+use super::common::what_if::WhatIfReply;
 use super::common::{decoders, encoders, linked, verify};
 use super::{
     ApiOnly, AutoBind, CancelOrder, ClientBound, ExecutionFilter, Executions, ExerciseOptionsBuilder, OrderBuilder, OrderCancel, OrderLookup,
-    OrderOutcome, OrderStatus, OrderUpdate, Orders, PlaceOrder,
+    OrderOutcome, OrderState, OrderStatus, OrderUpdate, Orders, PlaceOrder,
 };
 use crate::client::blocking::Subscription;
 use crate::common::request_helpers::{self, expect_proto, ONE_SHOT_TIMEOUT};
@@ -79,6 +80,15 @@ impl Client {
     ///
     /// # Arguments
     /// * `auto_bind` - [`AutoBind::Yes`] assigns newly created orders an API order ID and implicitly associates them with this client; with [`AutoBind::No`] future orders are not bound.
+    ///
+    /// TWS sends nothing in reply to the request itself and the stream has no
+    /// end marker: it runs until dropped. Besides orders bound from TWS, it
+    /// yields the `OpenOrder` and `OrderStatus` frames of this client's own
+    /// orders and of any [`open_orders`](Self::open_orders) or
+    /// [`all_open_orders`](Self::all_open_orders) reply on the same
+    /// connection, but not their `OpenOrderEnd`, so those requests don't end
+    /// it. Live (2026-11-25), an order another API client placed reached it
+    /// only through such a reply.
     ///
     /// # Examples
     ///
@@ -246,6 +256,15 @@ impl Client {
     /// Along with the [`crate::orders::ExecutionData`], the [`crate::orders::CommissionAndFeesReport`] will also be returned.
     /// To join each commission to its execution, read the reply with
     /// `collect_to_end_within` and pass it to [`FillMatcher::pair_executions`](crate::orders::FillMatcher::pair_executions).
+    ///
+    /// The reply reaches only this subscription. An open
+    /// [`place_order`](Self::place_order) subscription or
+    /// [`order_update_stream`](Self::order_update_stream) neither receives it
+    /// nor takes rows from it. A reply that TWS sends between one of this
+    /// client's fills and the fill's commission report lists the fill without
+    /// the report; the live report follows on the order's streams, and is
+    /// copied here too, so a reply can carry a fill's report twice. Key
+    /// commissions by `execution_id`.
     /// When requesting executions, a filter can be specified to receive only a subset of them
     ///
     /// # Arguments
@@ -494,6 +513,75 @@ impl Client {
         let subscription = self.send_order(checked_id, request)?;
 
         Ok(Subscription::new(Arc::clone(&self.message_bus), subscription, self.decoder_context()))
+    }
+
+    /// Analyzes `order` for margin and commission (what-if): TWS evaluates it without placing it.
+    ///
+    /// For an order built elsewhere; [`OrderBuilder::analyze`]
+    /// calls this with the client's [`next_order_id`](Client::next_order_id). Sends a copy of
+    /// `order` with [`what_if`](crate::orders::Order::what_if) set under `order_id`, so `order`
+    /// itself is not changed and needs neither.
+    ///
+    /// TWS treats `order_id` as used once the what-if is sent: a later order or what-if under the
+    /// same id, or under a lower one, draws 103 "Duplicate order id" (live: 2026-11-24, server
+    /// 223; `docs/wire-facts/orders.md#what-if-order-ids`). Pass an id from the same sequence as
+    /// the ids passed to [`place_order`](Client::place_order).
+    ///
+    /// Returns the order state that carries the margins and commission. TWS answers some orders
+    /// (live: US stock limit orders) with a warning-only frame first; the returned state keeps
+    /// that frame's [`warning_text`](crate::orders::OrderState::warning_text) (live: 2026-11-24,
+    /// server 223; `docs/wire-facts/orders.md#what-if-answer-frames`).
+    ///
+    /// The answer's frames also reach [`order_update_stream`](Client::order_update_stream), as
+    /// every order frame does, with `order.what_if` set; a stream consumer that analyzes through
+    /// this call can skip them.
+    ///
+    /// # Errors
+    /// - [`Error::OrderIdInRequestRange`] if `order_id`, or a `parent_id` or preset attached-order id on `order`, is at or above 1,500,000,000 (reserved for request ids).
+    /// - [`Error::InvalidArgument`], with nothing sent, for an [`ext_operator`](crate::orders::Order::ext_operator) TWS would reject.
+    /// - The error TWS returns if it rejects the what-if order, including the 201 for an order the account's margin cannot carry.
+    /// - [`Error::UnexpectedEndOfStream`] if the reply ends without the order's state.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::client::blocking::Client;
+    /// use ibapi::contracts::Contract;
+    /// use ibapi::orders::{order_builder, Action};
+    ///
+    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
+    /// let contract = Contract::stock("AAPL").build();
+    /// let order = order_builder::limit_order(Action::Buy, 100.0, 150.0);
+    ///
+    /// let state = client.analyze_order(client.next_order_id(), &contract, &order).expect("analyze failed");
+    /// println!(
+    ///     "initial margin {:?} -> {:?}, commission {:?} {}",
+    ///     state.initial_margin_before, state.initial_margin_after, state.commission_and_fees, state.commission_and_fees_currency
+    /// );
+    /// ```
+    pub fn analyze_order(&self, order_id: impl Into<OrderId>, contract: &Contract, order: &super::Order) -> Result<OrderState, Error> {
+        let order_id: OrderId = order_id.into();
+        let order = super::Order {
+            what_if: true,
+            ..order.clone()
+        };
+
+        let responses = self.place_order(order_id, contract, &order)?;
+
+        // `?` propagates a rejected what-if order (#735), including the 201 that follows the
+        // margins of an order the account cannot carry.
+        let mut reply = WhatIfReply::default();
+        for response in responses.iter_data() {
+            if let PlaceOrder::OpenOrder(order_data) = response? {
+                if order_data.order.order_id == order_id.value() {
+                    if let Some(state) = reply.observe(order_data.order_state) {
+                        return Ok(state);
+                    }
+                }
+            }
+        }
+
+        Err(Error::UnexpectedEndOfStream)
     }
 
     /// Submits or modifies an [`crate::orders::Order`] without returning a subscription.
@@ -751,6 +839,10 @@ impl Client {
     /// [`ExecutionData`](crate::orders::ExecutionData) it belongs to, feed both to a
     /// [`FillMatcher`](crate::orders::FillMatcher): they share `execution_id`, and the
     /// matcher joins them in either arrival order.
+    ///
+    /// The stream carries what TWS reports as it happens. A reply to
+    /// [`executions`](Self::executions), with its commission reports, goes only
+    /// to the request that asked and never appears here.
     ///
     /// # Gaps and recovery
     ///

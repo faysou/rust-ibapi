@@ -1317,3 +1317,22 @@ now stays live and receives each of the order's frames once.
 - **A modify sent with `submit_order`** opens no subscription. If the `place_order` subscription
   is the order's only one, it is the newest, and a refusal of that modify ends it with the error
   although the order is still working, as in 5.x. Send modifies with `place_order` to keep it.
+
+### 53. `executions()` replies no longer reach order subscriptions or `order_update_stream`
+
+An `ExecutionData` frame that answers `executions()` carries that request's id; a live fill
+carries -1. 5.x delivered a reply for an order with an open `place_order` subscription to that
+subscription instead of the request, and copied every reply, with its commission reports, to
+`order_update_stream`. A reply and its commission reports now go only to the request that asked,
+on both clients.
+
+- **`order_update_stream`**: yields executions and commission reports only as they happen. Code
+  that skipped replies by `request_id > 0` can drop that filter. Code that read a snapshot from
+  this stream reads it from the `executions()` subscription instead. A commission report that
+  answered a reply, including one for another client's execution, no longer arrives here.
+- **`place_order`**: no longer yields a second copy of an execution, with its commission report,
+  when any `executions()` call runs while the subscription is open.
+- **`executions()`**: a reply TWS sends between one of this client's fills and the fill's
+  commission report lists the fill without the report. The live report still reaches the
+  order's streams and is copied to the request, so a reply can carry a fill's report twice.
+  Key commissions by `execution_id`.
