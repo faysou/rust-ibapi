@@ -140,7 +140,7 @@ async fn main() {
         .address("127.0.0.1:4002")
         .client_id(100)
         .startup_callback(move |msg| if let StartupMessage::OpenOrder(o) = msg {
-            order_ids_clone.lock().unwrap().push(o.order_id);
+            order_ids_clone.lock().unwrap().push(o.order.order_id);
         })
         .connect()
         .await
@@ -165,7 +165,7 @@ fn main() {
         .address("127.0.0.1:4002")
         .client_id(100)
         .startup_callback(move |msg| if let StartupMessage::OpenOrder(o) = msg {
-            order_ids_clone.lock().unwrap().push(o.order_id);
+            order_ids_clone.lock().unwrap().push(o.order.order_id);
         })
         .connect()
         .expect("connection failed");
@@ -238,8 +238,8 @@ pub use messages::{ConnectivityStatus, DataFarm, DataFarmKind, IncomingMessages,
 #[doc(inline)]
 pub use messages::{
     DATA_ADVISORY_CODES, HANDSHAKE_DECODE_FAILURE_CODE, HANDSHAKE_UNKNOWN_FRAME_CODE, NOTICE_STREAM_LAG_CODE, ORDER_CANCELLED_CODE,
-    ORDER_MESSAGE_CODE, ORDER_REJECTION_CODE_RANGE, REQUEST_ERROR_CODES, SUBSCRIPTION_LAG_CODE, SYSTEM_MESSAGE_CODES, TRANSPORT_RECONNECT_CODE,
-    UNKNOWN_MESSAGE_TYPE_CODE, WARNING_CODE_RANGE,
+    ORDER_CREATION_PENDING_CODE, ORDER_MESSAGE_CODE, ORDER_REJECTION_CODE_RANGE, REQUEST_ERROR_CODES, SUBSCRIPTION_DISCONNECTED_CODE,
+    SUBSCRIPTION_LAG_CODE, SYSTEM_MESSAGE_CODES, TRANSPORT_RECONNECT_CODE, UNKNOWN_MESSAGE_TYPE_CODE, WARNING_CODE_RANGE,
 };
 
 #[cfg(test)]

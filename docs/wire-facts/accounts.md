@@ -57,3 +57,89 @@ Positions, PnL and account updates by model. End-marker behavior for account str
 - **Not probed:** a model code, an FA master account, later update frames (only the initial
   dump to the end marker was read), whether the Gateway applies a changed setting to an
   already-open subscription (each run reconnected).
+
+### A second `reqAccountUpdates` for the subscribed account draws no reply unless unsubscribed first
+
+*Live 2026-11-25 10:20-10:28 UTC off-hours, paper TWS, server 223, single account, sync.*
+
+- `reqAccountUpdates(true, account)` gets the initial dump: 242 `AccountValue`, 12
+  `PortfolioValue`, 13 `AccountUpdateTime`, then `AccountDownloadEnd`.
+- The same request again on the same connection while the first is live, after its
+  `AccountDownloadEnd`: no frame in the next 6 s. Two written back to back (the second before
+  the first dump ends): one dump only.
+- `reqAccountUpdates(false)` then `true` back to back while subscribed: TWS sends a request-less
+  2100 "API client has been unsubscribed from account data.", then the full dump again with its
+  `AccountDownloadEnd` (same counts). Written right after the first `true`, before its dump
+  ended: two full dumps, each with its end marker.
+- `false`, a 5 s wait, then `true`: 2100, nothing during the wait, then the full dump.
+- `true` for another account code (`DU0000000`) while subscribed: no frame and no error; `true`
+  for the subscribed account after it: no frame either, so TWS still counted that account as
+  subscribed.
+- So a second `account_updates` caller for the same account is sent as `false` then `true`;
+  the dump that follows reaches every subscription of the account. Live with that change, the
+  first caller read 242 / 12 / 13 and `End`, the second caller the same 100 ms after its
+  request, and the first caller the dump and `End` again.
+- Follow-up (*live 2026-11-26 23:59 UTC, paper TWS, server 223, single account*): the last
+  subscriber's cancel sends an explicit `subscribe=false` with the account field omitted.
+  Sending `true` then that cancel before reading produced the initial dump and
+  `AccountDownloadEnd`, followed by 2100. A replacement `true` produced a second complete dump
+  whether it was sent immediately after the cancel or after a 3 s wait. The named unsubscribe
+  used for replay also produced the first end marker before 2100 and the second dump afterward.
+- **Not probed:** updates for the subscribed account after the other-account request (the
+  account has no second account to switch to, and no change happened in the window), an FA
+  account, RTH, or an unsubscribe while a dump is stalled.
+
+
+### Exchange on positions, executions and order echoes
+
+*Live 2026-11-24 21:45-22:10 UTC (US closed), paper TWS, server 223; `positions`,
+`executions` with an empty filter, and order replies.*
+
+| Frame                                   | `contract.exchange`                                                                                                | `contract.primaryExchange` |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | -------------------------- |
+| Position, AAPL options (3 contracts)    | `AMEX`                                                                                                             | empty                      |
+| Position, AAPL and MSFT stock           | `NASDAQ`                                                                                                           | empty                      |
+| Position, SPY                           | `ARCA`                                                                                                             | empty                      |
+| Position, ES future and futures options | `CME`                                                                                                              | empty                      |
+| Execution (129 of the day's)            | the executing venue: `IEX`, `IBKRATS`, `ARCA` for AAPL stock; `MX2`, `BOX`, `PHLX`, `ISE`, `EDGX` for AAPL options | empty                      |
+| OpenOrder echo                          | the exchange the order was sent with: `SMART` for AAPL, VOD and 7203; `SEHK`, `HKFE` when sent there               | as sent                    |
+
+- A position names a listing exchange, not where the position traded: AAPL options came back
+  with `AMEX` whatever venue filled them, stocks with their primary listing in `exchange` and an
+  empty `primaryExchange`. Match a position to an order or execution by `conId`, not by
+  exchange.
+- An execution's `contract.exchange` equalled `execution.exchange` (the venue that filled) in all
+  129. The pair from an exercise of an AAPL 2026-11-27 340 call (the option sold at 0, 100 AAPL
+  bought at 340) reported `SMART` in both.
+- 2026-11-25 (US RTH): AAPL echoes for orders sent to SMART and IEX carried that exchange and an
+  empty `primaryExchange`; EUR.USD fills reported `IDEALPRO` in both exchange fields. A downstream
+  adapter reported stock executions on `EUDARK`, `TGATE`, `FWB`, `IEX` and `ARCA` the same day;
+  not re-probed (no stock fills placed).
+- **Not probed:** positions in non-US contracts (none held); a stock whose primary listing is
+  not its usual SMART destination.
+
+### Account streams across an internet outage
+
+*Live 2026-11-25 and 2026-11-26, paper TWS, server 223; Wi-Fi off for 15 s, 2 min, 6 min and
+20 min, router uplink unplugged for 2 min; #1300.*
+
+- Account summary, positions and PnL resumed on the same subscription with no action. Positions
+  re-sent the 4 open positions, no `PositionEnd`, 2.0 to 3.3 s before the 1102; account summary
+  pushed 0.1 to 1.9 s after it.
+- PnL pushed twice during the 6-minute outage. At restore one client's stream carried one value
+  far off (unrealized -63,090 between values near -86,000); a `reqPnL` sent at restore first
+  answered all zeros.
+- 2026-11-26: at the restore every PnL stream, old or new, carried one item with all values zero,
+  then normal values within 1 s (2 of 2 runs). Skip a lone zero item after the 1102:
+
+  ```text
+  12:34:01.191 [pnl/raw] data n=1 last=daily=Some(0.0) unrealized=Some(0.0) realized=Some(0.0)
+  12:34:02.192 [pnl/raw] data n=1 last=daily=Some(16966.52181) unrealized=Some(-21835.02651958752) realized=Some(-227.25718285)
+  ```
+
+- `reqAccountUpdates` resumed on the same subscription 2.1 s before the 1102, positions 2.2 s
+  before it, account summary 0.1 s after it.
+- A `reqPositions` sent after the 1100 never ended: one global 2151 "Positions info is not
+  available yet." and nothing more in 1554 s and 348 s, through the restore; see
+  [Requests held during an internet outage](protocol.md#requests-held-during-an-internet-outage).
+- **Not probed:** model variants; a positions change during the outage.

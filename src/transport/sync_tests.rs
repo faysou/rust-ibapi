@@ -184,7 +184,7 @@ impl Io for MockSocket {
         }
     }
 
-    fn write_all(&self, buf: &[u8]) -> Result<(), Error> {
+    fn write_all(&self, buf: &[u8], _deadline: Option<Instant>) -> Result<(), Error> {
         trace!("===== mock write =====");
         let write_call_count = self.write_call_count.load(Ordering::SeqCst);
         trace!("mock write: write_call_count: {write_call_count}");
@@ -574,6 +574,79 @@ fn reconnect_refreshes_handshake_state() -> Result<(), Error> {
     Ok(())
 }
 
+/// Listing another client's open order makes TWS raise this client's next
+/// valid order id past it without saying so; the dispatcher raises the local
+/// floor to match. Only another client's `OpenOrder` does: this client's own
+/// order and a completed order leave it.
+#[test]
+fn foreign_open_order_raises_order_id_floor() -> Result<(), Error> {
+    use crate::client::ids::REQUEST_ID_FLOOR;
+    use crate::testdata::builders::orders::{completed_order, open_order};
+
+    let cases = [
+        (
+            "another client's open order",
+            helpers::binary_proto(
+                IncomingMessages::OpenOrder as i32,
+                &open_order().order_id(500001).client_id(9420).to_proto(),
+            ),
+            [Ok(500002), Ok(500003)],
+        ),
+        (
+            "this client's open order",
+            helpers::binary_proto(
+                IncomingMessages::OpenOrder as i32,
+                &open_order().order_id(500001).client_id(CLIENT_ID).to_proto(),
+            ),
+            [Ok(100), Ok(101)],
+        ),
+        (
+            "another client's completed order",
+            helpers::binary_proto(
+                IncomingMessages::CompletedOrder as i32,
+                &completed_order().order_id(500001).client_id(9420).to_proto(),
+            ),
+            [Ok(100), Ok(101)],
+        ),
+        (
+            "last usable order id",
+            helpers::binary_proto(
+                IncomingMessages::OpenOrder as i32,
+                &open_order().order_id(REQUEST_ID_FLOOR - 2).client_id(9420).to_proto(),
+            ),
+            [Ok(REQUEST_ID_FLOOR - 1), Err(REQUEST_ID_FLOOR)],
+        ),
+        (
+            "foreign order near i32::MAX",
+            helpers::binary_proto(
+                IncomingMessages::OpenOrder as i32,
+                &open_order().order_id(i32::MAX - 1).client_id(9420).to_proto(),
+            ),
+            [Err(i32::MAX), Err(i32::MAX)],
+        ),
+    ];
+    for (name, frame, expected) in cases {
+        let (stream, bus) = make_bus();
+        let order_ids = Arc::new(ClientIdManager::new(100)?);
+        bus.set_handshake_state(HandshakeState {
+            order_ids: order_ids.clone(),
+            server_version: Arc::new(ServerVersion::new(crate::server_versions::PROTOBUF_REST_MESSAGES_3)),
+        });
+
+        stream.push_inbound(frame);
+        bus.dispatch()?;
+
+        let allocated = [order_ids.next_order_id(), order_ids.next_order_id()];
+        let checked = allocated.map(|id| match id.checked() {
+            Ok(id) => Ok(id.value()),
+            Err(Error::OrderIdInRequestRange { order_id }) => Err(order_id),
+            Err(error) => panic!("{name}: unexpected error {error}"),
+        });
+        assert_eq!(checked, expected, "{name}");
+    }
+    Ok(())
+}
+
 const AAPL_CONTRACT_RESPONSE: &str  = "AAPL|STK||0||SMART|USD|AAPL|NMS|NMS|265598|0.01||ACTIVETIM,AD,ADDONT,ADJUST,ALERT,ALGO,ALLOC,AON,AVGCOST,BASKET,BENCHPX,CASHQTY,COND,CONDORDER,DARKONLY,DARKPOLL,DAY,DEACT,DEACTDIS,DEACTEOD,DIS,DUR,GAT,GTC,GTD,GTT,HID,IBKRATS,ICE,IMB,IOC,LIT,LMT,LOC,MIDPX,MIT,MKT,MOC,MTL,NGCOMB,NODARK,NONALGO,OCA,OPG,OPGREROUT,PEGBENCH,PEGMID,POSTATS,POSTONLY,PREOPGRTH,PRICECHK,REL,REL2MID,RELPCTOFS,RPI,RTH,SCALE,SCALEODD,SCALERST,SIZECHK,SMARTSTG,SNAPMID,SNAPMKT,SNAPREL,STP,STPLMT,SWEEP,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,WHATIF|SMART,AMEX,NYSE,CBOE,PHLX,ISE,CHX,ARCA,NASDAQ,DRCTEDGE,BEX,BATS,EDGEA,BYX,IEX,EDGX,FOXRIVER,PEARL,NYSENAT,LTSE,MEMX,IBEOS,OVERNIGHT,TPLUS0,PSX|1|0|APPLE INC|NASDAQ||Technology|Computers|Computers|US/Eastern|20250324:0400-20250324:2000;20250325:0400-20250325:2000;20250326:0400-20250326:2000;20250327:0400-20250327:2000;20250328:0400-20250328:2000|20250324:0930-20250324:1600;20250325:0930-20250325:1600;20250326:0930-20250326:1600;20250327:0930-20250327:1600;20250328:0930-20250328:1600|||1|ISIN|US0378331005|1|||26,26,26,26,26,26,26,26,26,26,26,26,26,26,26,26,26,26,26,26,26,26,26,26,26||COMMON|0.0001|0.0001|100|";
 
 #[test]
@@ -710,7 +783,7 @@ fn request_during_disconnect_raises_error() -> Result<(), Error> {
         Err(_) => {
             connection.socket.reconnect()?;
             connection.handshake()?;
-            connection.write_message(&packet)?;
+            connection.write_message(&packet, None)?;
             connection.start_api()?;
             connection.receive_account_info()?;
         }
@@ -799,6 +872,34 @@ fn make_bus() -> (MemoryStream, Arc<TcpMessageBus<MemoryStream>>) {
 
 const TICK: Duration = Duration::from_millis(100);
 
+#[test]
+fn contract_details_deadline_refuses_rate_limited_send() {
+    let (stream, bus) = make_bus();
+    let limiter = RateLimiter::per_second(1);
+    assert_eq!(limiter.reserve(Instant::now(), false), Duration::ZERO);
+    let reservation = limiter.reserved_until();
+    bus.set_rate_limiter(limiter.clone());
+    let client = Client::stubbed(bus, crate::server_versions::CANCEL_CONTRACT_DATA).with_one_shot_timeout(Duration::from_millis(10));
+
+    let error = client.contract_details(&Contract::stock("AAPL").build()).unwrap_err();
+
+    assert!(matches!(error, Error::Timeout), "got {error:?}");
+    assert!(stream.captured().is_empty(), "the rate-limited request must never reach the socket");
+    assert_eq!(limiter.reserved_until(), reservation);
+}
+
+#[test]
+fn contract_details_deadline_prevents_an_expired_socket_write() {
+    let (socket, peer, _listener) = tcp_socket_pair();
+    peer.set_nonblocking(true).unwrap();
+
+    let error = socket.write_all(b"too late", Some(Instant::now())).unwrap_err();
+    let receive_error = peer.peek(&mut [0]).unwrap_err();
+
+    assert!(matches!(error, Error::Timeout), "got {error:?}");
+    assert_eq!(receive_error.kind(), ErrorKind::WouldBlock);
+}
+
 /// Two in-flight `send_request` subscriptions: responses arrive in reverse order
 /// and each subscription receives only its own message. Validates `requests`
 /// `SenderHash` lookup by request_id.
@@ -869,18 +970,28 @@ fn order_id_correlation_with_interleaved_responses() -> Result<(), Error> {
     Ok(())
 }
 
-/// Shared-channel fan-out: `RequestOpenOrders`, `RequestAllOpenOrders`, and
-/// `RequestAutoOpenOrders` all map to `[OpenOrder, OrderStatus, OpenOrderEnd]`
-/// in `CHANNEL_MAPPINGS`. The `OrderAndShared` strategy in `process_orders`
-/// fans every `OpenOrder` out to each shared subscriber, with or without an
-/// order id.
+/// Shared-channel fan-out: `RequestOpenOrders` and `RequestAllOpenOrders` map
+/// to `[OpenOrder, OrderStatus, OpenOrderEnd]` in `CHANNEL_MAPPINGS`,
+/// `RequestAutoOpenOrders` to `[OpenOrder, OrderStatus]`. The `OrderAndShared`
+/// strategy in `process_orders` fans every `OpenOrder` out to each shared
+/// subscriber, with or without an order id, once none is passing over an
+/// earlier request's reply.
 #[test]
 fn shared_channel_fan_out_for_open_orders() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
     let (stream, bus) = make_bus();
 
     let sub_open = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
     let sub_all = bus.send_shared_request(OutgoingMessages::RequestAllOpenOrders, &[])?;
     let sub_auto = bus.send_shared_request(OutgoingMessages::RequestAutoOpenOrders, &[])?;
+
+    // The end of the open-orders reply, which `sub_all` passes over.
+    stream.push_inbound(binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {}));
+    bus.dispatch()?;
+    let msg = sub_open.next_timeout(TICK).expect("sub_open got no end")?;
+    assert_eq!(msg.message_type(), M::OpenOrderEnd);
+    assert!(sub_all.try_next_routed().is_none(), "sub_all read the open-orders reply");
+    assert!(sub_auto.try_next_routed().is_none(), "sub_auto read another request's end marker");
 
     for order_id in [Some(42), None] {
         stream.push_inbound(binary_proto(
@@ -1104,15 +1215,20 @@ fn cancel_shared_subscription_writes_through() -> Result<(), Error> {
 
 /// Number of length-prefixed frames in `captured` whose payload is `payload`.
 fn count_frames(captured: &[u8], payload: &[u8]) -> usize {
+    frame_payloads(captured).into_iter().filter(|frame| *frame == payload).count()
+}
+
+/// The payloads of the length-prefixed frames in `captured`, in write order.
+fn frame_payloads(captured: &[u8]) -> Vec<&[u8]> {
     let mut rest = captured;
-    let mut count = 0;
+    let mut frames = Vec::new();
     while rest.len() >= 4 {
         let len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
         let (frame, tail) = rest[4..].split_at(len);
-        count += usize::from(frame == payload);
+        frames.push(frame);
         rest = tail;
     }
-    count
+    frames
 }
 
 /// TWS keeps one positions stream per client (`CancelPositions` carries no id),
@@ -1136,11 +1252,14 @@ fn shared_subscription_cancel_waits_for_last_subscriber() -> Result<(), Error> {
     drop(first);
     assert_eq!(cancels_written(), 0, "cancel written while a subscription is still live");
 
-    stream.push_inbound(binary_proto(
-        crate::messages::IncomingMessages::PositionEnd as i32,
-        &crate::proto::PositionEnd {},
-    ));
-    bus.dispatch()?;
+    // TWS answers each request: the survivor passes over the first reply.
+    for _ in 0..2 {
+        stream.push_inbound(binary_proto(
+            crate::messages::IncomingMessages::PositionEnd as i32,
+            &crate::proto::PositionEnd {},
+        ));
+        bus.dispatch()?;
+    }
     let item = second.next_timeout(TICK).expect("survivor received nothing")?;
     assert!(matches!(item, SubscriptionItem::Data(PositionUpdate::PositionEnd)), "got: {item:?}");
 
@@ -1238,8 +1357,12 @@ fn account_updates_request(name: &str) -> Vec<u8> {
     format!("account-updates {name}").into_bytes()
 }
 
+fn account_updates_unsubscribe(name: &str) -> Vec<u8> {
+    format!("account-updates off {name}").into_bytes()
+}
+
 fn account_updates_subscription(bus: &Arc<TcpMessageBus<MemoryStream>>, name: &str) -> Result<AccountUpdatesSubscription, Error> {
-    let internal = bus.send_account_updates_request(&account(name), &account_updates_request(name))?;
+    let internal = bus.send_account_updates_request(&account(name), &account_updates_request(name), &account_updates_unsubscribe(name))?;
     Ok(wrap_subscription(bus.clone(), internal))
 }
 
@@ -1251,11 +1374,13 @@ fn account_updates_cancel() -> Vec<u8> {
 }
 
 fn account_updates_slot(bus: &TcpMessageBus<MemoryStream>) -> Option<crate::accounts::types::AccountId> {
-    bus.shared_channels.counts.lock().unwrap().account_updates().cloned()
+    bus.shared_channels.account_counts.lock().unwrap().account_updates().cloned()
 }
 
-/// The same account again shares the one TWS stream: both requests go out,
-/// and only the last drop cancels and frees the slot.
+/// The same account again shares the one TWS stream, and only the last drop
+/// cancels and frees the slot. TWS answers a repeated subscribe with nothing,
+/// so the second goes out as unsubscribe then subscribe, which TWS answers
+/// with the full dump.
 #[test]
 fn account_updates_same_account_shares() -> Result<(), Error> {
     let (stream, bus) = make_bus();
@@ -1263,8 +1388,16 @@ fn account_updates_same_account_shares() -> Result<(), Error> {
 
     let first = account_updates_subscription(&bus, "DU1")?;
     let second = account_updates_subscription(&bus, "DU1")?;
-    assert_eq!(count_frames(&stream.captured(), &account_updates_request("DU1")), 2);
-    assert_eq!(bus.shared_channels.counts.lock().unwrap().live(OutgoingMessages::RequestAccountData), 2);
+    let (on, off) = (account_updates_request("DU1"), account_updates_unsubscribe("DU1"));
+    assert_eq!(frame_payloads(&stream.captured()), [&on[..], &off[..], &on[..]]);
+    assert_eq!(
+        bus.shared_channels
+            .account_counts
+            .lock()
+            .unwrap()
+            .live(OutgoingMessages::RequestAccountData),
+        2
+    );
 
     drop(first);
     assert_eq!(
@@ -1280,6 +1413,142 @@ fn account_updates_same_account_shares() -> Result<(), Error> {
     Ok(())
 }
 
+/// The dump TWS sends after the second subscription's resubscribe reaches
+/// both subscriptions, so the second caller gets the initial values and the
+/// end marker too. A second subscription made before the first dump ends
+/// passes over that dump and reads its own whole one, not the first one's
+/// tail.
+#[test]
+fn account_updates_second_subscription_reads_the_dump() -> Result<(), Error> {
+    use crate::transport::tests::{account_update_dump, account_update_value};
+
+    let (stream, bus) = make_bus();
+    let first = account_updates_subscription(&bus, "DU1")?;
+    let second = account_updates_subscription(&bus, "DU1")?;
+    // TWS answers the first subscribe and the second's resubscribe with a
+    // dump each, in the order sent; the second request went out before the
+    // first dump arrived.
+    for frame in account_update_dump("100000").into_iter().chain(account_update_dump("100001")) {
+        stream.push_inbound(frame);
+        bus.dispatch()?;
+    }
+
+    let read = |subscription: &AccountUpdatesSubscription, count| -> Vec<Option<String>> {
+        (0..count)
+            .map(|_| account_update_value(subscription.next_timeout(TICK).expect("dump cut short").unwrap()))
+            .collect()
+    };
+    assert_eq!(read(&first, 4), [Some("100000".to_string()), None, Some("100001".to_string()), None]);
+    assert_eq!(read(&second, 2), [Some("100001".to_string()), None]);
+    assert!(second.try_next().is_none(), "the second caller read past its dump");
+    Ok(())
+}
+
+#[test]
+fn account_updates_last_cancel_refuses_until_every_abandoned_end() -> Result<(), Error> {
+    use crate::transport::tests::{account_update_dump, account_update_value};
+
+    let (stream, bus) = make_bus();
+    let first = account_updates_subscription(&bus, "DU1")?;
+    let second = account_updates_subscription(&bus, "DU1")?;
+    drop(first);
+    drop(second);
+
+    let refused = account_updates_subscription(&bus, "DU1");
+    assert!(matches!(refused, Err(Error::AlreadySubscribed)));
+    for frame in account_update_dump("100000") {
+        stream.push_inbound(frame);
+        bus.dispatch()?;
+    }
+    let refused = account_updates_subscription(&bus, "DU2");
+    assert!(matches!(refused, Err(Error::AlreadySubscribed)));
+    assert_eq!(count_frames(&stream.captured(), &account_updates_request("DU1")), 2);
+    assert_eq!(count_frames(&stream.captured(), &account_updates_request("DU2")), 0);
+
+    for frame in account_update_dump("100001")
+        .into_iter()
+        .chain([error_frame(-1, 2100, "API client has been unsubscribed from account data.")])
+    {
+        stream.push_inbound(frame);
+        bus.dispatch()?;
+    }
+
+    let replacement = account_updates_subscription(&bus, "DU1")?;
+    for frame in account_update_dump("100002") {
+        stream.push_inbound(frame);
+        bus.dispatch()?;
+    }
+
+    assert_eq!(count_frames(&stream.captured(), &account_updates_cancel()), 1);
+    assert_eq!(count_frames(&stream.captured(), &account_updates_request("DU1")), 3);
+    let reply = std::iter::from_fn(|| replacement.try_next()).collect::<Result<Vec<_>, _>>()?;
+    let reply: Vec<_> = reply.into_iter().map(account_update_value).collect();
+    assert_eq!(reply, [Some("100002".to_string()), None]);
+    Ok(())
+}
+
+#[test]
+fn account_updates_abandoned_reply_without_end_is_cleared_by_reset() -> Result<(), Error> {
+    use crate::transport::tests::{account_update_dump, account_update_value};
+
+    let (stream, bus) = make_bus();
+    let original = account_updates_subscription(&bus, "DU1")?;
+    drop(original);
+
+    let refused = account_updates_subscription(&bus, "DU1");
+    assert!(matches!(refused, Err(Error::AlreadySubscribed)));
+    assert_eq!(count_frames(&stream.captured(), &account_updates_request("DU1")), 1);
+
+    bus.reset();
+    let replacement = account_updates_subscription(&bus, "DU1")?;
+    for frame in account_update_dump("100001") {
+        stream.push_inbound(frame);
+        bus.dispatch()?;
+    }
+    assert_eq!(count_frames(&stream.captured(), &account_updates_request("DU1")), 2);
+    let reply = std::iter::from_fn(|| replacement.try_next()).collect::<Result<Vec<_>, _>>()?;
+    let reply: Vec<_> = reply.into_iter().map(account_update_value).collect();
+    assert_eq!(reply, [Some("100001".to_string()), None]);
+    Ok(())
+}
+
+#[test]
+fn account_updates_reopen_during_last_cancel_refuses_abandoned_reply() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let original = bus.send_account_updates_request(&account("DU1"), &account_updates_request("DU1"), &account_updates_unsubscribe("DU1"))?;
+    let ticket = original.shared.expect("account updates use the shared channel");
+    let channels = &bus.shared_channels;
+    let deadline = Duration::from_secs(5);
+
+    std::thread::scope(|scope| -> Result<(), Error> {
+        let (closing, close_started) = std::sync::mpsc::channel();
+        let (finish_close, can_close) = std::sync::mpsc::channel();
+        let cancel = scope.spawn(move || {
+            channels.unsubscribe(ticket, true, || {
+                closing.send(()).unwrap();
+                can_close.recv_timeout(deadline).unwrap();
+                Ok(())
+            })
+        });
+        close_started.recv_timeout(deadline).unwrap();
+        let (starting, reopen_started) = std::sync::mpsc::channel();
+        let bus = &bus;
+        let reopen = scope.spawn(move || {
+            starting.send(()).unwrap();
+            account_updates_subscription(bus, "DU1")
+        });
+        reopen_started.recv_timeout(deadline).unwrap();
+        let cancel_holds_admission = channels.account_counts.try_lock().is_err();
+        finish_close.send(()).unwrap();
+        cancel.join().unwrap()?;
+
+        assert!(cancel_holds_admission);
+        assert!(matches!(reopen.join().unwrap(), Err(Error::AlreadySubscribed)));
+        assert_eq!(count_frames(&stream.captured(), &account_updates_request("DU1")), 1);
+        Ok(())
+    })
+}
+
 /// TWS has one account-updates slot: a second account would switch the live
 /// subscription to its data. It is refused before anything is written, and
 /// the live subscription keeps its registration and its data.
@@ -1290,7 +1559,7 @@ fn account_updates_other_account_refused() -> Result<(), Error> {
 
     let (stream, bus) = make_bus();
     let first = account_updates_subscription(&bus, "DU1")?;
-    let subscribers = bus.shared_channels.subscribers().len();
+    let subscribers = bus.shared_channels.subscribers().live.len();
 
     let refused = account_updates_subscription(&bus, "DU2").map(|_| ());
     assert!(
@@ -1302,8 +1571,19 @@ fn account_updates_other_account_refused() -> Result<(), Error> {
         0,
         "refused request was written"
     );
-    assert_eq!(bus.shared_channels.counts.lock().unwrap().live(OutgoingMessages::RequestAccountData), 1);
-    assert_eq!(bus.shared_channels.subscribers().len(), subscribers, "refused registration left behind");
+    assert_eq!(
+        bus.shared_channels
+            .account_counts
+            .lock()
+            .unwrap()
+            .live(OutgoingMessages::RequestAccountData),
+        1
+    );
+    assert_eq!(
+        bus.shared_channels.subscribers().live.len(),
+        subscribers,
+        "refused registration left behind"
+    );
 
     stream.push_inbound(binary_proto(
         crate::messages::IncomingMessages::AccountDownloadEnd as i32,
@@ -1323,6 +1603,9 @@ fn account_updates_other_account_after_cancel() -> Result<(), Error> {
     let (stream, bus) = make_bus();
 
     let first = account_updates_subscription(&bus, "DU1")?;
+    let [_, end] = crate::transport::tests::account_update_dump("100000");
+    stream.push_inbound(end);
+    bus.dispatch()?;
     drop(first);
     assert_eq!(count_frames(&stream.captured(), &account_updates_cancel()), 1);
 
@@ -1669,36 +1952,39 @@ fn concurrent_one_shot_shared_requests_each_receive_reply() -> Result<(), Error>
     Ok(())
 }
 
-/// Every live subscription of a shared streaming type receives every frame,
-/// as with the async broadcast: two `RequestPositions` subscriptions both see
-/// each `Position` and `PositionEnd`.
+/// Every live subscription of a shared streaming type receives every frame
+/// from its own reply on, as with the async broadcast. TWS answers each
+/// `RequestPositions` with a full list and a `PositionEnd`: the first
+/// subscription, a live stream, reads both replies; the second passes over
+/// the first reply and reads its own.
 #[test]
 fn live_shared_subscriptions_each_receive_every_frame() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
     let (stream, bus) = make_bus();
 
     let first = bus.send_shared_request(OutgoingMessages::RequestPositions, &[])?;
     let second = bus.send_shared_request(OutgoingMessages::RequestPositions, &[])?;
 
-    stream.push_inbound(binary_proto(
-        crate::messages::IncomingMessages::Position as i32,
-        &crate::proto::Position {
-            account: Some("DU123".to_string()),
-            ..Default::default()
-        },
-    ));
-    stream.push_inbound(binary_proto(
-        crate::messages::IncomingMessages::PositionEnd as i32,
-        &crate::proto::PositionEnd {},
-    ));
-    bus.dispatch()?;
-    bus.dispatch()?;
+    for _ in 0..2 {
+        stream.push_inbound(binary_proto(
+            M::Position as i32,
+            &crate::proto::Position {
+                account: Some("DU123".to_string()),
+                ..Default::default()
+            },
+        ));
+        stream.push_inbound(binary_proto(M::PositionEnd as i32, &crate::proto::PositionEnd {}));
+        bus.dispatch()?;
+        bus.dispatch()?;
+    }
 
-    for (name, sub) in [("first", &first), ("second", &second)] {
-        let position = sub.next_timeout(TICK).unwrap_or_else(|| panic!("{name} got no Position"))?;
-        assert_eq!(position.message_type(), crate::messages::IncomingMessages::Position, "{name}");
-        let end = sub.next_timeout(TICK).unwrap_or_else(|| panic!("{name} got no PositionEnd"))?;
-        assert_eq!(end.message_type(), crate::messages::IncomingMessages::PositionEnd, "{name}");
-        assert!(sub.try_next_routed().is_none(), "{name} received a frame twice");
+    let both_replies = [M::Position, M::PositionEnd, M::Position, M::PositionEnd];
+    for (name, sub, expected) in [("first", &first, &both_replies[..]), ("second", &second, &both_replies[2..])] {
+        for message_type in expected {
+            let message = sub.next_timeout(TICK).unwrap_or_else(|| panic!("{name} got no {message_type:?}"))?;
+            assert_eq!(message.message_type(), *message_type, "{name}");
+        }
+        assert!(sub.try_next_routed().is_none(), "{name} received an extra frame");
     }
     Ok(())
 }
@@ -1748,9 +2034,241 @@ fn later_shared_subscription_does_not_see_earlier_reset() -> Result<(), Error> {
     Ok(())
 }
 
+/// A data frame and the end frame of a reply to each shared request TWS
+/// answers one request at a time (`ChannelMapping::reply_end`).
+struct ReplyFrames {
+    request: OutgoingMessages,
+    data: (IncomingMessages, Vec<u8>),
+    end: (IncomingMessages, Vec<u8>),
+}
+
+fn reply_frames() -> Vec<ReplyFrames> {
+    use crate::messages::IncomingMessages as M;
+    let frame = |message_type: M, body: &dyn Fn(M) -> Vec<u8>| (message_type, body(message_type));
+    let open_order = || {
+        frame(M::OpenOrder, &|m| {
+            binary_proto(
+                m as i32,
+                &crate::proto::OpenOrder {
+                    order_id: Some(7),
+                    ..Default::default()
+                },
+            )
+        })
+    };
+    let open_orders_end = || frame(M::OpenOrderEnd, &|m| binary_proto(m as i32, &crate::proto::OpenOrdersEnd {}));
+    vec![
+        ReplyFrames {
+            request: OutgoingMessages::RequestOpenOrders,
+            data: open_order(),
+            end: open_orders_end(),
+        },
+        ReplyFrames {
+            request: OutgoingMessages::RequestAllOpenOrders,
+            data: open_order(),
+            end: open_orders_end(),
+        },
+        ReplyFrames {
+            request: OutgoingMessages::RequestCompletedOrders,
+            data: frame(M::CompletedOrder, &|m| binary_proto(m as i32, &crate::proto::CompletedOrder::default())),
+            end: frame(M::CompletedOrdersEnd, &|m| binary_proto(m as i32, &crate::proto::CompletedOrdersEnd {})),
+        },
+        ReplyFrames {
+            request: OutgoingMessages::RequestPositions,
+            data: frame(M::Position, &|m| binary_proto(m as i32, &crate::proto::Position::default())),
+            end: frame(M::PositionEnd, &|m| binary_proto(m as i32, &crate::proto::PositionEnd {})),
+        },
+    ]
+}
+
+/// A second request made while the first one's reply is arriving reads its
+/// own full reply, not the tail of the first: TWS answers each request with
+/// a full reply and its own end marker, in the order sent.
+#[test]
+fn overlapping_shared_request_reads_its_own_reply() -> Result<(), Error> {
+    for ReplyFrames {
+        request,
+        data: (data_type, data),
+        end: (end_type, end),
+    } in reply_frames()
+    {
+        let (stream, bus) = make_bus();
+        let first = bus.send_shared_request(request, &[])?;
+        stream.push_inbound(data.clone());
+        bus.dispatch()?;
+
+        let second = bus.send_shared_request(request, &[])?;
+        for frame in [end.clone(), data.clone(), end.clone()] {
+            stream.push_inbound(frame);
+            bus.dispatch()?;
+        }
+
+        let read = |sub: &InternalSubscription, count| -> Vec<IncomingMessages> {
+            (0..count)
+                .map(|_| sub.next_timeout(TICK).expect("reply cut short").unwrap().message_type())
+                .collect()
+        };
+        assert_eq!(read(&second, 2), [data_type, end_type], "{request:?}: second request read another reply");
+        assert!(second.try_next_routed().is_none(), "{request:?}: second request read past its reply");
+        assert_eq!(read(&first, 3), [data_type, end_type, data_type], "{request:?}");
+    }
+    Ok(())
+}
+
+/// `all_open_orders` overlapping `open_orders` reads its own result set:
+/// both replies carry `OpenOrder` frames and `OpenOrderEnd`, and TWS sends
+/// the own-orders reply first.
+#[test]
+fn overlapping_open_orders_and_all_open_orders_read_own_result_sets() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
+    let (stream, bus) = make_bus();
+    let open_order = |order_id| {
+        binary_proto(
+            M::OpenOrder as i32,
+            &crate::proto::OpenOrder {
+                order_id: Some(order_id),
+                ..Default::default()
+            },
+        )
+    };
+    let end = || binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {});
+
+    let own = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
+    let all = bus.send_shared_request(OutgoingMessages::RequestAllOpenOrders, &[])?;
+    for frame in [open_order(1), end(), open_order(1), open_order(2), end()] {
+        stream.push_inbound(frame);
+        bus.dispatch()?;
+    }
+
+    let read = |sub: &InternalSubscription, count| -> Vec<(M, Option<i32>)> {
+        (0..count)
+            .map(|_| {
+                let message = sub.next_timeout(TICK).expect("reply cut short").unwrap();
+                (message.message_type(), message.order_id())
+            })
+            .collect()
+    };
+    assert_eq!(read(&own, 2), [(M::OpenOrder, Some(1)), (M::OpenOrderEnd, None)]);
+    assert_eq!(read(&all, 3), [(M::OpenOrder, Some(1)), (M::OpenOrder, Some(2)), (M::OpenOrderEnd, None)]);
+    assert!(all.try_next_routed().is_none(), "all_open_orders read past its reply");
+    Ok(())
+}
+
+/// TWS draws no reply to `reqAutoOpenOrders` and its stream has no end
+/// marker: an `open_orders` reply on the same client ends only that request,
+/// and the auto stream reads on.
+#[test]
+fn auto_open_orders_survives_open_orders_reply() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
+    let (stream, bus) = make_bus();
+    let open_order = |order_id| {
+        binary_proto(
+            M::OpenOrder as i32,
+            &crate::proto::OpenOrder {
+                order_id: Some(order_id),
+                ..Default::default()
+            },
+        )
+    };
+    let end = || binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {});
+
+    let auto = bus.send_shared_request(OutgoingMessages::RequestAutoOpenOrders, &[])?;
+    let own = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
+    for frame in [open_order(1), end(), open_order(2)] {
+        stream.push_inbound(frame);
+        bus.dispatch()?;
+    }
+
+    let read = |sub: &InternalSubscription, count| -> Vec<(M, Option<i32>)> {
+        (0..count)
+            .map(|_| {
+                let message = sub.next_timeout(TICK).expect("stream cut short").unwrap();
+                (message.message_type(), message.order_id())
+            })
+            .collect()
+    };
+    assert_eq!(read(&own, 2), [(M::OpenOrder, Some(1)), (M::OpenOrderEnd, None)]);
+    assert_eq!(read(&auto, 2), [(M::OpenOrder, Some(1)), (M::OpenOrder, Some(2))]);
+    assert!(auto.try_next_routed().is_none(), "auto_open_orders read an end marker");
+    Ok(())
+}
+
+/// A reset ends every unanswered request with its session: a request made
+/// after it reads the first reply that arrives.
+#[test]
+fn reset_forgets_unanswered_replies() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
+    let (stream, bus) = make_bus();
+
+    let _unanswered = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
+    bus.reset();
+    let after = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
+    stream.push_inbound(binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {}));
+    bus.dispatch()?;
+
+    let message = after.next_timeout(TICK).expect("request after the reset passed over its reply")?;
+    assert_eq!(message.message_type(), M::OpenOrderEnd);
+    Ok(())
+}
+
+/// TWS never ended a `reqPositions` sent during a connectivity loss. The
+/// cancel written when its last subscription ends uncounts it, so the next
+/// `positions()` reads its own reply instead of passing over it.
+#[test]
+fn positions_cancel_uncounts_an_unanswered_request() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
+    let (stream, bus) = make_bus();
+    let mb: &dyn MessageBus = bus.as_ref();
+
+    let unanswered = bus.send_shared_request(OutgoingMessages::RequestPositions, &[])?;
+    let ticket = unanswered.shared.expect("a shared subscription carries its ticket");
+    mb.cancel_shared_subscription(ticket, Some(b"cancel-positions"))?;
+    drop(unanswered);
+    let after = bus.send_shared_request(OutgoingMessages::RequestPositions, &[])?;
+    stream.push_inbound(binary_proto(M::PositionEnd as i32, &crate::proto::PositionEnd {}));
+    bus.dispatch()?;
+
+    let message = after.next_timeout(TICK).expect("request after the cancel passed over its reply")?;
+    assert_eq!(message.message_type(), M::PositionEnd);
+    Ok(())
+}
+
+/// A shared request without a cancel stays counted when its subscription
+/// ends without a cancel: TWS still sends its reply, and a later request
+/// passes over it.
+#[test]
+fn ending_without_a_cancel_keeps_the_request_counted() -> Result<(), Error> {
+    use crate::messages::IncomingMessages as M;
+    let (stream, bus) = make_bus();
+    let mb: &dyn MessageBus = bus.as_ref();
+
+    let dropped = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
+    let ticket = dropped.shared.expect("a shared subscription carries its ticket");
+    mb.cancel_shared_subscription(ticket, None)?;
+    drop(dropped);
+    let after = bus.send_shared_request(OutgoingMessages::RequestOpenOrders, &[])?;
+    let end = || binary_proto(M::OpenOrderEnd as i32, &crate::proto::OpenOrdersEnd {});
+    stream.push_inbound(end());
+    bus.dispatch()?;
+    assert!(after.try_next_routed().is_none(), "read the dropped request's reply");
+    stream.push_inbound(end());
+    bus.dispatch()?;
+
+    let message = after.next_timeout(TICK).expect("own reply missing")?;
+    assert_eq!(message.message_type(), M::OpenOrderEnd);
+    Ok(())
+}
+
 /// The registered shared subscriptions matching `predicate`.
 fn shared_subscriber_count<S: Stream>(bus: &TcpMessageBus<S>, predicate: impl Fn(&SharedSubscriber) -> bool) -> usize {
-    bus.shared_channels.subscribers.lock().unwrap().iter().filter(|s| predicate(s)).count()
+    bus.shared_channels
+        .subscribers
+        .lock()
+        .unwrap()
+        .live
+        .iter()
+        .filter(|s| predicate(s))
+        .count()
 }
 
 /// Dropping a shared subscription removes its registration, so no response
@@ -1769,6 +2287,15 @@ fn dropped_shared_subscription_is_unregistered() -> Result<(), Error> {
     drop(sub);
     drain_cleanup_signals(&bus);
     assert_eq!(registered(&bus), 1, "dropped subscription still registered");
+
+    // TWS answers the dropped request first; the survivor passes over that
+    // reply.
+    stream.push_inbound(binary_proto(
+        crate::messages::IncomingMessages::OpenOrderEnd as i32,
+        &crate::proto::OpenOrdersEnd {},
+    ));
+    bus.dispatch()?;
+    assert!(survivor.try_next_routed().is_none(), "survivor read the dropped request's reply");
 
     // The survivor is the one still registered: every response type of the
     // mapping still delivers to it, once.
@@ -1844,11 +2371,14 @@ fn shared_subscription_cancel_notifies_and_unregisters() -> Result<(), Error> {
     assert_eq!(shared_subscriber_count(&bus, |_| true), 0, "cancelled subscription still registered");
 
     let later = bus.send_shared_request(OutgoingMessages::RequestPositions, &[])?;
-    stream.push_inbound(binary_proto(
-        crate::messages::IncomingMessages::PositionEnd as i32,
-        &crate::proto::PositionEnd {},
-    ));
-    bus.dispatch()?;
+    // TWS answers the cancelled request too; `later` passes over that reply.
+    for _ in 0..2 {
+        stream.push_inbound(binary_proto(
+            crate::messages::IncomingMessages::PositionEnd as i32,
+            &crate::proto::PositionEnd {},
+        ));
+        bus.dispatch()?;
+    }
 
     let resp = sub.next_timeout(TICK).expect("cancelled shared subscription got no notification");
     assert!(matches!(resp, Err(Error::Cancelled)), "{resp:?}");
@@ -2295,7 +2825,7 @@ fn execution_data_routes_to_order_channel() -> Result<(), Error> {
     let (stream, bus) = make_bus();
     let sub = bus.send_order_request(OrderId::from(7), &[])?;
 
-    stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 7, "exec-1"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-1"));
     bus.dispatch()?;
 
     let msg = sub.next_timeout(TICK).expect("order sub got no message")?;
@@ -2305,7 +2835,7 @@ fn execution_data_routes_to_order_channel() -> Result<(), Error> {
 }
 
 #[test]
-fn execution_data_falls_back_to_request_channel() -> Result<(), Error> {
+fn execution_reply_routes_to_request_channel() -> Result<(), Error> {
     let (stream, bus) = make_bus();
     let request_id = RequestId::nth(99);
     let sub = bus.send_request(request_id, &[])?;
@@ -2315,6 +2845,199 @@ fn execution_data_falls_back_to_request_channel() -> Result<(), Error> {
 
     let msg = sub.next_timeout(TICK).expect("request sub got no message")?;
     assert_eq!(msg.request_id(), Some(request_id.raw()));
+    Ok(())
+}
+
+/// An `executions` reply carries its request's id: it and its commission
+/// report reach the request that asked, never the order route that got the
+/// live fill, nor the update stream, which already saw that fill.
+#[test]
+fn execution_reply_reaches_request_while_order_route_is_open() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let order_route = bus.send_order_request(OrderId::from(7), &[])?;
+    let updates = bus.create_order_update_subscription()?;
+    let request_id = RequestId::nth(99);
+    let request = bus.send_request(request_id, &[])?;
+
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-1"));
+    stream.push_inbound(commission_frame("exec-1"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, request_id.raw(), 7, "exec-1"));
+    stream.push_inbound(commission_frame("exec-1"));
+    stream.push_inbound(binary_proto(
+        IncomingMessages::ExecutionDataEnd as i32,
+        &crate::proto::ExecutionDetailsEnd {
+            req_id: Some(request_id.raw()),
+        },
+    ));
+    for _ in 0..5 {
+        bus.dispatch()?;
+    }
+
+    let live = [
+        (IncomingMessages::ExecutionData, Some(-1)),
+        (IncomingMessages::CommissionsAndFeesReport, None),
+    ];
+    assert_eq!(frames(&order_route), live, "order route");
+    assert_eq!(frames(&updates), live, "update stream");
+    assert_eq!(
+        frames(&request),
+        [
+            (IncomingMessages::ExecutionData, Some(request_id.raw())),
+            (IncomingMessages::CommissionsAndFeesReport, None),
+            (IncomingMessages::ExecutionDataEnd, Some(request_id.raw())),
+        ],
+        "request"
+    );
+    Ok(())
+}
+
+#[test]
+fn overlapping_executions_deliver_each_distinct_commission() {
+    use crate::testdata::builders::orders::commission_and_fees_report;
+
+    let (stream, bus) = make_bus();
+    let first_id = RequestId::nth(97);
+    let second_id = RequestId::nth(98);
+    let unrelated_id = RequestId::nth(99);
+    let first = bus.send_request(first_id, &[]).unwrap();
+    let second = bus.send_request(second_id, &[]).unwrap();
+    let unrelated = bus.send_request(unrelated_id, &[]).unwrap();
+    let updates = bus.create_order_update_subscription().unwrap();
+
+    let report = commission_and_fees_report().execution_id("shared").commission_and_fees(1.25);
+    let report_frame = |report: crate::proto::CommissionAndFeesReport| binary_proto(IncomingMessages::CommissionsAndFeesReport as i32, &report);
+    let first_report = report_frame(report.to_proto());
+    let revised = report_frame(report.clone().commission_and_fees(2.75).to_proto());
+    let late_revision = report_frame(report.clone().commission_and_fees(3.5).to_proto());
+    let orphan = report_frame(report.execution_id("unknown").to_proto());
+    let no_id = report_frame(crate::proto::CommissionAndFeesReport::default());
+    let first_end = binary_proto(
+        IncomingMessages::ExecutionDataEnd as i32,
+        &crate::proto::ExecutionDetailsEnd {
+            req_id: Some(first_id.raw()),
+        },
+    );
+
+    for frame in [
+        execution_data_frame(CLIENT_ID + 1, first_id.raw(), 7, "shared"),
+        first_report.clone(),
+        execution_data_frame(CLIENT_ID + 1, second_id.raw(), 7, "shared"),
+        first_report.clone(),
+        execution_data_frame(CLIENT_ID + 1, second_id.raw(), 7, "shared"),
+        first_report,
+        revised.clone(),
+        revised,
+        first_end,
+        late_revision,
+        orphan,
+        no_id,
+    ] {
+        stream.push_inbound(frame);
+        bus.dispatch().unwrap();
+    }
+
+    let commissions = |subscription: &InternalSubscription| {
+        std::iter::from_fn(|| subscription.try_next_routed())
+            .filter_map(|item| match item {
+                RoutedItem::Response(message) if message.message_type() == IncomingMessages::CommissionsAndFeesReport => {
+                    let report = message.proto::<crate::proto::CommissionAndFeesReport>().unwrap();
+                    Some((report.exec_id.unwrap(), report.commission_and_fees.unwrap()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected = [("shared".to_owned(), 1.25), ("shared".to_owned(), 2.75)];
+    assert_eq!(commissions(&first), expected);
+    assert_eq!(
+        commissions(&second),
+        [("shared".to_owned(), 1.25), ("shared".to_owned(), 2.75), ("shared".to_owned(), 3.5)]
+    );
+    assert!(unrelated.try_next_routed().is_none());
+    assert!(updates.try_next_routed().is_none());
+}
+
+#[test]
+fn expired_commission_alias_warns_for_reconciliation() {
+    let (stream, bus) = make_bus();
+    let request_id = RequestId::nth(99);
+    let request = bus.send_request(request_id, &[]).unwrap();
+    let updates = bus.create_order_update_subscription().unwrap();
+    stream.push_inbound(execution_data_frame(CLIENT_ID + 1, request_id.raw(), 7, "expired"));
+    bus.dispatch().unwrap();
+    stream.push_inbound(commission_frame("expired"));
+    bus.dispatch().unwrap();
+    stream.push_inbound(commission_frame("expired"));
+    bus.dispatch().unwrap();
+    assert!(!bus.live_executions.warned_unmapped());
+
+    drop(request);
+    let leases = bus.executions_requested.leases(&"expired".to_owned());
+    assert_eq!(leases.len(), 1, "the alias must still await cleanup");
+    assert!(!leases[0].is_live());
+    stream.push_inbound(commission_frame("expired"));
+    bus.dispatch().unwrap();
+
+    assert!(bus.live_executions.warned_unmapped());
+    assert!(updates.try_next_routed().is_none());
+}
+
+/// Every frame queued on `sub`, as message type and request id.
+fn frames(sub: &InternalSubscription) -> Vec<(IncomingMessages, Option<i32>)> {
+    std::iter::from_fn(|| sub.next_timeout(TICK))
+        .map(|m| m.unwrap())
+        .map(|m| (m.message_type(), m.request_id()))
+        .collect()
+}
+
+/// TWS sends one commission report per live fill and one per `executions`
+/// reply that lists it. A reply sent before the live report lists the fill
+/// without one, so the live report reaches the update stream and the order
+/// route exactly once, whatever the order, and is shared with the request.
+/// The request also receives one copy when TWS repeats the same report.
+#[test]
+fn commission_reports_follow_live_fills_and_replies() -> Result<(), Error> {
+    let request_id = RequestId::nth(99);
+    let live_exec = || execution_data_frame(CLIENT_ID, -1, 7, "exec-1");
+    let reply_exec = || execution_data_frame(CLIENT_ID, request_id.raw(), 7, "exec-1");
+    let report = || commission_frame("exec-1");
+    let cases = [
+        ("live exec, reply exec, report", vec![live_exec(), reply_exec(), report()]),
+        ("reply exec, live exec, report", vec![reply_exec(), live_exec(), report()]),
+        (
+            "live exec, live report, reply exec, reply report",
+            vec![live_exec(), report(), reply_exec(), report()],
+        ),
+        (
+            "live exec, reply exec, duplicate report",
+            vec![live_exec(), reply_exec(), report(), report()],
+        ),
+    ];
+    for (name, inbound) in cases {
+        let (stream, bus) = make_bus();
+        let order_route = bus.send_order_request(OrderId::from(7), &[])?;
+        let updates = bus.create_order_update_subscription()?;
+        let request = bus.send_request(request_id, &[])?;
+        let count = inbound.len();
+        for frame in inbound {
+            stream.push_inbound(frame);
+        }
+        for _ in 0..count {
+            bus.dispatch()?;
+        }
+
+        let live = vec![
+            (IncomingMessages::ExecutionData, Some(-1)),
+            (IncomingMessages::CommissionsAndFeesReport, None),
+        ];
+        let reply = [
+            (IncomingMessages::ExecutionData, Some(request_id.raw())),
+            (IncomingMessages::CommissionsAndFeesReport, None),
+        ];
+        assert_eq!(frames(&order_route), live, "{name}: order route");
+        assert_eq!(frames(&updates), live, "{name}: update stream");
+        assert_eq!(frames(&request), reply, "{name}: request");
+    }
     Ok(())
 }
 
@@ -2363,7 +3086,7 @@ fn commission_and_fees_report_routes_via_execution_id_mapping() -> Result<(), Er
     let (stream, bus) = make_bus();
     let sub = bus.send_order_request(OrderId::from(7), &[])?;
 
-    stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 7, "exec-abc"));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-abc"));
     stream.push_inbound(binary_proto(
         crate::messages::IncomingMessages::CommissionsAndFeesReport as i32,
         &crate::proto::CommissionAndFeesReport {
@@ -2381,6 +3104,92 @@ fn commission_and_fees_report_routes_via_execution_id_mapping() -> Result<(), Er
     let commission = sub.next_timeout(TICK).expect("commission report missing")?;
     assert_eq!(commission.message_type(), crate::messages::IncomingMessages::CommissionsAndFeesReport);
     Ok(())
+}
+
+/// `cancel_order` registers its own subscription under the order id. The
+/// `place_order` subscription keeps the order's frames that follow, the fill
+/// a cancel races included, and each subscription gets each frame once.
+#[test]
+fn order_subscription_keeps_frames_after_a_cancel_subscription_opens() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    let cancel = bus.send_order_request(OrderId::from(7), &[])?;
+
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::PendingCancel));
+    stream.push_inbound(execution_data_frame(CLIENT_ID, -1, 7, "exec-1"));
+    stream.push_inbound(commission_frame("exec-1"));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Cancelled));
+    stream.push_inbound(error_frame(7, 202, "Order Canceled - reason:"));
+    for _ in 0..5 {
+        bus.dispatch()?;
+    }
+
+    let expected = ["OrderStatus", "ExecutionData", "CommissionsAndFeesReport", "OrderStatus", "notice 202"];
+    for (name, sub) in [("place", &place), ("cancel", &cancel)] {
+        let items: Vec<String> = std::iter::from_fn(|| sub.next_timeout_routed(TICK)).map(routed_label).collect();
+        assert_eq!(items, expected, "{name}");
+    }
+    Ok(())
+}
+
+/// A refused modify draws a TWS error on the order id while the order goes on
+/// working. Only the newest subscription on the id, the modify's, ends on it;
+/// the `place_order` subscription receives it as a notice and keeps the
+/// order's frames that follow.
+#[test]
+fn order_error_ends_only_the_newest_subscription_on_the_order_id() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    let modify = bus.send_order_request(OrderId::from(7), &[])?;
+
+    stream.push_inbound(error_frame(7, 105, "Order being modified does not match original order."));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Submitted));
+    for _ in 0..2 {
+        bus.dispatch()?;
+    }
+
+    let place_items: Vec<String> = std::iter::from_fn(|| place.next_timeout_routed(TICK)).map(routed_label).collect();
+    let modify_first = modify.next_timeout_routed(TICK).map(routed_label);
+    assert_eq!(place_items, ["notice 105", "OrderStatus"]);
+    assert_eq!(
+        modify_first.as_deref(),
+        Some("error [105] Order being modified does not match original order.")
+    );
+    Ok(())
+}
+
+/// `let _ = client.cancel_order(id)?;` drops the cancel's subscription before
+/// TWS answers. Its refusal still reaches the `place_order` subscription as a
+/// notice: the later request superseded it, so it does not end on the error.
+#[test]
+fn order_error_after_the_newer_subscription_drops_is_a_notice() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let handle = bus.start_cleanup_thread();
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    let cancel = bus.send_order_request(OrderId::from(7), &[])?;
+    drop(cancel);
+    drain_cleanup_signals(&bus);
+
+    stream.push_inbound(error_frame(7, 10148, "OrderId 7 that needs to be cancelled can not be cancelled."));
+    stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Filled));
+    for _ in 0..2 {
+        bus.dispatch()?;
+    }
+
+    let place_items: Vec<String> = std::iter::from_fn(|| place.next_timeout_routed(TICK)).map(routed_label).collect();
+    bus.request_shutdown();
+    handle.join().expect("cleanup thread join");
+    assert_eq!(place_items, ["notice 10148", "OrderStatus"]);
+    Ok(())
+}
+
+fn routed_label(item: RoutedItem) -> String {
+    match item {
+        RoutedItem::Response(message) => format!("{:?}", message.message_type()),
+        RoutedItem::Notice(notice) => format!("notice {}", notice.code),
+        RoutedItem::FarmDisconnected(notice, _) => format!("error {notice}"),
+        RoutedItem::Error(e) => format!("error {e}"),
+    }
 }
 
 #[test]
@@ -2814,16 +3623,23 @@ fn execution_aliases_pruned_when_subscriptions_drop() -> Result<(), Error> {
     stream.push_inbound(execution_data_frame(CLIENT_ID, RequestId::nth(99).raw(), 0, "exec-request"));
     bus.dispatch()?;
     bus.dispatch()?;
-    assert_eq!(bus.executions.len(), 2, "both executions mapped");
+    assert!(bus.executions.contains(&"exec-order".to_string()), "order execution not mapped");
+    assert!(
+        bus.executions_requested.contains(&"exec-request".to_string()),
+        "request execution not mapped"
+    );
 
     drop(order);
     drain_cleanup_signals(&bus);
-    assert!(!bus.executions.contains(&"exec-order".to_string()), "order alias leaked");
-    assert!(bus.executions.contains(&"exec-request".to_string()), "live request alias pruned");
+    assert_eq!(bus.executions.len(), 0, "order alias leaked");
+    assert!(
+        bus.executions_requested.contains(&"exec-request".to_string()),
+        "live request alias pruned"
+    );
 
     drop(executions);
     drain_cleanup_signals(&bus);
-    assert_eq!(bus.executions.len(), 0, "request alias leaked");
+    assert_eq!(bus.executions_requested.len(), 0, "request alias leaked");
 
     bus.request_shutdown();
     handle.join().expect("cleanup thread join");
@@ -3244,6 +4060,32 @@ fn short_frame_body_reconnects() -> Result<(), Error> {
     Ok(())
 }
 
+/// The order-update stream survives a reconnect and yields the gap notice
+/// once the session is live, so its consumer knows to rebuild order state.
+#[test]
+fn reconnect_sends_gap_notice_to_order_update_stream() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let updates = bus.create_order_update_subscription()?;
+
+    stream.push_inbound(b"xx".to_vec());
+    for frame in helpers::handshake_frames(crate::server_versions::PROTOBUF_REST_MESSAGES_3, "EST", 5000) {
+        stream.push_inbound(frame);
+    }
+
+    bus.dispatch()?;
+
+    match updates.next_timeout_routed(TICK) {
+        Some(RoutedItem::Notice(notice)) => {
+            assert_eq!(notice.code, TRANSPORT_RECONNECT_CODE, "{notice:?}");
+            assert_eq!(notice, crate::messages::order_update_gap_notice());
+        }
+        other => panic!("expected the gap notice, got {other:?}"),
+    }
+    assert!(updates.next_timeout_routed(TICK).is_none(), "one notice per reconnect");
+    assert!(bus.is_connected());
+    Ok(())
+}
+
 /// A market data type sent through the bus is re-sent by the reconnect, on
 /// the wire before the reconnect notice: a consumer acting on the notice
 /// already sees the new session with the type applied.
@@ -3369,6 +4211,7 @@ fn sends_are_refused_during_the_reconnect_handshake() -> Result<(), Error> {
 struct HandoffSocket {
     stream: MemoryStream,
     marker: &'static [u8],
+    pause_after_write: bool,
     state: Arc<(Mutex<Handoff>, std::sync::Condvar)>,
 }
 
@@ -3397,6 +4240,7 @@ impl HandoffSocket {
         Self {
             stream,
             marker,
+            pause_after_write: false,
             state: Arc::default(),
         }
     }
@@ -3428,10 +4272,14 @@ impl Io for HandoffSocket {
         self.stream.read_message()
     }
 
-    fn write_all(&self, buf: &[u8]) -> Result<(), Error> {
+    fn write_all(&self, buf: &[u8], deadline: Option<Instant>) -> Result<(), Error> {
         let (mutex, changed) = &*self.state;
         let mut state = mutex.lock().unwrap();
         let is_sender = carries(buf, self.marker);
+        let already_written = is_sender && self.pause_after_write;
+        if already_written {
+            self.stream.write_all(buf, deadline)?;
+        }
         if is_sender {
             state.sender_queued = true;
             changed.notify_all();
@@ -3447,7 +4295,11 @@ impl Io for HandoffSocket {
             changed.notify_all();
         }
         drop(state);
-        self.stream.write_all(buf)
+        if already_written {
+            Ok(())
+        } else {
+            self.stream.write_all(buf, deadline)
+        }
     }
 
     fn close(&self) {
@@ -3571,9 +4423,9 @@ impl Io for StuckWriteSocket {
         self.stream.read_message()
     }
 
-    fn write_all(&self, buf: &[u8]) -> Result<(), Error> {
+    fn write_all(&self, buf: &[u8], deadline: Option<Instant>) -> Result<(), Error> {
         if !carries(buf, self.marker) {
-            return self.stream.write_all(buf);
+            return self.stream.write_all(buf, deadline);
         }
         let (mutex, changed) = &*self.state;
         let mut state = mutex.lock().unwrap();
@@ -3691,19 +4543,22 @@ fn wait_connected_returns_shutdown_when_the_bus_shuts_down() {
     assert!(start.elapsed() < Duration::from_secs(5), "wait_connected did not return on shutdown");
 }
 
-/// Writes fail, reads delegate to a `MemoryStream`. Stands in for a write
-/// refused after the registration went in: the session went down between the
-/// registering call's first state check and its write.
+/// Writes fail while the flag is set, reads delegate to a `MemoryStream`.
+/// Stands in for a write refused after the registration went in: the session
+/// went down between the registering call's first state check and its write.
 #[derive(Clone, Debug)]
-struct FailingWriteStream(MemoryStream);
+struct FailingWriteStream(MemoryStream, Arc<AtomicBool>);
 
 impl Io for FailingWriteStream {
     fn read_message(&self) -> Result<Vec<u8>, Error> {
         self.0.read_message()
     }
 
-    fn write_all(&self, _buf: &[u8]) -> Result<(), Error> {
-        Err(Error::ConnectionReset)
+    fn write_all(&self, buf: &[u8], deadline: Option<Instant>) -> Result<(), Error> {
+        if self.1.load(Ordering::SeqCst) {
+            return Err(Error::ConnectionReset);
+        }
+        self.0.write_all(buf, deadline)
     }
 
     fn close(&self) {
@@ -3729,7 +4584,8 @@ impl Stream for FailingWriteStream {}
 /// and its write.
 #[test]
 fn failed_write_leaves_no_registration() {
-    let connection = Connection::stubbed(FailingWriteStream(MemoryStream::default()), 28);
+    let stream = FailingWriteStream(MemoryStream::default(), Arc::new(AtomicBool::new(true)));
+    let connection = Connection::stubbed(stream, 28);
     connection.set_server_version_for_test(crate::server_versions::PROTOBUF_REST_MESSAGES_3);
     let bus = Arc::new(TcpMessageBus::new(connection));
     let mb: &dyn MessageBus = bus.as_ref();
@@ -3746,6 +4602,230 @@ fn failed_write_leaves_no_registration() {
         0,
         "a failed write must leave no shared subscription registered"
     );
+    assert_eq!(
+        bus.shared_channels.subscribers().unanswered.pending(IncomingMessages::PositionEnd),
+        0,
+        "a failed write must leave no request awaiting a reply"
+    );
+}
+
+#[test]
+fn order_rejection_during_write_follows_the_write_outcome() {
+    for fails in [true, false] {
+        let stream = MemoryStream::default();
+        let socket = HandoffSocket {
+            pause_after_write: !fails,
+            ..HandoffSocket::new(stream.clone(), b"modify")
+        };
+        let connection = Connection::stubbed(socket.clone(), CLIENT_ID);
+        connection.set_server_version_for_test(crate::server_versions::PROTOBUF_REST_MESSAGES_3);
+        let bus = Arc::new(TcpMessageBus::new(connection));
+        let order_id = OrderId::from(7);
+        let placed = bus.send_order_request(order_id, b"place").unwrap();
+        let modify = {
+            let bus = bus.clone();
+            thread::spawn(move || bus.send_order_request(order_id, b"modify"))
+        };
+
+        assert!(socket.wait(TEST_SOCKET_WAIT, |state| state.sender_queued));
+        assert_eq!(count_frames(&stream.captured(), b"modify"), usize::from(!fails));
+        stream.push_inbound(error_frame(7, 201, "overlapping rejection"));
+        bus.dispatch().unwrap();
+        let during_write = placed.try_next_routed().map(routed_label);
+        if fails {
+            stream.close();
+        }
+        socket.release();
+        let modified = modify.join().unwrap();
+
+        assert_eq!(during_write, None);
+        let observed = placed.try_next_routed().map(routed_label);
+        if fails {
+            assert!(matches!(modified, Err(Error::Shutdown)));
+            assert_eq!(observed.as_deref(), Some("error [201] overlapping rejection"));
+        } else {
+            let modified = modified.unwrap();
+            assert_eq!(observed.as_deref(), Some("notice 201"));
+            assert_eq!(
+                modified.try_next_routed().map(routed_label).as_deref(),
+                Some("error [201] overlapping rejection")
+            );
+        }
+    }
+}
+
+/// A modify or cancel whose write fails never reached TWS, so it leaves the
+/// earlier subscription on the order id as it was: TWS rejecting the order
+/// still ends it.
+#[test]
+fn failed_order_write_leaves_the_earlier_subscription_not_superseded() -> Result<(), Error> {
+    let inbound = MemoryStream::default();
+    let failing = Arc::new(AtomicBool::new(false));
+    let connection = Connection::stubbed(FailingWriteStream(inbound.clone(), failing.clone()), CLIENT_ID);
+    connection.set_server_version_for_test(crate::server_versions::PROTOBUF_REST_MESSAGES_3);
+    let bus = Arc::new(TcpMessageBus::new(connection));
+    let place = bus.send_order_request(OrderId::from(7), &[])?;
+    failing.store(true, Ordering::SeqCst);
+    let modify = bus.send_order_request(OrderId::from(7), &[]);
+
+    inbound.push_inbound(error_frame(7, 201, "Order rejected - reason:"));
+    bus.dispatch()?;
+
+    let place_first = place.next_timeout_routed(TICK).map(routed_label);
+    assert!(matches!(modify, Err(Error::ConnectionReset)), "{modify:?}");
+    assert_eq!(place_first.as_deref(), Some("error [201] Order rejected - reason:"));
+    Ok(())
+}
+
+#[test]
+fn execution_snapshot_completes_while_first_order_write_is_pending() {
+    let stream = MemoryStream::default();
+    let socket = HandoffSocket::new(stream.clone(), b"modify");
+    let connection = Connection::stubbed(socket.clone(), CLIENT_ID);
+    connection.set_server_version_for_test(crate::server_versions::PROTOBUF_REST_MESSAGES_3);
+    let bus = Arc::new(TcpMessageBus::new(connection));
+    let request_id = RequestId::nth(7);
+    let snapshot = bus.send_request(request_id, b"executions").unwrap();
+    let order_id = OrderId::from(7);
+    let modify = {
+        let bus = bus.clone();
+        thread::spawn(move || bus.send_order_request(order_id, b"modify"))
+    };
+
+    assert!(socket.wait(TEST_SOCKET_WAIT, |state| state.sender_queued));
+    assert!(!bus.orders.contains(&order_id));
+    assert_eq!(count_frames(&stream.captured(), b"modify"), 0);
+    let execution_id = "snapshot-fill";
+    for frame in [
+        execution_data_frame(CLIENT_ID, request_id.raw(), 7, execution_id),
+        commission_frame(execution_id),
+        binary_proto(
+            IncomingMessages::ExecutionDataEnd as i32,
+            &crate::proto::ExecutionDetailsEnd {
+                req_id: Some(request_id.raw()),
+            },
+        ),
+    ] {
+        stream.push_inbound(frame);
+        bus.dispatch().unwrap();
+    }
+    let during_write: Vec<_> = std::iter::from_fn(|| snapshot.try_next_routed())
+        .map(|item| match item {
+            RoutedItem::Response(message) => (message.message_type(), message.execution_id(), message.request_id()),
+            item => panic!("unexpected snapshot item {item:?}"),
+        })
+        .collect();
+    stream.close();
+    socket.release();
+    let modified = modify.join().unwrap();
+
+    assert!(matches!(modified, Err(Error::Shutdown)));
+    assert_eq!(
+        during_write,
+        [
+            (IncomingMessages::ExecutionData, Some(execution_id.to_string()), Some(request_id.raw())),
+            (IncomingMessages::CommissionsAndFeesReport, Some(execution_id.to_string()), None),
+            (IncomingMessages::ExecutionDataEnd, None, Some(request_id.raw())),
+        ]
+    );
+    assert!(snapshot.try_next_routed().is_none());
+}
+
+#[test]
+fn pending_order_write_replays_facts_in_wire_order() {
+    for outcome in ["sent", "failed", "reset"] {
+        let stream = MemoryStream::default();
+        let socket = HandoffSocket::new(stream.clone(), b"modify");
+        let connection = Connection::stubbed(socket.clone(), CLIENT_ID);
+        connection.set_server_version_for_test(crate::server_versions::PROTOBUF_REST_MESSAGES_3);
+        let bus = Arc::new(TcpMessageBus::new(connection));
+        let order_id = OrderId::from(7);
+        let placed = bus.send_order_request(order_id, b"place").unwrap();
+        let other = bus.send_order_request(OrderId::from(8), b"place").unwrap();
+        let modify = {
+            let bus = bus.clone();
+            thread::spawn(move || bus.send_order_request(order_id, b"modify"))
+        };
+
+        assert!(socket.wait(TEST_SOCKET_WAIT, |state| state.sender_queued));
+        for frame in [
+            order_status_frame(CLIENT_ID, 7, OrderStatusKind::Submitted),
+            execution_data_frame(CLIENT_ID, -1, 7, "ordered-fill"),
+            order_status_frame(CLIENT_ID, 8, OrderStatusKind::Cancelled),
+            commission_frame("ordered-fill"),
+            order_status_frame(CLIENT_ID, 7, OrderStatusKind::Filled),
+        ] {
+            stream.push_inbound(frame);
+            bus.dispatch().unwrap();
+        }
+        let unrelated = other.try_next_routed().map(routed_label);
+        if outcome == "reset" {
+            bus.reset();
+        }
+        if outcome != "sent" {
+            stream.close();
+        }
+        socket.release();
+        let modified = modify.join().unwrap();
+
+        let label = |item| match item {
+            RoutedItem::Response(message) if message.message_type() == IncomingMessages::OrderStatus => {
+                message.proto::<crate::proto::OrderStatus>().unwrap().status.unwrap()
+            }
+            item => routed_label(item),
+        };
+        let order_frames = ["Submitted", "ExecutionData", "CommissionsAndFeesReport", "Filled"];
+        assert_eq!(unrelated.as_deref(), Some("OrderStatus"));
+        let placed_frames: Vec<_> = std::iter::from_fn(|| placed.try_next_routed()).map(label).collect();
+        let mut expected = order_frames.map(str::to_owned).to_vec();
+        if outcome == "reset" {
+            expected.push(format!("error {}", Error::ConnectionReset));
+        }
+        assert_eq!(placed_frames, expected, "{outcome}");
+        if outcome == "sent" {
+            let modified = modified.unwrap();
+            let modified_frames: Vec<_> = std::iter::from_fn(|| modified.try_next_routed()).map(label).collect();
+            assert_eq!(modified_frames, order_frames);
+        } else {
+            assert!(matches!(modified, Err(Error::Shutdown)));
+        }
+    }
+}
+
+#[test]
+fn pending_order_write_overflow_is_reported_before_reset() {
+    let stream = MemoryStream::default();
+    let socket = HandoffSocket::new(stream.clone(), b"modify");
+    let connection = Connection::stubbed(socket.clone(), CLIENT_ID);
+    connection.set_server_version_for_test(crate::server_versions::PROTOBUF_REST_MESSAGES_3);
+    let bus = Arc::new(TcpMessageBus::new(connection));
+    let order_id = OrderId::from(7);
+    let placed = bus.send_order_request(order_id, b"place").unwrap();
+    let modify = {
+        let bus = bus.clone();
+        thread::spawn(move || bus.send_order_request(order_id, b"modify"))
+    };
+
+    assert!(socket.wait(TEST_SOCKET_WAIT, |state| state.sender_queued));
+    for _ in 0..1025 {
+        stream.push_inbound(order_status_frame(CLIENT_ID, 7, OrderStatusKind::Submitted));
+        bus.dispatch().unwrap();
+    }
+    bus.reset();
+    stream.close();
+    socket.release();
+    let modified = modify.join().unwrap();
+
+    for _ in 0..1022 {
+        assert_eq!(placed.try_next_routed().map(routed_label).as_deref(), Some("OrderStatus"));
+    }
+    assert!(matches!(
+        placed.try_next_routed(),
+        Some(RoutedItem::Error(Error::BufferLimitExceeded { limit: 1022 }))
+    ));
+    assert!(matches!(placed.try_next_routed(), Some(RoutedItem::Error(Error::ConnectionReset))));
+    assert!(placed.try_next_routed().is_none());
+    assert!(matches!(modified, Err(Error::Shutdown)));
 }
 
 #[test]
@@ -3770,6 +4850,8 @@ fn bound(limit: usize) -> BufferBound {
     BufferBound {
         limit,
         end: &[IncomingMessages::ContractDataEnd],
+        continues: |_, _| false,
+        context: crate::subscriptions::DecoderContext::default(),
     }
 }
 
@@ -3808,7 +4890,7 @@ fn route(stream: &MemoryStream, bus: &TcpMessageBus<MemoryStream>, frames: usize
 #[test]
 fn bounded_request_fails_after_limit_unread() -> Result<(), Error> {
     let (stream, bus) = make_bus();
-    let sub = bus.send_request_capped(RequestId::nth(100), &[], Some(bound(2)))?;
+    let sub = bus.send_request_capped(RequestId::nth(100), &[], Some(bound(2)), None)?;
 
     route(&stream, &bus, 4, RequestId::nth(100))?;
 
@@ -3822,7 +4904,7 @@ fn bounded_request_fails_after_limit_unread() -> Result<(), Error> {
 #[test]
 fn bounded_request_counts_unread_not_total() -> Result<(), Error> {
     let (stream, bus) = make_bus();
-    let sub = bus.send_request_capped(RequestId::nth(100), &[], Some(bound(2)))?;
+    let sub = bus.send_request_capped(RequestId::nth(100), &[], Some(bound(2)), None)?;
 
     for _ in 0..6 {
         route(&stream, &bus, 1, RequestId::nth(100))?;
@@ -3834,8 +4916,8 @@ fn bounded_request_counts_unread_not_total() -> Result<(), Error> {
 #[test]
 fn reset_skips_overflowed_route() -> Result<(), Error> {
     let (stream, bus) = make_bus();
-    let overflowed = bus.send_request_capped(RequestId::nth(100), &[], Some(bound(1)))?;
-    let at_limit = bus.send_request_capped(RequestId::nth(200), &[], Some(bound(1)))?;
+    let overflowed = bus.send_request_capped(RequestId::nth(100), &[], Some(bound(1)), None)?;
+    let at_limit = bus.send_request_capped(RequestId::nth(200), &[], Some(bound(1)), None)?;
 
     route(&stream, &bus, 2, RequestId::nth(100))?;
     route(&stream, &bus, 1, RequestId::nth(200))?;
@@ -3857,7 +4939,7 @@ fn overflowed_subscription_cancels_on_drop() -> Result<(), Error> {
     use crate::subscriptions::DecoderContext;
 
     let (stream, bus) = make_bus();
-    let internal = bus.send_request_capped(CONTRACT_REQUEST_ID, &[], Some(bound(1)))?;
+    let internal = bus.send_request_capped(CONTRACT_REQUEST_ID, &[], Some(bound(1)), None)?;
     let subscription: Subscription<ContractDetails> =
         Subscription::new(bus.clone(), internal, DecoderContext::new(crate::server_versions::CANCEL_CONTRACT_DATA));
 
@@ -3877,6 +4959,64 @@ fn overflowed_subscription_cancels_on_drop() -> Result<(), Error> {
     )?
     .expect("type has a cancel");
     assert_eq!(count_frames(&stream.captured(), &cancel), 1, "overflow leaves the cancel to drop");
+    Ok(())
+}
+
+/// What TWS sends for a crypto `TRADES` bar request (live 2026-11-24): 10299 naming
+/// `AGGTRADES`, then that series' bars and the end marker, all on the request's id.
+fn substituted_bar_frames(request_id: RequestId) -> Vec<Vec<u8>> {
+    use crate::testdata::builders::market_data::{historical_data_bar, historical_data_end_response, historical_data_response};
+
+    let mut bars = historical_data_response().bar(historical_data_bar(1_678_886_400).ohlc(185.5, 186.0, 185.25, 185.75));
+    bars.request_id = request_id.raw();
+    let mut end = historical_data_end_response();
+    end.request_id = request_id.raw();
+    vec![
+        error_frame(
+            request_id.raw(),
+            10299,
+            "Expected what to show is AGGTRADES, please use that instead of TRADES.",
+        ),
+        binary_proto(IncomingMessages::HistoricalData as i32, &bars.to_proto()),
+        binary_proto(IncomingMessages::HistoricalDataEnd as i32, &end.to_proto()),
+    ]
+}
+
+/// A `buffer_limit` route stays open after an error its decoder continues after: the
+/// subscription yields 10299 as a notice, then the bars TWS sends after it.
+#[test]
+fn bounded_historical_route_delivers_the_bars_after_10299() -> Result<(), Error> {
+    use crate::market_data::historical::HistoricalDataFrame;
+    use crate::subscriptions::sync::Subscription;
+    use crate::subscriptions::{DecoderContext, SubscriptionItem};
+
+    let request_id = RequestId::nth(0);
+    let context = DecoderContext::new(crate::server_versions::PROTOBUF_HISTORICAL_DATA);
+    let (stream, bus) = make_bus();
+    let bound = BufferBound::for_stream::<HistoricalDataFrame>(Some(4), &context)?;
+    let internal = bus.send_request_capped(request_id, &[], bound, None)?;
+    let subscription: Subscription<HistoricalDataFrame> = Subscription::new(bus.clone(), internal, context);
+
+    for frame in substituted_bar_frames(request_id) {
+        stream.push_inbound(frame);
+        bus.dispatch()?;
+    }
+    let notice = subscription.next_timeout(TICK);
+    let bars = subscription.next_timeout(TICK);
+    let end = subscription.next_timeout(TICK);
+
+    assert!(
+        matches!(&notice, Some(Ok(SubscriptionItem::Notice(n))) if n.code == 10299),
+        "got {notice:?}"
+    );
+    assert!(
+        matches!(&bars, Some(Ok(SubscriptionItem::Data(HistoricalDataFrame::Bars(b)))) if b.len() == 1 && b[0].close == 185.75),
+        "got {bars:?}"
+    );
+    assert!(
+        matches!(&end, Some(Ok(SubscriptionItem::Data(HistoricalDataFrame::End { .. })))),
+        "got {end:?}"
+    );
     Ok(())
 }
 
@@ -3926,7 +5066,7 @@ fn bounded_request_end_marker_at_limit_still_ends() -> Result<(), Error> {
     // A result exactly `limit` rows long, read late: the end marker gets
     // through past the cap, so the stream ends normally.
     let (stream, bus) = make_bus();
-    let sub = bus.send_request_capped(CONTRACT_REQUEST_ID, &[], Some(bound(1)))?;
+    let sub = bus.send_request_capped(CONTRACT_REQUEST_ID, &[], Some(bound(1)), None)?;
 
     for frame in [contract_row(1), contract_end(), contract_row(2)] {
         stream.push_inbound(frame);
@@ -4087,6 +5227,60 @@ fn rate_limited_bus(limiter: &crate::RateLimiter) -> (MemoryStream, Arc<TcpMessa
 }
 
 #[test]
+fn account_updates_rate_limiter_sends_one_initial_frame_then_the_replay_pair() -> Result<(), Error> {
+    let limiter = crate::RateLimiter::per_second(1);
+    let (stream, bus) = rate_limited_bus(&limiter);
+    let on = account_updates_request("DU1");
+    let off = account_updates_unsubscribe("DU1");
+    let first = account_updates_subscription(&bus, "DU1")?;
+    assert_eq!(frame_payloads(&stream.captured()), [&on[..]]);
+
+    let second = account_updates_subscription(&bus, "DU1")?;
+    assert_eq!(frame_payloads(&stream.captured()), [&on[..], &off[..], &on[..]]);
+
+    // Keep fixture teardown from waiting for the ordinary unsubscribe slot.
+    bus.connection_state.set_disconnected();
+    drop((first, second));
+    Ok(())
+}
+
+#[test]
+fn positions_cancel_during_account_pacing_does_not_wait_for_the_account_slot() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let positions = positions_subscription(&bus)?;
+    let limiter = crate::RateLimiter::per_second(1);
+    let barrier = Instant::now() + Duration::from_secs(60);
+    limiter.reserve(barrier, false);
+    let occupied = limiter.reserved_until();
+    bus.set_rate_limiter(limiter.clone());
+
+    thread::scope(|scope| -> Result<(), Error> {
+        let opening = scope.spawn(|| account_updates_subscription(&bus, "DU1"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while limiter.reserved_until() == occupied && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let account_was_pacing = limiter.reserved_until() != occupied;
+        let (finished, cancellation) = std::sync::mpsc::channel();
+        let cancelling = scope.spawn(move || {
+            drop(positions);
+            finished.send(()).unwrap();
+        });
+        let cancelled = cancellation.recv_timeout(Duration::from_secs(5));
+        // Release the deliberately unavailable permit even when cancel is
+        // incorrectly blocked behind it.
+        bus.connection_state.set_disconnected();
+        cancelling.join().unwrap();
+        assert!(account_was_pacing);
+        assert!(matches!(opening.join().unwrap(), Err(Error::ConnectionReset)));
+        assert!(cancelled.is_ok());
+        assert_eq!(count_frames(&stream.captured(), &positions_cancel()), 1);
+        assert_eq!(count_frames(&stream.captured(), &account_updates_request("DU1")), 0);
+        Ok(())
+    })
+}
+
+#[test]
 fn rate_limiter_reserves_a_slot_per_send() -> Result<(), Error> {
     let limiter = crate::RateLimiter::per_second(1000);
     let (_stream, bus) = rate_limited_bus(&limiter);
@@ -4097,6 +5291,29 @@ fn rate_limiter_reserves_a_slot_per_send() -> Result<(), Error> {
         reserved.push(limiter.reserved_until().expect("send did not reserve"));
     }
     assert!(reserved[0] < reserved[1] && reserved[1] < reserved[2], "{reserved:?}");
+    Ok(())
+}
+
+#[test]
+fn throttled_modify_leaves_the_sent_order_rejection_terminal() -> Result<(), Error> {
+    let limiter = crate::RateLimiter::per_second(1);
+    let (stream, bus) = rate_limited_bus(&limiter);
+    let order_id = OrderId::from(7);
+    let placed = bus.send_order_request(order_id, b"place")?;
+    let reserved = limiter.reserved_until();
+    let modified = {
+        let bus = bus.clone();
+        thread::spawn(move || bus.send_order_request(order_id, b"modify"))
+    };
+
+    helpers::wait_for("modify reserves a pacing slot", || limiter.reserved_until() > reserved);
+    assert_eq!(count_frames(&stream.captured(), b"modify"), 0);
+    stream.push_inbound(error_frame(7, 201, "original rejection"));
+    bus.dispatch()?;
+    let observed = placed.try_next_routed().map(routed_label);
+    modified.join().unwrap()?;
+
+    assert_eq!(observed.as_deref(), Some("error [201] original rejection"));
     Ok(())
 }
 
@@ -4166,6 +5383,21 @@ fn order_status_stream_starts_with_earlier_rejection() -> Result<(), Error> {
     let statuses = bus.create_order_status_subscription(OrderId::from(7))?;
     let item = statuses.next_timeout(TICK).expect("no item");
     assert!(matches!(&item, Err(Error::Notice(n)) if n.code == 110), "{item:?}");
+    Ok(())
+}
+
+/// A refused cancel before any status (live: 10148 for an order that already
+/// filled) changed nothing, so it does not start a later stream: `wait_for_fill`
+/// goes on to look the order up instead of reporting a rejection.
+#[test]
+fn order_status_stream_skips_earlier_refused_cancel() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+
+    stream.push_inbound(helpers::error_frame(7, 10148, "cannot be cancelled, state: Filled."));
+    bus.dispatch()?;
+
+    let statuses = bus.create_order_status_subscription(OrderId::from(7))?;
+    assert!(statuses.next_timeout(TICK).is_none(), "the refusal started the stream");
     Ok(())
 }
 
@@ -4283,10 +5515,7 @@ fn foreign_execution_answers_requests_only() -> Result<(), Error> {
         .collect();
     assert_eq!(types, [IncomingMessages::ExecutionData, IncomingMessages::CommissionsAndFeesReport]);
     assert!(order_route.next_timeout(TICK).is_none(), "order route got it");
-    let updates: Vec<_> = std::iter::from_fn(|| updates.next_timeout(TICK))
-        .map(|m| m.unwrap().message_type())
-        .collect();
-    assert!(!updates.contains(&IncomingMessages::ExecutionData), "update stream got {updates:?}");
+    assert!(updates.next_timeout(TICK).is_none(), "update stream got it");
     Ok(())
 }
 
@@ -4398,7 +5627,7 @@ fn close_wakes_a_blocked_read_and_is_terminal() {
 
     socket.close();
     assert!(matches!(socket.read_message(), Err(Error::Shutdown)));
-    assert!(matches!(socket.write_all(&[1]), Err(Error::Shutdown)));
+    assert!(matches!(socket.write_all(&[1], None), Err(Error::Shutdown)));
     assert!(matches!(socket.reconnect(), Err(Error::Shutdown)));
 }
 
@@ -4452,14 +5681,14 @@ fn sever_fails_a_stuck_write_until_reconnect() {
         let socket = socket.clone();
         // Larger than loopback send + receive buffers: stalls, as the peer
         // is not reading.
-        move || done_send.send(socket.write_all(&vec![0xAA; 32 * 1024 * 1024])).unwrap()
+        move || done_send.send(socket.write_all(&vec![0xAA; 32 * 1024 * 1024], None)).unwrap()
     });
     helpers::wait_for("the write to take the writer", || socket.writer.try_lock().is_err());
 
     socket.sever();
     let written = done.recv_timeout(Duration::from_secs(1)).expect("sever left the write stuck");
     assert!(matches!(written, Err(Error::ConnectionReset)), "write: {written:?}");
-    assert!(matches!(socket.write_all(&[1]), Err(Error::ConnectionReset)));
+    assert!(matches!(socket.write_all(&[1], None), Err(Error::ConnectionReset)));
 
     let reconnect = std::thread::spawn({
         let socket = socket.clone();
@@ -4467,7 +5696,7 @@ fn sever_fails_a_stuck_write_until_reconnect() {
     });
     let (mut new_peer, _) = listener.accept().unwrap();
     reconnect.join().unwrap().expect("reconnect after sever");
-    socket.write_all(b"live").expect("the new connection must take writes");
+    socket.write_all(b"live", None).expect("the new connection must take writes");
     let mut received = [0u8; 4];
     new_peer.read_exact(&mut received).unwrap();
     assert_eq!(&received, b"live");
@@ -4520,6 +5749,51 @@ fn read_frame(peer: &mut std::net::TcpStream) {
 /// A length-prefixed protobuf frame, as TWS writes it.
 fn tws_frame(message: IncomingMessages, proto: &impl prost::Message) -> Vec<u8> {
     encode_raw_length(&helpers::binary_proto(message as i32, proto))
+}
+
+#[test]
+fn analyze_order_accepts_top_level_open_order_id() {
+    use crate::contracts::Contract;
+    use crate::orders::{order_builder, Action, OrderStatusKind};
+    use crate::testdata::builders::orders::open_order;
+    use std::io::Write;
+
+    let order_id = 9090;
+    let answer = open_order()
+        .order_id(order_id)
+        .client_id(CLIENT_ID)
+        .status(OrderStatusKind::PreSubmitted)
+        .initial_margin_before(1234.5);
+    let unrelated = answer.clone().order_id(order_id + 1).initial_margin_before(5678.0).to_proto();
+    let later = answer.clone().initial_margin_before(6789.0).to_proto();
+
+    for nested_id in [None, Some(order_id)] {
+        let mut answer = answer.to_proto();
+        answer.order.as_mut().unwrap().order_id = nested_id;
+        let (client, _bus, mut peer) = tcp_client_with_peer();
+        let client = client.with_one_shot_timeout(Duration::from_secs(2));
+
+        let frames = [
+            tws_frame(IncomingMessages::OpenOrder, &unrelated),
+            tws_frame(IncomingMessages::OpenOrder, &answer),
+            tws_frame(IncomingMessages::OpenOrder, &later),
+        ];
+        let tws = thread::spawn(move || {
+            read_frame(&mut peer);
+            for frame in frames {
+                peer.write_all(&frame).unwrap();
+            }
+            peer
+        });
+
+        let contract = Contract::stock("AAPL").build();
+        let order = order_builder::limit_order(Action::Buy, 1.0, 100.0);
+        let state = client.analyze_order(order_id, &contract, &order).unwrap();
+        drop(tws.join().unwrap());
+
+        assert_eq!(state.status, OrderStatusKind::PreSubmitted, "nested id {nested_id:?}");
+        assert_eq!(state.initial_margin_before, Some(1234.5), "nested id {nested_id:?}");
+    }
 }
 
 fn open_orders_end_frame() -> Vec<u8> {

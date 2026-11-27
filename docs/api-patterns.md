@@ -522,14 +522,17 @@ for result in subscription {
 `client.resubscribing(open)` packages that loop for streams: it waits out the reconnect, calls
 `open` again, and yields a `TRANSPORT_RECONNECT_CODE` notice before the new subscription's first
 item. Data from the outage is missing; depth books, `keep_up_to_date` bars and account snapshots
-start over. Order streams are rejected at compile time. `filter_data` drops the gap notice, so match
-the items to see it.
+start over. A `keep_up_to_date` bar stream that TWS ends with 10182 during an internet outage is
+reopened too, behind that 10182 notice (`SUBSCRIPTION_DISCONNECTED_CODE`) instead, and any
+wrapped stream is reopened after a 1101 ("connectivity restored, data lost") behind the 1101, so
+match all three codes as the gap. Order streams are rejected at compile time. `filter_data` drops the gap notice,
+so match the items to see it.
 
 ```rust
 for item in client.resubscribing(|| client.realtime_bars(&contract).subscribe()) {
     match item {
         Ok(SubscriptionItem::Data(bar)) => process(bar),
-        Ok(SubscriptionItem::Notice(n)) if n.code == TRANSPORT_RECONNECT_CODE => mark_gap(),
+        Ok(SubscriptionItem::Notice(n)) if matches!(n.code, TRANSPORT_RECONNECT_CODE | SUBSCRIPTION_DISCONNECTED_CODE | 1101) => mark_gap(),
         Ok(SubscriptionItem::Notice(n)) => log::info!("{n}"),
         // Any other error, or the reconnect gave up
         Err(e) => return Err(e),
@@ -541,58 +544,120 @@ for item in client.resubscribing(|| client.realtime_bars(&contract).subscribe())
 
 `order_update_stream()` survives the client's automatic reconnects — the same
 subscription keeps delivering once the connection returns. Updates TWS emitted
-during the outage are **not** replayed, and no marker appears in the stream
-itself, so a quiet stream is indistinguishable from missed activity. Detect
-the gap on the notice stream and reconcile:
+during the outage are **not** replayed. Once the new session is live, the stream
+yields one notice with code `TRANSPORT_RECONNECT_CODE` to mark the gap; rebuild
+order state from snapshots when it arrives. The notice classifies as
+`NoticeCategory::ClientSynthesized`, so `is_error()` is false for it:
 
 ```rust
-let notices = client.notice_stream();
+let updates = client.order_update_stream()?;
 
-for notice in notices.iter() {
-    // 1100: connectivity lost; 1101/1102: restored (data lost / maintained);
-    // 1300: socket port reset.
-    if matches!(notice.code, 1101 | 1102) {
-        // The order update stream did not replay the outage window:
-        // rebuild open-order state and diff against your book.
-        let snapshot = client.open_orders()?;
-        reconcile(snapshot)?;
+for item in updates.iter() {
+    match item? {
+        SubscriptionItem::Data(update) => apply(update),
+        SubscriptionItem::Notice(n) if n.code == TRANSPORT_RECONNECT_CODE => {
+            // This client's open orders. Not `all_open_orders`: it also lists
+            // other clients' orders and raises this client's next valid order
+            // id past the highest id listed.
+            reconcile_open(client.open_orders()?)?;
+            reconcile_completed(client.completed_orders(ApiOnly::No)?)?;
+            reconcile_fills(client.executions(ExecutionFilter::default())?)?;
+        }
+        SubscriptionItem::Notice(n) => log::warn!("{n}"),
     }
 }
 ```
+
+The `order_update_stream` rustdoc lists the full recovery steps, including the
+client-id filter and idempotent updates.
 
 ## Common Patterns
 
 ### Correlating Commissions with Executions
 
-`CommissionAndFeesReport` joins to its `ExecutionData` by `execution_id` — the same value
+`CommissionAndFeesReport` joins to its `ExecutionData` by `execution_id`, the same value
 carried on `Execution::execution_id`. TWS sends the execution first and the commission
-shortly after, but order-status and open-order frames can land between them, so index
-commissions by `execution_id` rather than assuming the two are adjacent. Both arrive on
+shortly after, but order-status and open-order frames can land between them. Both arrive on
 the same streams (`executions`, `place_order`, `order_update_stream`).
 
+`orders::FillMatcher` does the join and yields a `Fill`: the execution with `Option` of its
+report. It pairs in either arrival order. `take_expired` hands back the executions whose report
+has not come within a wait you choose, and `put_back` returns one you cannot emit yet. An
+execution its rule expects no report for (by default an option exercise; set your own with
+`expects_report`) is a fill at once with no commission. The matcher remembers up to
+`FillMatcher::DEFAULT_MEMORY` handed-out execution IDs, configurable with `memory`. While
+it retains an ID, a first report after `take_expired` is `ReportMatch::Late` and a
+repeated one is `ReportMatch::Duplicate`. The matcher drops duplicate executions while it
+holds them or remembers their IDs.
+
 ```rust
-use ibapi::orders::{ExecutionData, OrderUpdate};
-use std::collections::HashMap;
+use ibapi::orders::{FillMatcher, OrderUpdate, ReportMatch};
+use ibapi::subscriptions::SubscriptionItem;
+use std::time::Duration;
 
-let mut executions: HashMap<String, ExecutionData> = HashMap::new();
-
+let mut matcher = FillMatcher::new();
 let updates = client.order_update_stream()?;
-for update in updates.iter_data() {
-    match update? {
-        OrderUpdate::ExecutionData(exec) => {
-            // The execution arrives first: index it by execution_id.
-            executions.insert(exec.execution.execution_id.clone(), exec);
+loop {
+    let Some(item) = updates.next_timeout(Duration::from_secs(1)) else {
+        if updates.is_terminated() {
+            break;
         }
-        OrderUpdate::CommissionAndFeesReport(report) => {
-            // The commission follows: join it to the execution it belongs to.
-            if let Some(exec) = executions.remove(&report.execution_id) {
-                println!("{} x {} commission {}", exec.execution.shares, exec.contract.symbol, report.commission_and_fees);
+        for execution in matcher.take_expired(Duration::from_secs(5)).executions {
+            println!("fill without commission: {execution:?}");
+        }
+        continue;
+    };
+    match item? {
+        SubscriptionItem::Data(OrderUpdate::ExecutionData(execution)) => {
+            if let Some(fill) = matcher.push_execution(execution) {
+                println!("fill: {fill:?}");
             }
         }
+        SubscriptionItem::Data(OrderUpdate::CommissionAndFeesReport(report)) => match matcher.push_report(report) {
+            ReportMatch::Paired(fill) => println!("fill: {fill:?}"),
+            ReportMatch::Late(report) => println!("late commission: {report:?}"),
+            ReportMatch::Waiting | ReportMatch::ComboPending | ReportMatch::Duplicate(_) => {}
+        },
         _ => {}
     }
 }
 ```
+
+For a combo (BAG) order, TWS sends each fill as an execution for the combo itself (the combo's
+quantity and net price, no commission report) and one execution per leg, each with its report.
+Pass the order's `perm_id` and legs to `add_combo`, for example from its open-order echo, which
+TWS sends before the first execution, and the matcher returns each fill as one `Fill` whose
+`legs` hold the leg fills. A report that pairs with a leg before the combo fill is complete is
+`ReportMatch::ComboPending`; `take_expired` returns incomplete combo fills in `Unpaired::fills`:
+
+```rust
+SubscriptionItem::Data(OrderUpdate::OpenOrder(order)) if !order.contract.combo_legs.is_empty() => {
+    matcher.add_combo(order.order.perm_id, &order.contract.combo_legs);
+}
+```
+
+If TWS corrects a leg execution before assembly, the revision with the highest numeric
+suffix in its execution ID supplies the quantity and commission. For example, `.02`
+supersedes `.01` with the same prefix. Use the raw execution stream to observe each revision.
+A correction arriving after the combo fill is returned does not revise that fill.
+
+For a whole `executions` reply, `FillMatcher::pair_executions` returns the fills in execution
+order and the executions and reports that found no partner. Use the same matcher for the
+live stream to pair reply items with waiting live counterparts and recognize copies while
+their IDs stay in memory. An incomplete live combo continues waiting until it completes
+or `take_expired` returns it.
+
+```rust
+let rows = client.executions(ExecutionFilter::default())?.collect_to_end_within(Duration::from_secs(10))?;
+let mut matcher = FillMatcher::new();
+let (fills, unpaired) = matcher.pair_executions(rows);
+```
+
+A combo fill's `Fill::combo_legs()` returns the order's legs (contract id, ratio and action) from
+its leg executions, sorted by contract id as TWS's order echoes list them, with the exchange that
+executed each leg: the order's exchange for a combo routed to one exchange, the executing venue
+(not `SMART`) for a `SMART` combo. Use it to identify the combo when the order echo is gone, as
+for a previous day's fill.
 
 ### Concurrent Subscriptions
 ```rust

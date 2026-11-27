@@ -25,16 +25,26 @@ use time::{Date, OffsetDateTime};
 use crate::builder::ValidationError;
 use crate::common::error_helpers;
 use crate::common::request_helpers::CancellableOneShot;
-use crate::messages::{IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE};
+use crate::contracts::SecurityType;
+use crate::messages::{
+    IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE, SUBSCRIPTION_DISCONNECTED_CODE,
+    WHAT_TO_SHOW_SUBSTITUTED_CODE,
+};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
 pub(crate) mod common;
 
 mod builder;
-pub use builder::{date_spec, HistoricalDataBuilder, HistoricalScheduleBuilder, HistoricalTicksBuilder};
+pub use builder::{
+    date_spec, HistoricalDataBuilder, HistoricalScheduleBuilder, HistoricalTicksBetweenBuilder, HistoricalTicksBuilder, PagingStop, TicksBetween,
+    TicksBetweenError,
+};
 
-pub use super::{TickAttributeBidAsk, TickAttributeLast, TickBidAsk, TickLast, TickMidpoint};
+mod completion;
+pub use completion::{BarCompletion, StreamedBar};
+
+pub use super::{QuoteSide, TickAttributeBidAsk, TickAttributeLast, TickBidAsk, TickLast, TickMidpoint};
 
 #[doc(hidden)]
 #[cfg(feature = "sync")]
@@ -495,6 +505,36 @@ pub struct HistoricalData {
     pub bars: Vec<Bar>,
 }
 
+/// A failed request after the first in a split
+/// [`between`](HistoricalDataBuilder::between)`(..).fetch()` of 1-second bars, with the bars
+/// fetched before it. Carried by [`Error::BarsBetween`].
+///
+/// # Examples
+///
+/// ```
+/// use ibapi::market_data::historical::{BarsBetweenError, HistoricalData};
+/// use ibapi::Error;
+///
+/// fn bars_or_partial(result: Result<HistoricalData, Error>) -> Result<HistoricalData, Error> {
+///     match result {
+///         // Keep what arrived; `fetched.start` is where the complete bars begin.
+///         Err(Error::BarsBetween(partial)) => Ok(partial.fetched),
+///         other => other,
+///     }
+/// }
+/// # let _ = bars_or_partial;
+/// # let _: Option<BarsBetweenError> = None;
+/// ```
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{error} ({} bars fetched before the failed request)", .fetched.bars.len())]
+pub struct BarsBetweenError {
+    /// Why the request failed.
+    pub error: Error,
+    /// The bars of the requests before it, oldest first: every bar in
+    /// `[fetched.start, fetched.end)`, where `fetched.end` is the range's end.
+    pub fetched: HistoricalData,
+}
+
 impl HistoricalData {
     /// Keeps the bars in `[start, end)` and reports that range as the window.
     ///
@@ -574,8 +614,9 @@ pub enum HistoricalDataFrame {
     /// window comes in `End`.
     Bars(Vec<Bar>),
     /// The current (incomplete) bar, from `subscribe_with_updates` only. TWS
-    /// resends it every few seconds as it builds, with the same timestamp,
-    /// until a new bar begins.
+    /// sends it just after each 5-second boundary of the wall clock, changed or
+    /// not, with the same timestamp until a new bar begins, and never marks a
+    /// bar as final; [`BarCompletion`] turns the updates into completed bars.
     Update(Bar),
     /// The window TWS served. Follows `Bars`.
     End {
@@ -668,10 +709,27 @@ impl StreamDecoder<HistoricalDataFrame> for HistoricalDataFrame {
 
     /// Without `keep_up_to_date`, any error: a one-shot query has nothing to
     /// continue after one. Verified live for 162, 200 and 10314, where TWS
-    /// answers a cancel with 366 (no query found). With it, only 200, after
-    /// which TWS answers the cancel with 366.
+    /// answers a cancel with 366 (no query found). With it, only 200 and 321
+    /// ("Source price not supported with live updates"): no frame followed
+    /// either for 65 s, and TWS answered the cancel with 366. 162 still
+    /// cancels: four of its texts behaved the same, but a pacing violation,
+    /// also a 162, could not be provoked to check. And 10182, sent when the
+    /// HMDS farm breaks: no frame followed it for 390 s or more, and TWS
+    /// answered the cancel with 366.
     fn rejection_ends_request(notice: &Notice, context: &DecoderContext) -> bool {
-        !context.keep_up_to_date || notice.code == NO_SECURITY_DEFINITION_CODE
+        !context.keep_up_to_date
+            || matches!(
+                notice.code,
+                NO_SECURITY_DEFINITION_CODE | REQUEST_VALIDATION_CODE | SUBSCRIPTION_DISCONNECTED_CODE
+            )
+    }
+
+    /// Live: after 10299 TWS sends the bars of the series the error names
+    /// (AGGTRADES for crypto `TRADES`, TRADES for AGGTRADES on stocks and
+    /// futures), then the window. With `keep_up_to_date` it streams the
+    /// updates too, and a later cancel draws 162.
+    fn error_continues_request(notice: &Notice, _context: &DecoderContext) -> bool {
+        notice.code == WHAT_TO_SHOW_SUBSTITUTED_CODE
     }
 }
 
@@ -768,8 +826,15 @@ pub enum WhatToShow {
     BidAsk,
     /// Aggregated trade data (wire value `AGGTRADES`).
     ///
-    /// Required for crypto contracts: TWS rejects `TRADES` for crypto with
-    /// error 10299, so crypto trade-price series must be requested as `AGGTRADES`.
+    /// The trade-price series for crypto. A crypto `TRADES` bar request draws
+    /// notice 10299 ("Expected what to show is AGGTRADES") and is then served
+    /// this series; historical ticks are refused with 10299. With `keepUpToDate`
+    /// ([`subscribe_with_updates`](HistoricalDataBuilder::subscribe_with_updates))
+    /// TWS refuses `AGGTRADES` with error 321, so a crypto stream needs
+    /// [`Trades`](Self::Trades). On stocks and futures `AGGTRADES` draws 10299
+    /// and the `TRADES` bars; on forex, 10299 then 162.
+    /// [`trades_for`](Self::trades_for) and [`trades_for_updates`](Self::trades_for_updates) pick
+    /// between the two (`docs/wire-facts/market-data.md#10299-whattoshow-substitution`).
     AggTrades,
     /// Historical volatility computed by IB.
     HistoricalVolatility,
@@ -781,6 +846,72 @@ pub enum WhatToShow {
     Schedule,
     /// Split-adjusted last price series.
     AdjustedLast,
+}
+
+impl WhatToShow {
+    /// The `whatToShow` that requests trade prices for `security_type`, or `None` where TWS has
+    /// no trade data for it.
+    ///
+    /// - Crypto: [`AggTrades`](Self::AggTrades). TWS serves `TRADES` bars too, the same data, after
+    ///   notice 10299; it refuses `TRADES` historical ticks with 10299. A keep-up-to-date
+    ///   [`subscribe_with_updates`](HistoricalDataBuilder::subscribe_with_updates) on
+    ///   crypto must use [`Trades`](Self::Trades) instead, which
+    ///   [`trades_for_updates`](Self::trades_for_updates) returns.
+    /// - Forex pairs, commodities (`XAUUSD`) and CFDs: `None`. TWS answers `TRADES` with error 162
+    ///   ("No historical market data"); request [`MidPoint`](Self::MidPoint), [`Bid`](Self::Bid)
+    ///   or [`Ask`](Self::Ask) instead.
+    /// - Every other security type: [`Trades`](Self::Trades). An index's TRADES bars carry no
+    ///   volume.
+    ///
+    /// Live-checked for stocks, futures, options, futures options, indices, forex, `XAUUSD`, an
+    /// index CFD and crypto (`docs/wire-facts/market-data.md#trade-price-whattoshow-by-security-type`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::SecurityType;
+    /// use ibapi::market_data::historical::WhatToShow;
+    ///
+    /// assert_eq!(WhatToShow::trades_for(&SecurityType::Crypto), Some(WhatToShow::AggTrades));
+    /// assert_eq!(WhatToShow::trades_for(&SecurityType::Stock), Some(WhatToShow::Trades));
+    /// assert_eq!(WhatToShow::trades_for(&SecurityType::ForexPair), None);
+    /// ```
+    pub fn trades_for(security_type: &SecurityType) -> Option<Self> {
+        match security_type {
+            SecurityType::Crypto => Some(Self::AggTrades),
+            SecurityType::ForexPair | SecurityType::Commodity | SecurityType::CFD => None,
+            _ => Some(Self::Trades),
+        }
+    }
+
+    /// The `whatToShow` that streams trade-price bars for `security_type` with keep-up-to-date
+    /// ([`subscribe_with_updates`](HistoricalDataBuilder::subscribe_with_updates)), or `None`
+    /// where TWS has no trade data for it.
+    ///
+    /// The same as [`trades_for`](Self::trades_for) except for crypto, which takes
+    /// [`Trades`](Self::Trades): TWS refuses `AGGTRADES` with keep-up-to-date (error 321, "Source
+    /// price not supported with live updates") and streams a crypto `TRADES` request after notice
+    /// 10299.
+    ///
+    /// Live-checked for crypto, stocks, futures and forex
+    /// (`docs/wire-facts/market-data.md#trade-price-whattoshow-by-security-type`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::SecurityType;
+    /// use ibapi::market_data::historical::WhatToShow;
+    ///
+    /// assert_eq!(WhatToShow::trades_for_updates(&SecurityType::Crypto), Some(WhatToShow::Trades));
+    /// assert_eq!(WhatToShow::trades_for_updates(&SecurityType::Future), Some(WhatToShow::Trades));
+    /// assert_eq!(WhatToShow::trades_for_updates(&SecurityType::ForexPair), None);
+    /// ```
+    pub fn trades_for_updates(security_type: &SecurityType) -> Option<Self> {
+        match security_type {
+            SecurityType::Crypto => Some(Self::Trades),
+            _ => Self::trades_for(security_type),
+        }
+    }
 }
 
 impl std::fmt::Display for WhatToShow {
@@ -861,6 +992,8 @@ pub trait TickDecoder<T> {
     /// subscription drivers', not a third copy of it — a tick type happens to
     /// declare exactly one entry.
     const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages];
+    /// The kind of tick this decoder reads, as the request names it.
+    const WHAT_TO_SHOW: WhatToShow;
     /// Decode a batch of ticks, returning the payload and an end-of-stream flag.
     ///
     /// Every impl narrows with `message.expect_type(..)?` first: it is the
@@ -872,6 +1005,7 @@ pub trait TickDecoder<T> {
 #[allow(private_interfaces)]
 impl TickDecoder<TickBidAsk> for TickBidAsk {
     const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[IncomingMessages::HistoricalTickBidAsk];
+    const WHAT_TO_SHOW: WhatToShow = WhatToShow::BidAsk;
 
     fn decode(message: &ResponseMessage) -> Result<(Vec<TickBidAsk>, bool), Error> {
         common::decoders::decode_historical_ticks_bid_ask(message.expect_type(IncomingMessages::HistoricalTickBidAsk)?)
@@ -881,6 +1015,7 @@ impl TickDecoder<TickBidAsk> for TickBidAsk {
 #[allow(private_interfaces)]
 impl TickDecoder<TickLast> for TickLast {
     const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[IncomingMessages::HistoricalTickLast];
+    const WHAT_TO_SHOW: WhatToShow = WhatToShow::Trades;
 
     fn decode(message: &ResponseMessage) -> Result<(Vec<TickLast>, bool), Error> {
         common::decoders::decode_historical_ticks_last(message.expect_type(IncomingMessages::HistoricalTickLast)?)
@@ -890,6 +1025,7 @@ impl TickDecoder<TickLast> for TickLast {
 #[allow(private_interfaces)]
 impl TickDecoder<TickMidpoint> for TickMidpoint {
     const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[IncomingMessages::HistoricalTick];
+    const WHAT_TO_SHOW: WhatToShow = WhatToShow::MidPoint;
 
     fn decode(message: &ResponseMessage) -> Result<(Vec<TickMidpoint>, bool), Error> {
         common::decoders::decode_historical_ticks_mid_point(message.expect_type(IncomingMessages::HistoricalTick)?)

@@ -137,7 +137,7 @@ fn first_rejection_is_kept() {
     let (receiver, _lease) = status_stream(&taps, 7);
     next_rejection(&receiver);
 
-    reject(&taps, 7, 10147);
+    reject(&taps, 7, 103);
 
     assert!(receiver.try_recv().is_err(), "no second rejection");
     assert_eq!(next_rejection(&status_stream(&taps, 7).0).code, 110);
@@ -151,6 +151,23 @@ fn status_after_rejection_replaces_it() {
     publish(&taps, 7, OrderStatusKind::Inactive);
 
     assert_eq!(next_response(&status_stream(&taps, 7).0).order_id(), Some(7));
+}
+
+#[test]
+fn refused_cancel_or_modify_is_not_a_rejection() {
+    let taps = taps();
+    let (open, _lease) = status_stream(&taps, 7);
+
+    // A cancel of an order filled before this connection (10148), or of an id
+    // with no order (10147), and a refused modify (105) change nothing.
+    for code in [10148, 10147, 105] {
+        reject(&taps, 7, code);
+    }
+
+    assert!(open.try_recv().is_err(), "nothing reaches an open stream");
+    assert!(status_stream(&taps, 7).0.try_recv().is_err(), "nothing starts a later stream");
+    reject(&taps, 7, 110);
+    assert_eq!(next_rejection(&open).code, 110, "a rejection still follows");
 }
 
 #[test]
@@ -242,6 +259,31 @@ fn reset_ends_status_streams_and_keeps_updates_and_final_latest() {
     );
     assert!(taps.send_update(order_status_response(order_status()).into()));
     assert!(updates.try_recv().is_ok(), "a reset keeps the update stream");
+}
+
+/// The order-update stream outlives a reconnect, so it gets the gap notice;
+/// status streams have already ended on the reset and get nothing.
+#[test]
+fn reconnected_sends_the_gap_notice_to_the_update_stream_only() {
+    let taps = taps();
+    let NewTap {
+        receiver: updates,
+        lease: _updates_lease,
+        ..
+    } = taps.subscribe_updates(0).unwrap();
+    let (status, _lease) = status_stream(&taps, 7);
+
+    taps.reconnected();
+
+    match updates.try_recv() {
+        Ok(RoutedItem::Notice(notice)) => {
+            assert_eq!(notice.code, crate::messages::TRANSPORT_RECONNECT_CODE);
+            assert_eq!(notice, crate::messages::order_update_gap_notice());
+        }
+        other => panic!("expected the gap notice, got {other:?}"),
+    }
+    assert!(updates.try_recv().is_err(), "one notice per reconnect");
+    assert!(status.try_recv().is_err(), "status streams get no notice");
 }
 
 /// TWS does not replay what happened while disconnected, so only statuses

@@ -4,16 +4,62 @@ Placement, echoes, status, executions and completed orders. Format: [README](REA
 
 ### `transmit` absent means held
 
-*Live 2026-09-23, paper Gateway, server 220; #841 (closed, not a bug).*
+*Live 2026-11-23 off-hours, paper TWS, server 223, AAPL BUY 1 LMT 1.00; first seen 2026-09-23,
+paper Gateway, server 220 (#841, closed, not a bug).*
 
 - A placeOrder proto with `transmit` left out (what `some_bool(false)` produces): TWS holds the
-  order. permId assigned, no OrderStatus, absent from open_orders; cancel returns 202 "Order was
-  discarded" + 161. Control with `transmit=true` goes PreSubmitted → Submitted.
+  order. It gets a permId but sends nothing for it: no OpenOrder, OrderStatus or notice on
+  `order_update_stream` within 3 s. Control with `transmit=true` goes PreSubmitted → Submitted.
+- A held order is listed nowhere: absent from `open_orders`, `all_open_orders` and
+  `completed_orders(false)` while held, and from `completed_orders` after it is cancelled.
+- Cancelling it is order-bound: the cancel's own subscription receives OrderStatus `Cancelled`
+  (with the permId) and 202 "Order Canceled - reason:Order was discarded.", then 161 "Cancel
+  attempted when order is not in a cancellable state. Order permId =…" as an error that ends the
+  subscription. The same three frames reach `order_update_stream`. Server 220 showed 202 + 161.
+- Cancelling the id again returns 10148 "…cannot be cancelled, state: Cancelled."; an id that was
+  never sent returns 10147 "…is not found." So a cancel tells the three states apart: 202 =
+  was held, 10148 = already done, 10147 = never reached TWS.
+- It survives a disconnect: held, `disconnect()`, reconnect 3 s later with the same client id. It
+  is still listed nowhere, and the cancel returns 202 "Order was discarded" + 161.
+- It survives a pause: two orders held for 20 s were released by the last order's
+  `transmit=true` like an immediate one.
 - The official clients (`EClientUtils` in C#/Java/Python/C++) also set `transmit` only when
   true. Our decoder's `unwrap_or(true)` applies to inbound messages only and says nothing about
   how TWS reads an absent flag in outbound ones.
 - An untransmitted order gets no open-order or status frames, so a TWS-derived value (e.g. a
   VOL order's limit) is only visible once transmitted.
+- **Not probed:** how long a held order lasts beyond 20 s or a 3 s disconnect, whether a TWS
+  restart discards it, and whether another client id (or client 0) can cancel it.
+
+### Held parent and children
+
+*Live 2026-11-23 off-hours, paper TWS, server 223, AAPL parent BUY 1 LMT 1.00 with SELL LMT
+5000 / 6000 children.*
+
+- Parent and first child held, last child `transmit=true`: all three go PreSubmitted within
+  0.4 s and are listed by `open_orders`. Cancelling the parent then cancels both children
+  (OrderStatus `Cancelled` + 202 for each id).
+- Cancelling a held parent does **not** discard its held child: the child's own cancel still
+  returns 202 "Order was discarded" + 161, not 10147. Cleaning up a partly sent list therefore
+  needs a cancel per held order, not just the parent's.
+- Re-sending a held parent with `transmit=true` releases its held child too: both go
+  PreSubmitted.
+- `submit_linked_orders` and bracket `submit_all` (sync and async share the code) on this
+  session: all three orders PreSubmitted, then cancelled through the parent; a list whose last id
+  is 1,500,000,000 failed with `OrderIdInRequestRange` and sent nothing (cancels of the first two
+  ids returned 10147).
+- **Not probed:** fills of a released bracket, and a send failing part-way on a live connection
+  (the client checks every order before sending, so only a lost connection fails a later send).
+
+*Live 2026-11-25 19:12 UTC (US RTH), paper TWS, server 223.*
+
+- An AAPL BUY 1 LMT with `transmit=false`, then an unrelated AAPL BUY 1 LMT with `transmit=true`
+  on the same client: the second went `PreSubmitted` and `Submitted`; the held one stayed held.
+  Eight seconds later it had still sent no frame on its own stream and `all_open_orders` did not
+  list it. A transmitted child that names it as `parent_id` releases a held order (see
+  [Bracket child quantity](#bracket-child-quantity-follows-the-parent)); re-sending the held
+  order itself with `transmit=true` was not probed. Its cancel drew
+  `Cancelled`, 202 "Order was discarded" and 161, as above.
 
 ### Attached orders (`attached_orders`)
 
@@ -38,6 +84,29 @@ Placement, echoes, status, executions and completed orders. Format: [README](REA
   Trailing Amount".
 - C# `Order.cs` documents percent as 1; wrong. The OrderSamples comments (100) are right.
 
+### Trailing order echo
+
+*Live 2026-11-23 23:13-23:14Z, paper TWS, server 223; EUR.USD SELL 20000 GTC, placed with
+`trailing_stop` and `trailing_stop_limit`.*
+
+| Placed | `order_type` | `aux_price` | `trailing_percent` | `trail_stop_price` | `limit_price_offset` | `limit_price` |
+| ------ | ------------ | ----------- | ------------------ | ------------------ | -------------------- | ------------- |
+| `TrailBy::Amount(0.3)`, stop 0.7 | `TRAIL` | 0.3 | absent | 0.7, then 0.79043 | absent | 0 |
+| `TrailBy::Percent(20.0)`, stop 0.7 | `TRAIL` | absent | 20 | 0.7 | absent | 1.09047 |
+| `TrailBy::Amount(0.3)`, stop 0.7, offset 0.007 | `TRAIL LIMIT` | 0.3 | absent | 0.7 | 0.007 | 0 |
+
+- The echo carries the fields the builder sets, so `TrailBy` reads back from `aux_price` or
+  `trailing_percent`. TWS trails the stop: within a second of placement the amount order's stop
+  moved from 0.7 to 0.79043 (market 1.0905 less 0.3), and each later echo carried the new stop.
+- The percent order echoed `limit_price` 1.09047, about the market price, where the amount orders
+  echoed 0.
+- Plain AAPL LMT orders echoed `trail_stop_price` 2.0 on the first echoes and none after a
+  modify; the field is not a sign of a trailing order.
+- A modify of the stop price alone draws 10067 "Stop price must be changed together with the
+  trailing amount for a trailing order", and the order keeps working unchanged.
+- **Not probed:** stocks or futures, trailing percent on `TRAIL LIMIT`, the percent order's stop
+  after it starts to trail, and the echo after a trigger.
+
 ### What-if and additional order params
 
 *Live 2026-10-27 RTH, paper Gateway, server 226, SPY BUY LMT SMART DAY; #1065.*
@@ -51,6 +120,52 @@ Placement, echoes, status, executions and completed orders. Format: [README](REA
 - `ignore_open_auction=true` echoes as false (sent, but not reported for SMART DAY LMT).
 - `seek_price_improvement` unset → open order reports `Some(false)`: TWS sends an explicit
   false.
+
+### What-if answer frames
+
+*Live 2026-11-24 off-hours (04:15 ET), paper TWS, server 223; raw capture of `openOrder`
+frames; #1289.*
+
+| Order (what-if)                                              | Frames | Margin fields           | Commission             | Then    |
+| ------------------------------------------------------------ | ------ | ----------------------- | ---------------------- | ------- |
+| AAPL BUY 10 LMT 100, SELL 5 LMT 900                          | 2      | 1st absent, 2nd present | 1st `0`, 2nd `1.00003` | nothing |
+| AAPL BUY 5 MKT; ES H7 LMT; EUR.USD LMT and MKT; SAP IBIS LMT | 1      | present                 | present                | nothing |
+| AAPL BUY 10,000,000 LMT 1                                    | 2      | 1st absent, 2nd present | 1st `0`, 2nd absent    | 201     |
+| AAPL BUY 10,000,000 MKT; ES H7 BUY or SELL 100,000           | 1      | present                 | absent                 | 201     |
+
+- The first frame of a two-frame answer carries only `status` (PreSubmitted), `commission_and_fees
+  = 0` and `warning_text` (the limit-price collar warning, "If your order is not immediately
+  executable..."): no margin fields, no currencies. The second, 0 to 80 ms later (three runs),
+  carries the margins, commission and currencies and no `warning_text`. A consumer that
+  takes the first frame reports no margins and a zero commission. A stock market order drew no
+  warning and one frame.
+- An order the account's margin cannot carry: the frame with margins has `suggested_size` set
+  (`"4000"`, `"14"`, `"16"`) and no commission or commission currency; an error 201 "YOUR ORDER
+  IS NOT ACCEPTED. IN ORDER TO OBTAIN THE DESIRED POSITION ... MUST EXCEED ..." follows within
+  1 ms. No accepted what-if carried `suggested_size`.
+- No `orderStatus`, `openOrderEnd` or other end marker follows any what-if answer; the reply
+  stays silent for the 6 to 10 s read.
+- Rejected before any frame: unknown symbol, 200; EUR.USD LMT -1, 110; EUR.USD 500,000,000,
+  201 "Order size is not within the limits".
+- The answer's frames reach `order_update_stream` as well as the place-order reply, each with
+  `order.what_if = true` (live 2026-11-24 10:59 UTC, `Client::analyze_order`: AAPL BUY 10 LMT
+  100 two frames 33 ms apart, EUR.USD BUY 20,000 LMT 1.0 one frame with commission `2`).
+- **Not probed:** RTH (the US stock frames may differ at the open); options, combos and other
+  warnings; Gateway (the 2026-10-27 SPY probe above ran on Gateway 226 and did not count frames).
+
+### What-if order ids
+
+*Live 2026-11-24 21:53 UTC (US stocks closed), paper TWS, server 223; #1289.*
+
+- One connection per step, same client id, AAPL BUY 1 LMT 100: what-if under id 1000 answered
+  with two frames (PreSubmitted, then the margins); a real order under 1000 then drew 103
+  "Duplicate order id: 1000", and so did a second what-if under 1000. A what-if under 1005
+  answered; a second what-if under 1005, a what-if under 1003 and a real order under 1005 each
+  drew 103.
+- Settles that a what-if uses its order id like a placed order: the id and every id below it are
+  spent for that client, although no order is left working. A caller that keeps its own id
+  sequence must take what-if ids from it, or its next order collides.
+- **Not probed:** whether the spent id survives a TWS restart; Gateway.
 
 ### IBKRATS PEG BEST / PEG MID
 
@@ -108,6 +223,122 @@ Placement, echoes, status, executions and completed orders. Format: [README](REA
     sorts alphabetically); three or more legs; other order types (MKT, REL) on a stock combo;
     whether a single-underlying stock combo needs `NonGuaranteed`.
 
+### Combo (BAG) executions and commissions
+
+*Live 2026-11-23 23:11-23:39 UTC (CME Globex evening session), paper TWS, server 223; ES
+calendars ESZ6/ESH7 (1x1 and 1x2) and an ES put vertical (P6500/P6450 Dec) as BAGs on CME,
+market orders of 1 to 5 combos and a passive 10-lot limit cancelled after its first fill; 14
+fills, each read on `place_order`, `order_update_stream` and `executions`. Guard:
+`FillMatcher::add_combo`, `orders/fills_tests.rs`.*
+
+- **Shape**: each fill of a combo order is one execution for the combo, then one per leg. The
+  combo-level execution has security type `BAG`, the per-exchange placeholder contract id
+  (16472979 on CME, recorded in #1271), `local_symbol` `ES`, no `combo_legs` and an empty
+  `combo_legs_description`. Its `shares` is the combo
+  quantity of the fill and its `price` the net price per combo: -7397 = 7260 - 2 x 7328.5 on
+  the 1x2. Each leg execution carries the leg contract, `shares` = combo shares x ratio (2 on
+  the ratio-2 leg) and the leg's own price.
+- **Order**: combo-level execution first in all 13 fills read live, then the legs, the three
+  within 8 to 14 ms. The leg with the higher con id came first every time (ESH7 before ESZ6,
+  P6450 before P6500), on buys and sells and with the legs sent in either order. An OpenOrder
+  and OrderStatus pair follows each execution; the OrderStatus that reports the fill follows
+  the combo-level execution, before the legs.
+- **Link**: the three executions share `order_id`, `client_id` and `perm_id`. Their
+  `execution_id`s share the first two fields and differ in the third: `0000e1a7.6b0717ad.01.01`
+  (combo), `.02.01` (first leg), `.03.01` (second leg). Each fill of a partly filled order gets
+  a new second field: a 4-lot order filled 2 + 2 as `0000e1a7.6b0719db.*` and
+  `0000e1a7.6b0719de.*`, 11 s apart.
+- **Commissions**: one report per leg execution, 1 to 31 ms after the second leg's execution,
+  in leg order: 2.16 USD per ES future, 4.32 for the ratio-2 leg's 2 contracts, 1.41 per ES
+  option. No report for the combo-level execution, live or in `executions`. `realized_pnl` is
+  set on closing legs only.
+- **Partial fills**: a combo-level execution and its legs per fill, sized to that fill.
+  `cumulative_quantity` and `average_price` run per order and per contract: the combo 2 then
+  4, each leg 2 then 4 with the leg's running average (ESH7 7325.55 then 7325.925).
+- **`executions` replay**: the same executions in the same order (per fill: combo, then legs;
+  fills in time order), then all reports, none for a combo-level execution; the combo-level
+  contract carries no legs there either. The replay was read on a connection with no live
+  `place_order` subscription for the order: while one is open, the client delivers that
+  order's executions to it and they are missing from the reply.
+- **Legs from the reply alone** (*live 2026-11-24 09:16 UTC, paper TWS, server 223,
+  `last_n_days` 7*): 91 executions and 77 reports. Every one of the 14 combo-level executions
+  had exactly two executions with its `perm_id` and its first two id fields, both leg
+  contracts (ES futures or options). Every execution with a combo order's `perm_id` was a
+  combo-level execution or a leg of one: the orders filled in 2 and 3 parts gave 2 and 3 such
+  groups, one per second field. The 14 missing reports were the combo-level executions'.
+- **Legs against the order echo** (*live 2026-11-24 11:20 UTC, paper TWS, server 223,
+  `last_n_days` 7*): for each of the 14 combo fills, the legs `Fill::combo_legs` derives (ratio
+  = leg shares / combo shares, `Buy` when the leg executed on the combo execution's side) equal
+  the legs TWS echoed on that order's `openOrder` frames when it was placed (contract id, ratio
+  and action; 1x1 and 1x2 ES calendars and an ES put vertical, bought and sold, fills of 1, 2
+  and 3 parts). Each leg execution's contract carried exchange `CME`, as the echo's legs do.
+  `completed_orders` no longer listed those orders; it listed one cancelled ES calendar order,
+  legs sorted by contract id with ratio 1 and `CME`.
+- **Executions missing once**: on one fill (1 of a 4-lot market sell, 23:26:39 UTC) the client
+  got the two leg reports on both streams but none of the three executions; the OrderStatus
+  for the fill came 8 s later with `last_fill_price` 0, and `executions` afterwards listed all
+  three. A raw capture of the next order (3 fills) showed the normal shape, so whether TWS
+  skipped the frames or the client dropped them is not settled.
+- **US option combos on `SMART`** (*live 2026-11-24 16:06-16:09 UTC, US market open, paper
+  TWS, server 223; AAPL Dec 2026 350/355 call vertical, BAG on `SMART` with `SMART` legs,
+  market orders of 1, sold then bought back*): the same shape and order as on CME. Combo-level
+  execution first, then both legs within 14 ms, the higher con id first (the 355 call,
+  927346994, before the 350 call, 692808279); execution ids `.01.01`, `.02.01`, `.03.01`; one
+  commission report per leg (1.03 to 1.05 USD) 1 to 9 ms after the second leg, none for the combo.
+  The combo-level contract id was 28812380 for both fills and for another client's AAPL combo
+  that executed on BOX.
+- **Executing venue, not `SMART`**: each fill's three executions carry the venue that executed
+  it as the contract's exchange, `PHLX` for the sale and `EDGX` for the buy-back, so
+  `Fill::combo_legs` gave the legs with `PHLX` and then `EDGX`. `completed_orders` echoed both
+  orders' legs with exchange `SMART`, contract ids sorted, ratio 1, `Buy` 350 and `Sell` 355,
+  which match the derived legs except for the exchange.
+- A `SMART` combo buy sent while a single-leg sell of one of its legs was still working drew 201
+  "Order rejected - reason:Cannot have open orders on both sides of the same US Option
+  contract." (Inactive, then the 201).
+- **Not probed:** SMART-routed futures combos, more than two
+  legs, a leg filled by more than one execution within one combo fill, a leg execution before its combo-level execution, a combo-level report, execution
+  corrections (an id ending `.02`), several combo fills interleaved, Gateway.
+
+### Combo (BAG) shape and identity
+
+*Live 2026-11-23 17:24-17:35 ET off-hours (CME Globex closed 17:00-18:00 ET), paper TWS, server
+223; what-if orders on AAPL, SPY, MSFT and IBM options and stock, ES and CL futures; three AAPL
+and MSFT verticals placed at 0.01 and cancelled. Guard: `Contract::spread_from_legs`,
+`integration/*/tests/spreads.rs`.*
+
+- **No combo contract id**: the echoed BAG `contract_id` is a placeholder per combo exchange,
+  the same for every combo there: 28812380 for every SMART combo (AAPL, SPY, MSFT and AAPL/IBM
+  combos, and futures combos sent to SMART), 14442663 on CBOE, 16472979 on CME (Z6/H7 and H7/M7
+  ES calendars), 40348702 on NYMEX. Placed orders echo the same id in `open_orders` and
+  `completed_orders`. So the legs identify a combo, not the id.
+- **Echo**: legs come back sorted by con id ascending, whatever order they were sent in; ratio
+  positive with the side in `action`; leg exchange filled (`SMART`, or the futures exchange).
+  `local_symbol` repeats the symbol, `trading_class` is `COMB`, and `combo_legs_description` is
+  `conid|signed ratio` per leg (`692808040|-1,838697388|1`), with `|CME` appended per leg when a
+  futures combo goes to SMART.
+- **Symbol**: must match the legs; another symbol draws 478 "Requested symbol MSFT, in legs
+  AAPL". For legs on several underlyings TWS accepts any one leg's symbol or all of them sorted
+  and comma-joined, and echoes the joined form (`AAPL,IBM`, though IBM's con id sorts first).
+  `IBM,AAPL` draws 478 "... in legs AAPL,IBM".
+- **Currency**: required on SMART (empty: 321 "Currency null isn't supported for smart combo"),
+  but its value is not checked: `EUR` on USD legs echoed `USD`. Empty was accepted on CME.
+- **Exchange**: required (empty: 321 "Missing order exchange"). Options take `SMART` or `CBOE`.
+  A stock leg takes only `SMART` (10125). A futures calendar takes the legs' exchange (`CME`,
+  `NYMEX`), or `SMART` only when each leg names that exchange; `SMART` with blank leg exchanges,
+  or a wrong exchange, draws 200. SMART and CME gave the same margin for the ES calendar.
+- **Leg exchange**: ignored for options (blank, `SMART` and `CBOE` all echoed the combo
+  exchange). Blank is fine for futures on their own exchange; `NYMEX` on ES legs drew 200.
+- **Ratios**: positive and with no common factor. 2:2, 2:4 and a single leg at 3 draw 321
+  "Invalid leg ratio"; 1:3 and 2:3 were accepted. A zero or negative ratio draws 321 "The combo
+  details for leg ... are invalid".
+- **Not answered** (no reply within 20-40 s, no error): a BAG with one leg at ratio 1 (option
+  or stock), the same leg twice, and the collar (stock 100 + put + call), with or without
+  `NonGuaranteed`. Gateway 226 accepted the collar on 2026-10-29 (above).
+- **Stock pair** (AAPL/MSFT, AAPL/IBM): 10043 unless the order is `NonGuaranteed`.
+- **Not probed:** Gateway (TWS only); RTH; other directed option exchanges; non-USD combos;
+  legs in different currencies; ES/NQ on CME drew 201 "Unknown contract" (no native
+  inter-commodity listing), so a directed multi-underlying combo stays untested.
+
 ### `use_price_mgmt_algo` / `route_marketable_to_bbo` echo and acceptance
 
 *Live 2026-11-05 off-hours (23:43 ET), paper Gateway, server 226; AAPL BUY 1 LMT 1.00; #1191.*
@@ -147,6 +378,23 @@ Placement, echoes, status, executions and completed orders. Format: [README](REA
   ~10s. Late fills can arrive with the cancel reply; re-read `filled` from it.
 - Bracket sibling-cancel (#1030) confirmed the same day; a fill without a Filled status never
   appeared in 8 fills.
+
+### Completed order ids can be `0`
+
+*Live 2026-11-25 Wed 11:10 ET (RTH), paper TWS, server 223; #1263.*
+
+- `completed_orders(ApiOnly::No)` returned 230 records; 185 carried `order.order_id` `0`. The
+  ones printed had `order.client_id` `0`, status `Cancelled` and `completed_status` "Cancelled by
+  Trader", each with a distinct `perm_id`. Paper Gateway (server 226, 2026-11-15) listed three
+  cancelled orders the same way.
+- Settles that a completed record's order id does not identify it; `perm_id` does. The
+  `CompletedOrder` message has no top-level id, so `order.order_id` is the only id it carries.
+- On paper Gateway (server 226), every `OpenOrder` frame captured (226 across sessions) carried
+  the same id at the top level and on its order, including an order listed to a second client
+  and to client 0's `all_open_orders`. The second client saw the first client's order under id
+  `1`, so an open order's id identifies it only with `order.client_id`.
+- **Not probed:** how the id-`0` orders were placed (they predate this run); an order entered in
+  TWS by hand; one bound with `auto_open_orders`.
 
 ### `open_orders` excludes finished orders
 
@@ -194,6 +442,57 @@ first `Inactive` event.*
 - **Not probed:** other 201 reasons; a 201 on a modify; `completed_orders(true)`; a raw capture
   to settle the two `open_orders()` hits; the Gateway.
 
+### Overlapping open-order requests
+
+*Live 2026-11-25 off-hours, paper TWS, server 223; client with 3 resting EUR.USD limits, a
+second client with 1, other clients' orders resting too.*
+
+- Two requests written back to back on one client, before any reply frame: TWS sends one full
+  reply per request, each with its own end marker, in the order sent, never interleaved. Seen
+  for `reqOpenOrders` twice (`5 3 5 3 5 3 53`, then the same again), `reqAllOpenOrders`
+  twice, both mixed orders (the own-client list of 3 orders and `53`, then the all-clients
+  list and `53`, or the reverse), and `reqCompletedOrders` twice (76 `CompletedOrder` and
+  `102`, twice). The second reply came about 100 ms after the first.
+- `reqPositions` twice behaves the same: 14 `Position` and `62`, twice.
+- A second request written after the first reply's first frame arrived draws the same: the
+  rest of the first reply, its end marker, then a full second reply.
+- At connect, before `nextValidId`, TWS sends this client's open orders and an `OpenOrderEnd`
+  that answers no request.
+- So routing these replies by message type alone is not enough: every reply reaches every
+  live subscription of its types, and a subscription must pass over the replies outstanding
+  when its request was written (`ChannelMapping::reply_end`). Without that, a second
+  `open_orders` made mid-reply read 4 of 6 frames and ended, and `all_open_orders` written
+  after `open_orders` read the 3 own orders instead of all of them.
+- A request can go unanswered: during the farm outage runs of #1315, a `reqPositions` sent
+  after a 1100 got no `PositionEnd` for 1554 s and 348 s.
+- **Not probed:** whether a busier account ever interleaves two replies, an unsolicited
+  `OpenOrderEnd` while a request is outstanding; whether `cancelPositions` sent mid-dump
+  suppresses the `PositionEnd`; whether `reqOpenOrders` or `reqCompletedOrders` sent during a
+  connectivity loss are answered. `reqAutoOpenOrders`: see
+  [`auto_open_orders` draws no reply](#auto_open_orders-draws-no-reply).
+
+### `auto_open_orders` draws no reply
+
+*Live 2026-11-25 10:09-10:11 UTC off-hours, paper TWS, server 223, client id 0, async client
+with `IBAPI_RECORDING_DIR`.*
+
+- `reqAutoOpenOrders(autoBind=true)` drew no frame at all in the next 5 to 6 s, with no open
+  order on the account, and again with a resting EUR.USD limit of client 0 and one of another
+  client. No `OpenOrder`, no `OrderStatus`, no `OpenOrderEnd`: the request has no reply and
+  no end marker.
+- A far EUR.USD limit placed by another API client while the request was live sent client 0
+  nothing.
+- `reqAllOpenOrders` on client 0 while the request was live drew `5 3 53` (the other client's
+  order). The client fanned that reply out to the `auto_open_orders` stream as well, which
+  yielded the order and its status and then ended at the `53`. `reqOpenOrders` on client 0
+  (with its own resting order) did the same. So every `OpenOrderEnd` a client 0 connection
+  sees ends some other request's reply, and the auto stream now ignores it
+  (`ChannelMapping` for `RequestAutoOpenOrders` lists no `OpenOrderEnd`).
+- At connect, TWS sent client 0 its resting order, its status and an `OpenOrderEnd` before
+  `nextValidId`; a connection whose client had no open order got none of the three.
+- **Not probed:** an order placed in the TWS window, the case `autoBind` exists for (no manual
+  order was placed); `autoBind=false`.
+
 ### Executions: `last_n_days` and `specific_dates`
 
 *Live 2026-09-27 (Sunday), paper Gateway, server 220; #858.*
@@ -217,6 +516,14 @@ first `Inactive` event.*
 - **Not probed:** a `specific_dates` day older than a week that has executions. None was
   reachable (`last_n_days` above 7 returns nothing), so whether TWS applies the "within the
   past week" in IB's `ExecutionFilter.proto` to `specific_dates` is not known.
+
+*Live 2026-11-25 19:15 UTC, paper TWS, server 223; `time` with `last_n_days = 7`.*
+
+- `time` from 1978-01-01 00:00 UTC to the present was accepted: each date from one day to
+  48 years back (1978-01-01, 1980, 2002, 30, 60, 365 and 3,650 days back) returned the same 317
+  executions as the 7-day window. 1977-12-31 and earlier (1977-08-14, 1975, 1970-01-02,
+  1970-01-01) drew 10314 "The date, time, or time-zone entered is invalid." A `time` one day
+  ahead returned no executions and no error.
 
 ### Commission report timing and values
 
@@ -248,6 +555,31 @@ and sold at market; MSFT orders of 500 shares filled in 7 to 9 parts.*
   order's total (1.000126, 1.000246, ... 2.5015 after 500 shares).
 - **Not probed:** futures; a later corrected report; a raw capture of `realized_pnl`; the
   Gateway.
+
+### Executions: request id on replies and live fills
+
+*Live 2026-11-23 23:56Z off-hours, paper TWS, server 223; EUR.USD BUY 20,000 MKT, then
+`executions(ExecutionFilter::default())`.*
+
+- The live `ExecutionData` frame carried request id -1; the same execution in the
+  `executions` reply carried the request's id (`1500000000`). The request id alone tells a
+  reply from a live fill.
+- The reply carried a commission report for each execution, other clients' executions
+  included. A commission report carries no request id or client id, so only the execution id
+  links it to its execution.
+
+*Live 2026-11-24 00:26Z–00:32Z off-hours, paper TWS, server 223; raw captures; EUR.USD BUY
+20,000 MKT with `executions()` sent on the live execution (5 runs), before the fill (2 runs),
+and every 10 ms across the fill (5 runs, 40 requests each).*
+
+- TWS sends one commission report for the live fill and one more inside each reply that lists
+  the fill, before that reply's end marker.
+- In 5 runs a reply landed between the live execution and its commission report. Each time that
+  reply listed the execution without a report, its end marker followed, and then the live
+  report arrived on its own. The fill's reports matched the replies that listed it one for one
+  (38 replies, 38 reports in one run): the live one stood in for the racing reply's.
+- A reply sent before the fill does not list it, and the fill's live report follows as usual.
+- **Not probed:** a live report arriving inside a reply, before its end marker.
 
 ### `Execution.time` rendering
 
@@ -370,8 +702,92 @@ with `override_natural_action`.*
   day.
 - The open order has no field marking it as an exercise; only the shared `permId` links it to the
   executions.
-- **Not probed:** lapse, assignment, automatic exercise at expiry, puts, futures options, and
-  exercising from a client other than the one that bought.
+- **Again during US hours** (*live 2026-11-24 16:23 and 16:31 UTC, paper TWS, server 223;
+  AAPL Nov 27 2026 calls, bought by one client and exercised by another*): the same frames and
+  order. The 340 call (in the money, AAPL at 352): 10349, OpenOrder and OrderStatus
+  `PreSubmitted`, 6 ms later ExecutionData BOT 100 AAPL at 340, OpenOrder and OrderStatus Filled
+  with 100, then ExecutionData SLD 1 call at 0 and Filled with 1, all within 20 ms. The two
+  execution ids share their first two fields and differ in the third (`.01.01` stock, `.02.01`
+  option), like a combo's. No commission report for either, live or in `executions` 3 minutes
+  later. An exercise of the out-of-the-money 380 call (AAPL at 351) went through the same way,
+  buying 100 AAPL at 380.
+- Lapse before the last trading day: 10349, OpenOrder and OrderStatus `Inactive`, 201 "Order
+  rejected - reason:trade date must match last trade date of the contract", then 322
+  "Error processing request.Exercise/Lapse failed due to server rejection." on the same id.
+- Futures option (ES Dec 2026 6800 put, held): 10349, `Inactive`, 201 "Order rejected -
+  reason:Real time exercise of FOP is not available. Please send TMS ticket to request this
+  exercise.", then 322. The position was unchanged.
+- **Not probed:** a lapse on the last trading day, assignment, automatic exercise at expiry,
+  puts, and the Gateway.
+
+### Cancel replies, and a cancel that races a fill
+
+*Live 2026-11-23 23:56Z off-hours, paper TWS, server 223; AAPL BUY 1 LMT 1.00 (PreSubmitted),
+and EUR.USD BUY 20,000 MKT cancelled right after placing.*
+
+- Resting order: `cancel_order` drew `OrderStatus` `Cancelled` and then error 202 ("Order
+  Canceled - reason:"), both on the order id, within 0.2 s. No `PendingCancel` status came first.
+- Market order cancelled at once: `OrderStatus` `PendingCancel`, then the fill
+  (`ExecutionData`, request id -1), `OrderStatus` `Filled`, and the commission report. The cancel
+  lost the race; no 202 or other error followed.
+- **Not probed:** a partial fill followed by a cancel of the rest, and a cancel during RTH.
+
+### Modifying an order
+
+*Live 2026-11-24 off-hours (04:25-04:36 ET), paper TWS, server 223; EUR.USD BUY 20,000 LMT 0.95
+(Submitted), modified with `place_order` on the same id; #1282.*
+
+| Modify sent                                                       | Reply                                                                                |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| limit 0.95 -> 0.96; quantity 20,000 -> 25,000; `DAY` -> `GTC`     | OpenOrder and OrderStatus Submitted (once or twice) with the new terms, same perm id |
+| only `order_type` and `lmt_price` set (quantity 0)                | 321 "... The size value cannot be zero"                                              |
+| action BUY -> SELL; contract EUR.USD -> GBP.USD                   | 105 "Order being modified does not match original order."                            |
+| order type LMT -> STP                                             | 329 "Order modify failed. Cannot change to the new order type.STP"                   |
+| id of a cancelled, filled (MKT) or rejected (201, Inactive) order | 104 "Cannot modify a filled order."                                                  |
+| id of an order TWS had not acknowledged yet                       | 103 "Duplicate order id: 5"                                                          |
+
+- Every refusal carried the order id, came with no status, and left the order working with its
+  earlier terms (`open_orders` right after). A second cancel of a cancelled order drew 10148.
+- **Held order** (`transmit` false): the place and a modify with a new price drew no frames and
+  `open_orders` did not list it. The modify that set `transmit` released it with the newest price
+  (Submitted).
+- **Another client**: client 209 sending client 208's working order id placed a second, separate
+  order (another perm id, both listed by `all_open_orders`); its cancel of that id before then drew
+  10147.
+- **Slow acknowledgment**: in one run TWS took 7 s before the OpenOrder of a new order, and in
+  another sent none; modifies sent meanwhile drew 103, and the unanswered order's cancel
+  drew OrderStatus ApiCancelled with perm id 0.
+- **Subscriptions**: with every subscription on an order id receiving its frames (#1282), a
+  refused modify's error ends the modify's own subscription and reaches the earlier `place_order`
+  subscription as a notice, which keeps receiving the order's frames (201, 104 and 434 on
+  2026-11-24 during US hours, on the build with #1282). On 6.0-dev before #1282, each
+  `place_order` or `cancel_order` on the id replaced the earlier subscription's route: on the
+  async client that subscription ended at once; on the blocking client (read from the code,
+  not run) it kept a sender of its own for the cancel notification, so it stopped receiving
+  and its `next()` blocked. A refused modify then ended its own subscription, leaving none.
+- **Partly filled order** (*live 2026-11-24 16:14-16:21 UTC, US market open, paper TWS, server
+  223; MSFT BUY LMT at or above the ask, modified with `place_order` on the same id after the
+  first partial fill*):
+
+  | Modify sent                                    | Reply                                                                       |
+  | ---------------------------------------------- | --------------------------------------------------------------------------- |
+  | limit to 480 (below the market), filled 100    | OpenOrder with the new price, status `PendingSubmit`, then `Submitted`      |
+  | quantity 2000 -> filled + 100                  | OpenOrder and OrderStatus `PreSubmitted`, then `Submitted`, `remaining` 100 |
+  | quantity below the filled quantity             | 355 "Order size does not conform to market rule." under order id 0          |
+  | quantity equal to the filled quantity          | 434 "The order size cannot be zero." on the order id                        |
+  | limit change while the order was still filling | fills at the old price, status `PendingSubmit`; once `Filled`, 201          |
+
+  - The quantity is the order's total, filled shares included: after 2000 -> 299 with 199
+    filled, the cancel reported `filled` 199 and `remaining` 100.
+  - The 355 frame carried order id 0 (raw capture), so it reached no subscription on the
+    order, only `order_update_stream`; the order kept its quantity. The 434 reached the
+    modify's subscription as an error and the earlier `place_order` subscription as a notice.
+  - Modify overtaken by fills: the OpenOrder that answered the modify echoed the new price with
+    status `PendingSubmit` while seven more fills at the old price (493.45 to 493.47 against a
+    new limit of 480) completed the order; after `Filled` came 201 "Order rejected -
+    reason:Order is already filled" on the order id, and further modifies drew 104.
+- **Not probed:** a modify of a partly filled order's limit back into the market; IB Gateway;
+  futures orders.
 
 ### Weekend cancel of a PreSubmitted ES order wedges in PendingCancel
 
@@ -398,6 +814,33 @@ with `override_natural_action`.*
 - **Not probed:** whether a plain order (not an exercise) shows the same, whether it depends on
   the client id, and whether TWS rejects the reused id later.
 
+### Orders TWS names in 1104
+
+*Live 2026-11-25 and 2026-11-26 (US pre-market, FX open), paper TWS, server 223; internet cut
+for 15 s, 2 min, 20 min (Wi-Fi) and 2 min (router uplink); AAPL BUY 1 LMT 1.00; #1300.*
+
+- With the 1100, TWS sent 1104 with request id -1, listing the orders it had not created, and a
+  second 1104 1 s later as the list grew. Run of 2026-11-26, 20 minutes:
+
+  ```text
+  12:00:53.861 status order 55 ApiPending filled 0 remaining 1
+  12:01:12.622 NOTICE code=1104 req=None msg="Pending to create 1 orders: 55"
+  12:01:13.627 NOTICE code=1104 req=None msg="Pending to create 2 orders: 55, 57"
+  12:01:14.621 NOTICE code=200 req=Some(57) msg="No security definition has been found for the request"
+  12:27:13.069 [10147] OrderId 55 that needs to be cancelled is not found.
+  ```
+
+- An order placed after the cut and before the 1100 (55, 60) was never created, also after
+  the 1102: no status after ApiPending, no error, absent from every open-orders reply (25 in
+  the 20-minute run), and a cancel at the end drew 10147. 4 of 4 runs.
+- An order placed 1.0 s after the 1100 (57, 62) was named in the second 1104, then rejected
+  with 200 on its order id, 1.0 s and 21.0 s after it was placed.
+- The ids follow `": "` and are separated by `", "`, in English message text; the frame carries
+  them nowhere else.
+- `Notice::pending_order_ids` reads the ids from that text.
+- **Not probed:** a 1104 without a 1100; an outage that ends in 1101; a named order TWS creates
+  later; TWS set to another language; IB Gateway; live accounts.
+
 ### `reqAllOpenOrders` raises the caller's next valid order id
 
 *Live 2026-11-23 about 18:35Z and 21:19-21:20Z (after the US close), paper TWS, server 223.*
@@ -418,8 +861,11 @@ with `override_natural_action`.*
   1000320). A client that sent no request also read 1 both times.
 - The builder's `submit()` took the stale id 1 from `Client::next_order_id()` and returned
   `Ok(OrderId(1))`; the 103 arrived as a notice bound to order 1 on `order_update_stream()`.
-- Settles that `all_open_orders()` can leave this crate's order-id counter below the floor TWS
-  enforces for duplicates; `next_valid_order_id()` returns the raised value.
+- Settled, for the client as it was then, that `all_open_orders()` could leave its order-id
+  counter below the floor TWS enforces for duplicates; `next_valid_order_id()` returns the
+  raised value. The client now raises its counter past every order id an `all_open_orders()`
+  reply lists, so the builder's next `submit()` takes an id above them; the two bullets above
+  describe the client before that.
 - **Not probed:** whether `reqCompletedOrders` or `reqExecutions` raise the id within the same
   session (no `reqIds` between the listing and the disconnect); `reqOpenOrders` with rows to
   list (it listed nothing in both runs, so it had nothing to raise the id above); whether TWS
@@ -531,3 +977,349 @@ connections, AAPL BUY 1 LMT 1.00 (rests), every order cancelled afterwards.*
 - **Not probed:** a futures or EFP order, where `refFuturesConId` would be set; a filled or
   partially filled order.
 
+
+### Order rejections outside the 200-399 band
+
+*Live 2026-11-23 23:12-23:23Z (Monday evening ET; US stocks closed, EUR.USD trading), paper TWS,
+server 223.*
+
+Each code below answered a new order's `placeOrder` with no OpenOrder and no OrderStatus. The
+notice carried the order id as its request id and reached both the `place_order` subscription
+(which ended on it) and `order_update_stream`. A `cancel_order` of the same id then drew 10147
+("not found"), so TWS created no order.
+
+| Code | Order | Message |
+| ---- | ----- | ------- |
+| 110 | AAPL BUY 1 LMT 1.001; EUR.USD BUY 20000 LMT 0.900001 | "The price does not conform to the minimum price variation for this contract." |
+| 103 | an id re-sent after a 110 for it; an id below the highest this client had used | "Duplicate order id: 1" |
+| 10244 | AAPL `cash_qty` 100 on LMT BUY, LMT SELL, STP BUY, MKT BUY and MKT SELL | "Cash Quantity cannot be used for this order" |
+| 10317 | EUR.USD MKT BUY `cash_qty` 0.229 | "The Cash Quantity size of 0.229 does not conform to minimum variation of 0.01 for this contract" |
+
+- Sequence for 110 (client 9602): 23:12:51.165 place sent; 23:12:51.335 notice 110 on both
+  streams; 23:12:51.336 `open_orders` empty; cancel then 10147 in the same millisecond.
+- 103 is not what reusing a finished order's id draws: an id whose order was cancelled drew 104
+  ("Cannot modify a filled order."), and a working order's id is a modify. 103 arrived only for
+  an id with no order behind it.
+- 110 answers a new order only. An off-tick price on a modify of a working order drew 201 instead;
+  see [refused modifies](#refused-modifies-leave-the-order-working).
+- 10244 also came during US hours, on AAPL, an AAPL option, ESZ6 and BTC limit orders.
+- **Not probed:** 10244 on other stocks; the same codes on IB Gateway or a live account.
+
+### Orders TWS discards (461 and 10311)
+
+*Live 2026-11-24 22:03-22:23 UTC (SEHK and TSE closed), paper TWS, server 223.*
+
+| Code | Order | Message |
+| ---- | ----- | ------- |
+| 461 | 700 SEHK BUY 150 LMT 320; 7203 SMART BUY 150 LMT 2000 (board lot 100) | "BUY 150 700 SEHK @ 320.00: Order size 150 is not correct; it should be a multiple of 100" |
+| 10311 | 7203 TSEJ BUY 100 LMT 2000 | "This order will be directly routed to TSEJ. Direct routed orders may result in higher trade fees. Restriction is specified in Precautionary Settings of Global Configuration/API." |
+
+- Each notice carried the order id and came on the `place_order` reply with no OpenOrder or
+  OrderStatus before it, 0.2 s (10311) to 2.4 s (461) after the order was sent.
+  `all_open_orders` afterwards listed neither order.
+- A `cancel_order` sent at once drew OrderStatus `Cancelled`, 202 "Order Canceled - reason:Order
+  was discarded." and 161 "Cancel attempted when order is not in a cancellable state", for both
+  codes. An order TWS never created draws 10147 instead: TWS assigned a perm id and discarded
+  the order, as it does with a 201.
+- The same 7203 order with `SMART` and 100 shares rested (Submitted) and was cancelled normally.
+  A size below the lot drew 388 and an off-tick price 110, both before the routing check.
+- 10311 names a TWS setting, so whether it fires depends on the TWS configuration.
+- **Not probed:** other exchanges for 10311; the other precautionary codes; TWS with the setting
+  off; 461 on a modify.
+
+### Refused modifies leave the order working
+
+*Live 2026-11-23 23:12-23:23Z, paper TWS, server 223. AAPL BUY 1 LMT 1.00 resting off-hours
+(Submitted), and EUR.USD SELL 20000 TRAIL (PreSubmitted, `why_held` "trigger").*
+
+Each modify below (`place_order` with the working order's id) was refused. `open_orders` right
+after listed the order with its earlier terms and status. No `Inactive` status and no other status
+change arrived for any of them.
+
+| Modify sent | Reply |
+| ----------- | ----- |
+| limit 1.00 -> 1.001 (off tick) | OpenOrder and OrderStatus Submitted (twice), then 201 "Order rejected - reason:Invalid Price" |
+| quantity 1 -> 10,000,000 | OpenOrder and OrderStatus Submitted (twice), then 201 "... YOUR EQUITY WITH LOAN VALUE ... MUST EXCEED THE INITIAL MARGIN ..." |
+| quantity 1 -> 0 | 321 "Error validating request.-'v' : cause - The size value cannot be zero:" |
+| quantity 1 -> 0.5 | 10242 "Fractional-sized order cannot be modified via API. ..." with request id **0**, not the order id |
+| action BUY -> SELL; contract AAPL -> MSFT | 105 "Order being modified does not match original order." |
+| `cash_qty` 100 added | 10241 "Order Quantity is expressed in monetary terms. Modification is not supported via API. ..." |
+| TRAIL `trail_stop_price` changed, trailing amount kept | 10067 "Stop price must be changed together with the trailing amount for a trailing order" |
+
+- A modify sent with the id of a cancelled order (AAPL BUY 1 LMT 1.00, cancelled 5 s earlier) drew
+  104 "Cannot modify a filled order." with no status; the order stayed Cancelled and
+  `open_orders` stayed empty.
+- The 201 and 321 codes are in the order-rejection band, yet here they reject the modification
+  only. The order goes on working with its previous terms.
+- For the TRAIL order, a modify of stop price and amount together, and of the amount alone, was
+  accepted. Sequence for 10067 (client 9605): 23:14:00.602 modify sent; 23:14:00.604 notice 10067;
+  23:14:00.606 `open_orders` showed the order PreSubmitted with stop 0.79045 and amount 0.3,
+  unchanged.
+- A downstream claim that a refused modify can make TWS report the working order as `Inactive`
+  did not reproduce in these seven variants.
+- **Not probed:** modifies during RTH, of a partly filled order, or of an order TWS holds
+  (`why_held` "locate"); IB Gateway; live accounts.
+
+### Cancel refusals
+
+*Live 2026-11-23 23:12-23:23Z, paper TWS, server 223.*
+
+Every refusal below carried the order id as its request id, reached the `cancel_order`
+subscription (which ended on it) and `order_update_stream`, and came with no status.
+
+| Order state at the cancel | Reply |
+| ------------------------- | ----- |
+| Filled (EUR.USD MKT) | 10148 "OrderId 1 that needs to be cancelled cannot be cancelled, state: Filled." |
+| Cancelled (a second cancel) | 10148 "... state: Cancelled." |
+| Never created (rejected with 110 or 10244, or an id never sent) | 10147 "OrderId 52 that needs to be cancelled is not found." |
+| Held (`transmit` false) | OrderStatus Cancelled, 202 "Order Canceled - reason:Order was discarded.", then 161 "Cancel attempted when order is not in a cancellable state.  Order permId =..." |
+
+- 161 does not mean the order is unaffected: in the held case the same cancel ended the order,
+  and 161 followed the Cancelled status and 202 in the same millisecond. Earlier entries record
+  161 for a global cancel of a PendingCancel order, where the order did not change; see
+  [`ext_operator`](#ext_operator-and-manual_order_indicator-on-orders-and-cancels).
+- A filled or cancelled order drew 10148, never 161, on the connection that had seen it. A
+  contributor reports 10147 instead on paper Gateway (server 226, 2026-11-15) for an order
+  cancelled or filled on an earlier connection and cancelled from a new one; not checked on TWS.
+- **Not probed:** a cancel of a partly filled order, or one sent while a fill is in flight; a
+  cancel from a new connection on TWS.
+
+### `Minutes` time in force on a crypto order
+
+*Live 2026-11-25 11:01 UTC, paper TWS, server 223; the account has no crypto trading permission.*
+
+- BTC.USD (`CRYPTO`, PAXOS) BUY 0.01 LMT 1000, `tif` `Minutes`: TWS took the time in force and
+  echoed `Minutes` on the open order, then sent Inactive and 201 for the missing permission. The
+  same order with `tif` DAY drew 201 "The crypto buy order must be Minutes or IOC." instead.
+- `completed_orders` lists the rejected order with `tif` `Minutes`.
+- **Not probed:** the 5-minute cancel of an unfilled `Minutes` order (needs crypto permission).
+
+### Non-US orders outside and during the trading session
+
+*Live 2026-11-24 22:03-22:17 UTC (SEHK, HKFE, TSE, OSE and KSE closed) and 2026-11-24
+23:46 to 2026-11-25 04:07 UTC (in session and at lunch), paper TWS, server 223;
+non-marketable limit orders, each cancelled after 5 to 10 s.*
+
+| Order                                                                | Reply                                                                                                              | Cancel                                                                                                                                    |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| 700 SEHK BUY 100 LMT 320                                             | 399 "Warning: Your order will not be placed at the exchange until 2026-11-25 09:30:00 Hongkong", then PreSubmitted | Cancelled, 202                                                                                                                            |
+| HSI future HKFE BUY 1 LMT 20000; HSI option `HSI25600L6` BUY 1 LMT 1 | the same 399 with `09:15:00 Hongkong`, PreSubmitted, then Submitted within 1.3 s                                   | Cancelled, 202                                                                                                                            |
+| HSI futures option `PHS25600L6` BUY 1 LMT 1                          | 399 with `09:15:00`, PreSubmitted twice                                                                            | Cancelled, 202                                                                                                                            |
+| N225M future OSE.JPN BUY 1 LMT 40000                                 | PreSubmitted, no 399                                                                                               | Cancelled, 202                                                                                                                            |
+| 7203 SMART BUY 100 LMT 2000                                          | Submitted, no 399                                                                                                  | Cancelled, 202                                                                                                                            |
+| K200 future KSE BUY 1 LMT 300                                        | nothing in 5 s                                                                                                     | nothing in 5 s; `PendingCancel` in `all_open_orders` 21 s after placing; at 22:17 a second cancel drew 10147 and no open order was listed |
+
+- The 399 carries a `Warning:` line and the order goes on, so it is a warning, not a rejection.
+  The time is the exchange's next open in its own zone, as text.
+- HKFE orders reached `Submitted` while the exchange was closed: `Submitted` does not mean the
+  order is at the exchange.
+- The KSE order neither acknowledged nor cancelled promptly, like the
+  [weekend ES cancel](#weekend-cancel-of-a-presubmitted-es-order-wedges-in-pendingcancel), and
+  cleared without a terminal status reaching the probe.
+- The same orders while the venue traded or was at lunch (2026-11-25, each cancelled after 10 s):
+
+  | Order                                                   | Session                                           | Lunch break                                          |
+  | ------------------------------------------------------- | ------------------------------------------------- | ---------------------------------------------------- |
+  | 700 SEHK BUY 100 LMT 320 (last 344)                     | 01:36 UTC: PreSubmitted, no 399                   | 04:05: PreSubmitted, no 399                          |
+  | HSI option `HSI25600L6` BUY 1 LMT 1                     | 01:36: Submitted                                  | 04:05: Submitted                                     |
+  | HSI future BUY 1 LMT 20000                              | not run (connection timed out)                    | 04:07: Submitted                                     |
+  | 7203 SMART BUY 100 LMT 2000                             | 00:01: PreSubmitted                               | 02:35: PreSubmitted; 03:35 after lunch: PreSubmitted |
+  | K200 future BUY 1 LMT 700; N225M future BUY 1 LMT 50000 | 23:46 (day session): Submitted, cancelled at once |                                                      |
+
+- No 399 came during a session or a lunch break. The SEHK and TSE stock orders stayed
+  PreSubmitted with an empty `why_held` while their venue traded, and 7203 had been Submitted at
+  22:03 when TSE was closed, so neither status tells whether the order is at the exchange.
+- Distance from the market decides the SEHK status (06:25, bid 339, ask 339.2): BUY 100 LMT 336
+  and LMT 330 went PreSubmitted, then Submitted 0.2 s later; LMT 320 stayed PreSubmitted, and so
+  did 7203 LMT 2000 again. Inferred: IB holds a limit that far from the market without sending
+  it on, and says so in no field.
+- **Not probed:** fills; marketable orders; orders during the SEHK closing auction.
+
+### Auction orders on SEHK and TSE
+
+*Live 2026-11-24 22:04-22:06 UTC (both closed), paper TWS, server 223.*
+
+| Order                 | 700 SEHK                                                                                             | 7203 SMART (JPY)                                                                                 |
+| --------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| LMT, `tif` OPG (LOO)  | Inactive, 201 "The time-in-force OPG is invalid for this combination of exchange and security type." | not run (connection timed out)                                                                   |
+| MKT, `tif` OPG (MOO)  | not run (connection timed out)                                                                       | Submitted; cancelled                                                                             |
+| MOC                   | 387 "Unsupported order type for this exchange and security type."                                    | no frame in 5 s; `PendingSubmit` in `all_open_orders`; cancelled (PendingCancel, Cancelled, 202) |
+| LOC                   | 387                                                                                                  | as MOC                                                                                           |
+| MTL or LMT, `tif` AUC | Inactive, 201 "The time-in-force AUC is invalid ..."                                                 | Inactive, 201 (MTL)                                                                              |
+
+- The unsupported time in force drew an Inactive status before the 201; the unsupported order
+  type drew 387 with no status.
+- The 7203 MOC and LOC orders sat in `PendingSubmit` with no frame on their `place_order`
+  replies while two other connections in the same minute timed out at the handshake, so the
+  silence may be TWS load rather than the order type.
+- **Not probed:** SEHK's closing auction order types (`tif` AUC was refused; no other type
+  tried), TSE MOC and LOC during a session.
+
+### Crypto orders on PAXOS: time in force and cash quantity
+
+*Live 2026-11-25 11:01-11:03 UTC, paper TWS, server 223; BTC.USD (`CRYPTO`, PAXOS), BUY limits at
+1000 and SELL limits at 1000000, 0.01 BTC or 10 USD. The account has no crypto trading
+permission, so an order that passes every other check is rejected for that.*
+
+| Order                                                             | Reply                                                                                                |
+| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| BUY LMT, `tif` DAY or GTC                                         | Inactive, 201 "The crypto buy order must be Minutes or IOC."                                         |
+| BUY LMT, `tif` IOC or `Minutes`; SELL LMT, `tif` DAY or `Minutes` | Inactive, 201 for the missing permission                                                             |
+| BUY LMT or BUY MKT, `tif` FOK                                     | 10052 "Invalid time in force:FOK", no open order or status                                           |
+| SELL LMT, `tif` FOK                                               | Inactive, 201 "The time-in-force FOK is invalid for this combination of exchange and security type." |
+| BUY MKT `Minutes` with cash quantity; SELL MKT DAY                | Inactive, 201 "The crypto MKT order must be IOC."                                                    |
+| BUY MKT IOC with a quantity and no cash quantity                  | 10289 "You must set Cash Quantity for this order", no open order                                     |
+| BUY MKT IOC with cash quantity 10; SELL MKT IOC with a quantity   | Inactive, 201 for the missing permission                                                             |
+| BUY LMT `Minutes` or SELL MKT IOC with cash quantity 10           | 10244 "Cash Quantity cannot be used for this order", no open order                                   |
+
+- A crypto BUY order takes only IOC or `Minutes`, a market order only IOC, and FOK is refused on
+  every order. A market BUY needs a cash quantity, and every other order refuses one.
+- The client sends `Minutes` as the order's `tif` text, and TWS echoes it on the open order. IB
+  cancels an unfilled `Minutes` order after 5 minutes; this run could not observe that, as every
+  order was rejected.
+- The open order and the Inactive status came before the 201 in all 21 orders that drew both,
+  0.1 to 33 ms apart; the open order and status were then sent again. A downstream run reported
+  the 201 first in some orders, 0.1 to 0.7 s apart; this run did not reproduce it.
+- The 10052, 10289 and 10244 refusals came within 4 ms, with no open order: these orders are not
+  in completed orders either. Each order that drew a 201 is in `completed_orders` with its order
+  id and perm id, status `Cancelled`, and `completed_status` "Rejected by System:" followed by
+  the 201 text. A market order shows the price cap IB set (`lmt` 58796.25 on a SELL, 58798 on a 10 USD
+  BUY, whose quantity became 0.00017006).
+- Observed once, in a downstream run on 2026-11-25: an order with a refused time in force drew no
+  frame at all for 55 minutes and then appeared in completed orders as rejected. Not reproduced
+  here.
+- **Not probed:** fills and the 5-minute cancel of a `Minutes` order (needs crypto permission);
+  ZEROHASH; other crypto symbols; GTD and OPG.
+
+### OCA groups
+
+*Live 2026-11-25 19:12-19:14 UTC (US RTH), paper TWS, server 223; AAPL limits far below the
+market, EUR.USD market orders.*
+
+- Cancelling one member cancels the others: with two AAPL BUY limits in one group (`ocaType` 1),
+  a cancel of the first sent the second `PendingCancel`, then `Cancelled` with 202, on its own
+  stream; `all_open_orders` no longer listed it.
+- A member placed after another member filled is rejected: EUR.USD BUY 20,000 MKT in a group
+  filled at once; a second BUY 20,000 MKT in the same group went `Inactive`, then drew 201 "Order
+  rejected - reason:OCA group is already filled".
+- **Not probed:** `ocaType` 2 (reduce with block) and 3. Reported downstream the same day: type 2
+  reduces the remaining members by the filled quantity, with block.
+
+### Bracket child quantity follows the parent
+
+*Live 2026-11-25 19:12 UTC (US RTH), paper TWS, server 223.*
+
+- Parent AAPL BUY 1 LMT with `transmit=false`, then a child SELL 5,000,000 LMT with `parent_id` set
+  to the parent and `transmit=true`: TWS echoed the child with `totalQuantity` 1 and `remaining` 1,
+  `PreSubmitted` with `whyHeld` `child`, and no error. The child released the parent, which went
+  `Submitted`.
+- Cancelling the parent removed the child: `all_open_orders` listed neither afterwards.
+- So TWS cuts a child's quantity to the parent's without telling the caller. Compare the echo with
+  what was sent.
+
+### Modify and directed routing refusals
+
+*Live 2026-11-25 19:13 UTC (US RTH), paper TWS, server 223; AAPL BUY 1 LMT far below the market.*
+
+| Request                                                        | Reply                                                                               |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Modify a working SMART order with the exchange changed to ARCA | 105 "Order being modified does not match original order." The order kept working.   |
+| Modify the same order's price, exchange unchanged              | `PreSubmitted`, `Submitted`                                                         |
+| New order directed to LSE, which does not list AAPL            | 200 "No security definition has been found for the request"                         |
+| New order directed to IEX                                      | `PreSubmitted`, `Submitted`, no 10311                                               |
+| Cancel of the order rejected with 200                          | 10147 "OrderId 6 that needs to be cancelled is not found."                          |
+| Second cancel of an order cancelled 3 s before                 | 10148 "OrderId 5 that needs to be cancelled cannot be cancelled, state: Cancelled." |
+
+- 10311 ("This order will be directly routed to ...") did not appear because the TWS API
+  precautionary setting allowed direct routes. With the setting off, a downstream adapter saw
+  10311 for directed orders.
+- Reported downstream the same day: 10147 for cancels of orders it had cancelled earlier. Not
+  reproduced here: a second cancel within the session drew 10148.
+- **Not probed:** a modify that changes the exchange of a held order.
+
+### Option orders acknowledged late
+
+*Live 2026-11-25 19:14 UTC (US RTH), paper TWS, server 223; AAPL 2026-12-18 245 call (deep in the
+money) BUY 1 LMT 0.05.*
+
+- The order's own stream received nothing from TWS for 13.1 s, then an `OpenOrder` past
+  `PendingSubmit` (`PreSubmitted` or `Submitted`; the log does not say which). Before that,
+  each `all_open_orders` request (at 5 s and 10 s) listed the order as `PendingSubmit`, and that
+  reply also reached the order's stream as an `OpenOrder` and an `OrderStatus` `PendingSubmit`.
+- A second order cancelled 3.5 s after placing went `PendingCancel` 1.7 s after the cancel, then
+  `Cancelled`.
+- A downstream adapter reported delays from 1.5 s to 60 s on the same paper TWS. Treat an option
+  order without an acknowledgement as pending, not lost.
+- **Not probed:** option orders on IB Gateway or a live account; other option roots.
+
+### Cash quantity
+
+*Live 2026-11-23 23:18-23:20Z, paper TWS, server 223; EUR.USD on IDEALPRO and AAPL on SMART.*
+
+- **EUR.USD**: `cash_qty` 1000 with quantity 0 was accepted on MKT BUY, MKT SELL, LMT BUY (0.9)
+  and LMT SELL (1.5). TWS echoed a quantity of 1100.39 and sent 399 "Order Message: SELL 1,000 USD
+  EUR.USD Forex Warning: ... below the EUR 20000 IdealPro minimum ..." for the BUY, which states
+  the order as its USD leg. The market orders filled 916.88 and 917.09 EUR.
+- **Filled with remaining above 0**: those fills reported OrderStatus `Filled` with `filled`
+  916.88 and `remaining` 183.51, measured against the echoed estimate.
+- **AAPL**: every `cash_qty` order drew 10244 and was not created: no OpenOrder or OrderStatus,
+  and a `cancel_order` for the id drew 10147 "not found". A downstream rule that cash quantity
+  works on MKT BUY orders only matches neither instrument: EUR.USD took every type and side,
+  AAPL none.
+- Cash quantity on EUR.USD must be a multiple of 0.01 (10317), and a quantity of 0.21 EUR without
+  `cash_qty` drew 10318 "This order doesn't support fractional quantity trading".
+- **US hours, by security type** (*live 2026-11-24 16:28-16:31 UTC, US market open, paper TWS,
+  server 223*): AAPL stock (LMT BUY at 1.00 and MKT BUY), an AAPL option (LMT BUY), ESZ6 (LMT
+  BUY) and BTC on PAXOS (LMT BUY) each drew 10244 within 0.2 s. BTC MKT BUY with `cash_qty` 100
+  passed that check: TWS echoed a quantity of 0.001678 BTC and then rejected it with 201 "The
+  crypto buy order must be Minutes or IOC"; with `tif` IOC, it echoed 0.00167857 BTC and a limit
+  of 59579.75, then 201 for the account's missing crypto trading permission. BTC MKT SELL and
+  LMT BUY with IOC drew 10244. So for crypto, cash quantity depends on the order type and side.
+- **Filled cash-quantity order, US hours** (*EUR.USD MKT BUY, `cash_qty` 1000*): 399 (the USD
+  leg warning, twice), OpenOrder `PreSubmitted` with quantity 1093.82; OrderStatus
+  `PreSubmitted` with `filled` 911.41 and `remaining` 182.41 before any execution; the
+  ExecutionData (911.41 EUR at 1.0972); `Submitted`; `PendingCancel`; `Filled` with `filled`
+  911.41 and `remaining` 182.41; OpenOrder with the 2 USD commission; the report. TWS cancels the
+  rest of the estimate, and `Filled` keeps the cancelled remainder in `remaining`. The 911.41
+  EUR could not be sold by quantity (10318); a SELL with `cash_qty` 1000 sold 911.57 and a BUY
+  with `cash_qty` 0.18 bought 0.16 (`remaining` 0.04 after `Filled`).
+- **Not probed:** an account with fractional-share or crypto trading permission, other currency
+  pairs, and other order types on EUR.USD.
+
+### `why_held` values
+
+*Live 2026-11-23 23:13-23:21Z, paper TWS, server 223.*
+
+- A simulated EUR.USD TRAIL or TRAIL LIMIT order reported PreSubmitted with `why_held` "trigger"
+  until cancelled. The cancel's Cancelled status carried `why_held` "".
+- Short sales of 1 share (LMT 9999, outside RTH, no position) of BYND, GME, CVNA, SPCE, UPST and
+  LCID went PreSubmitted or Submitted with `why_held` "" and no `Inactive` status. The paper
+  account did not produce a "locate" hold off-hours.
+- **Not probed:** short sales during RTH, a stock the account cannot borrow, and live accounts.
+
+### Orders during an internet outage
+
+*Live 2026-11-25 and 2026-11-26, paper TWS, server 223; AAPL BUY 1 LMT 1.00 resting PreSubmitted;
+Wi-Fi off 15 s, 2 min and 20 min, router uplink unplugged 2 min; orders placed 5 s after the cut,
+before TWS reported the loss, and 1.0 s after the 1100; #1300.*
+
+- A resting order stayed PreSubmitted. At the 6-minute restore TWS re-sent `openOrder` and
+  `orderStatus` for every open order 2 s before the 1102, unrequested.
+- An order placed during the outage got ApiPending; with the 1100 TWS sent 1104 "Pending to
+  create 1 orders: <id>". TWS never created it: no status, no error, absent from
+  `reqOpenOrders`, and a later cancel drew 10147 "not found". 4 of 4 runs, the 20-minute one
+  included (absent from all 25 open-order replies).
+- An order placed 1.0 s after the 1100 was named in the next 1104, then rejected with 200 on its
+  order id 1.0 s (20-minute run) and 21.0 s (uplink run) after it was placed; a later cancel drew
+  10147:
+
+  ```text
+  12:01:13.627 code=1104 "Pending to create 2 orders: 55, 57"
+  12:01:14.621 code=200 req=Some(57) category=OrderRejection "No security definition has been found for the request"
+  12:27:13.169 code=10147 req=Some(57) "OrderId 57 that needs to be cancelled is not found."
+  ```
+
+- A cancel sent 5 s later returned ApiCancelled within 1 ms.
+- Resting orders survived two TWS restarts; see
+  [TWS restart and reconnect](protocol.md#tws-restart-and-reconnect).
+- **Not probed:** a fill during the outage; IB Gateway.

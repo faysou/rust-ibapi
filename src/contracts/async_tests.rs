@@ -1,4 +1,5 @@
 use super::*;
+use crate::builder::ValidationError;
 use crate::common::request_helpers::OneShot;
 use crate::common::test_utils::helpers::{
     assert_request, assert_tws_error_message, proto_error_response, proto_response, request_message_count, text_response, TEST_REQ_ID_FIRST,
@@ -722,6 +723,46 @@ async fn contract_details_cancels_after_tws_error() {
     assert_request(&message_bus, 1, &cancel_contract_data_request().request_id(TEST_REQ_ID_FIRST));
 }
 
+/// TWS has left contract-details requests unanswered with no error: the
+/// client's one_shot_timeout ends the wait and cancels the request at TWS.
+#[tokio::test(start_paused = true)]
+async fn contract_details_times_out_at_the_one_shot_timeout() {
+    let cancel_version = server_versions::CANCEL_CONTRACT_DATA;
+    for (version, count) in [(cancel_version - 1, 1), (cancel_version, 2)] {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![]).keeping_channels_open());
+        let client = Client::stubbed(message_bus.clone(), version).with_one_shot_timeout(std::time::Duration::from_millis(50));
+
+        let error = client.contract_details(&Contract::stock("AAPL").build()).await.unwrap_err();
+
+        assert!(matches!(error, Error::Timeout), "server {version}: got {error:?}");
+        tokio::task::yield_now().await;
+        wait_for_requests(&message_bus, count).await;
+        assert_eq!(request_message_count(&message_bus), count, "server {version}");
+        if version == cancel_version {
+            assert_request(&message_bus, 1, &cancel_contract_data_request().request_id(TEST_REQ_ID_FIRST));
+        }
+    }
+}
+
+#[tokio::test]
+async fn contract_details_within_the_one_shot_timeout_returns_every_row() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+        detail_row(1),
+        detail_row(2),
+        proto_response(
+            IncomingMessages::ContractDataEnd,
+            contract_data_end().request_id(TEST_REQ_ID_FIRST).encode_proto(),
+        ),
+    ]));
+    let client = Client::stubbed(message_bus.clone(), server_versions::CANCEL_CONTRACT_DATA).with_one_shot_timeout(std::time::Duration::from_secs(5));
+
+    let details = client.contract_details(&Contract::stock("AAPL").build()).await.unwrap();
+
+    let ids: Vec<i32> = details.iter().map(|d| d.contract.contract_id).collect();
+    assert_eq!(ids, vec![1, 2]);
+    assert_eq!(request_message_count(&message_bus), 1, "no cancel after ContractDataEnd");
+}
+
 // ---- buffer_limit ----------------------------------------------------------
 
 #[tokio::test]
@@ -790,4 +831,32 @@ async fn option_chain_buffer_limit_reaches_the_bus() {
         "only the bounded request carries a limit"
     );
     assert_eq!(request_message_count(&message_bus), 2, "the rejected request sends nothing");
+}
+
+/// Requests TWS answers with 321 fail before anything is sent.
+#[tokio::test]
+async fn known_invalid_requests_are_rejected_before_sending() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+    let bag = Contract {
+        security_type: SecurityType::Spread,
+        ..Contract::stock("AAPL").build()
+    };
+
+    let details = client.contract_details(&bag).await;
+    let stream = client.contract_details_stream(&bag).subscribe().await;
+    let chain = client.option_chain("AAPL", SecurityType::Stock, 0).subscribe().await;
+
+    assert!(matches!(details, Err(Error::InvalidArgument(_))), "contract_details: {details:?}");
+    assert!(
+        matches!(stream, Err(Error::InvalidArgument(_))),
+        "contract_details_stream: {:?}",
+        stream.err()
+    );
+    assert!(
+        matches!(chain, Err(Error::Validation(ValidationError::InvalidField { field: "contract_id", .. }))),
+        "option_chain: {:?}",
+        chain.err()
+    );
+    assert_eq!(request_message_count(&message_bus), 0);
 }

@@ -85,7 +85,22 @@ sequenceDiagram
 
 1. **Requests with IDs**: MessageBus creates dedicated channels for responses
 2. **Requests without IDs**: MessageBus uses shared channels for responses
-3. **Order-based requests**: Special handling for order tracking
+3. **Order-based requests**: Routed by order id, with copies to the order update stream.
+   Every subscription opened on an order id (`place_order`, a modify, `cancel_order`) receives
+   each of that order's frames once and yields the types its decoder declares, so a cancel or
+   modify takes nothing from the subscription that placed the order. A TWS error on the order id ends the subscription for the
+   most recently written request. During a write, the transport holds the direct subscription's
+   frames for that order until it knows the result. If the queue fills, it reports a buffer
+   limit error on the affected subscriptions. Earlier subscriptions read subsequent TWS errors
+   as notices and keep receiving order updates. A modify sent with `submit_order` opens no subscription,
+   so a refusal still ends a sole `place_order` subscription.
+   - A live execution carries request id -1. It reaches its order's subscriptions and the
+     order update stream. Those streams also receive distinct commission reports for this
+     client's known live executions.
+   - An execution row in an `executions` reply carries its request's id. Until the reply
+     ends, its subscription receives distinct commission reports for the executions it
+     lists. Overlapping replies can share a report because commission frames carry only
+     the execution id.
 
 ## Module Structure
 
@@ -198,6 +213,7 @@ The `Client` can be shared between threads for concurrent operations:
 - While the session is down, sends are refused with `Error::ConnectionReset`, and `is_connected()` reports false until the replayed handshake completes (it is a snapshot: a call made right after the check can still be refused). The refusal covers the whole reconnect, handshake included: a send that overlaps it either completes on the old socket before the reconnect starts or is refused, so nothing is written to the new socket before it is live. A write still pending on the lost connection (a TCP write has no timeout, so one to a peer that stopped reading can block indefinitely) is failed with `Error::ConnectionReset` first, so it cannot stall the reconnect. One-shot requests (`server_time`, `managed_accounts`, `historical_data`, ...) wait for the reconnect, up to their deadline, and retry: `Error::Timeout` if the deadline passes first, `Error::ConnectionFailed` if the reconnect gives up, `Error::Shutdown` on shutdown
 - The market data type set with `switch_market_data_type` is not kept by TWS across reconnects, so the reconnect re-sends the last one after the handshake, before the session is reported live
 - The handshake's order-id floor and server version are applied to the client before the session is reported live (`HandshakeState::refresh`): order ids never resume below the new floor, and requests sent after the reconnect are checked and decoded against the new version
+- Another client's `OpenOrder` frame (an `all_open_orders` reply) raises the order-id floor past its order id (`HandshakeState::raise_past_listed_order`): TWS raises this client's next valid order id above every order id it lists, and refuses lower ones, without sending the new id
 - Once the reconnected session is live, a `TRANSPORT_RECONNECT_CODE` notice is published to the notice stream: TWS never frames the reconnect itself and does not replay 1101/1102 on the new connection, so the notice stream is otherwise blind to the socket generation change. Resubscribing from its handler lands on the new session
 - On shutdown (`disconnect()` or dropping the client), every live subscription yields `Err(Error::Shutdown)`, then ends; the notice stream just ends
 

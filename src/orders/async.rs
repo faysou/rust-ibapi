@@ -1,16 +1,18 @@
 //! Asynchronous implementation of order management functionality
 
-use crate::common::request_helpers::{self, expect_proto};
+use crate::common::request_helpers::{self, expect_proto, ONE_SHOT_TIMEOUT};
 use crate::messages::OutgoingMessages;
 use crate::orders::OrderId;
-use crate::subscriptions::{Subscription, SubscriptionItem};
+use crate::subscriptions::{Subscription, SubscriptionItem, SubscriptionItemStreamExt};
 use crate::{Client, Error};
 use futures::{FutureExt, StreamExt};
 
 use std::time::{Duration, Instant};
 
-use super::common::fill::{completed_status, lists_order, lookup_wait, FillTracker};
-use super::common::{decoders, encoders, verify};
+use super::common::fill::{lookup_wait, FillTracker};
+use super::common::lookup::{recheck_delay, OrderKey};
+use super::common::what_if::{reply_deadline, WhatIfReply};
+use super::common::{decoders, encoders, linked, verify};
 use super::*;
 
 impl Client {
@@ -48,10 +50,19 @@ impl Client {
     /// `filter_data()` drops them (logging at `warn!` level), so match on
     /// notices explicitly when monitoring fire-and-forget orders for rejection.
     ///
-    /// To pair a [`CommissionAndFeesReport`] with the
-    /// [`ExecutionData`] it belongs to, join on
-    /// `execution_id` — the commission follows its execution and shares that key. See
-    /// the [`CommissionAndFeesReport`] docs for the idiom.
+    /// To pair each [`CommissionAndFeesReport`] with the
+    /// [`ExecutionData`] it belongs to, feed both to a
+    /// [`FillMatcher`]: they share `execution_id`, and the
+    /// matcher joins them in either arrival order.
+    ///
+    /// The stream carries live executions and commission reports for this client's
+    /// known live execution ids. A changed commission can arrive during an
+    /// [`executions`](Self::executions) reply. TWS provides the execution id but no
+    /// request id on a commission report, so its source is ambiguous when replies overlap.
+    ///
+    /// The client drops reports without a known execution id and logs the first
+    /// unmatched report per connection. Use [`executions`](Self::executions) to
+    /// reconcile missing commissions after a warning or a reconnect.
     ///
     /// # Gaps and recovery
     ///
@@ -60,10 +71,16 @@ impl Client {
     ///
     /// - **Reconnect.** The stream survives the client's automatic reconnects:
     ///   the same subscription keeps delivering once the connection returns,
-    ///   but updates TWS emitted during the outage are lost and no marker
-    ///   appears in the stream. Watch [`Self::notice_stream`] for the
+    ///   but updates TWS emitted during the outage are lost. Once the new
+    ///   session is live, the stream yields one
+    ///   [`SubscriptionItem::Notice`]
+    ///   with code [`TRANSPORT_RECONNECT_CODE`](crate::TRANSPORT_RECONNECT_CODE)
+    ///   to mark the gap. Its `is_error()` is false
+    ///   ([`NoticeCategory::ClientSynthesized`](crate::NoticeCategory::ClientSynthesized)). Watch [`Self::notice_stream`] for the
     ///   connectivity notices (codes 1100 connectivity lost, 1101 restored
     ///   with data lost, 1102 restored with data maintained, 1300 socket reset).
+    ///   A data-only reader does not see the reconnect notice: `filter_data()`
+    ///   drop notices, this one included.
     /// - **Error.** An `Err` item ends the stream; every later call returns
     ///   `None`. A frame that fails to decode is a bug in TWS or this crate,
     ///   so it is surfaced rather than skipped.
@@ -78,7 +95,10 @@ impl Client {
     /// After a reconnect, the existing subscription is still live. In both
     /// cases, rebuild state from snapshots:
     ///
-    /// 1. [`Self::all_open_orders`]: every open order and its status.
+    /// 1. [`Self::open_orders`]: this client's open orders and their statuses.
+    ///    Not [`Self::all_open_orders`]: it also lists other clients' orders,
+    ///    and TWS then raises this client's next valid order id past the
+    ///    highest order id listed, which `open_orders` does not.
     /// 2. [`Self::completed_orders`]`(ApiOnly::No)`: orders that filled or were
     ///    cancelled during the gap.
     /// 3. [`Self::executions`] with a default [`ExecutionFilter`]: fills and
@@ -86,12 +106,13 @@ impl Client {
     ///    `last_n_days` when the gap may span midnight, as the daily gateway
     ///    reset does.
     ///
-    /// The snapshots cover every client's orders, while this stream reports
-    /// only this client's. Keep the entries whose `order.client_id` /
+    /// `completed_orders` and `executions` cover every client's orders, while
+    /// this stream reports only this client's. Keep the entries whose `order.client_id` /
     /// `execution.client_id` matches, or state will hold orders the stream
     /// never updates.
     ///
-    /// Take the snapshots after the stream is live again, so no event falls
+    /// Take the snapshots once the stream is live again (on the reconnect
+    /// notice, or once the new subscription exists), so no event falls
     /// between the two. An event can then arrive both ways; apply updates
     /// idempotently, keyed by `perm_id` for orders and `execution_id` for fills.
     ///
@@ -99,6 +120,7 @@ impl Client {
     ///
     /// ```no_run
     /// use ibapi::prelude::*;
+    /// use ibapi::TRANSPORT_RECONNECT_CODE;
     ///
     /// #[tokio::main]
     /// async fn main() {
@@ -108,6 +130,9 @@ impl Client {
     ///         match item {
     ///             Ok(SubscriptionItem::Data(OrderUpdate::OrderStatus(s))) => println!("status: {s:?}"),
     ///             Ok(SubscriptionItem::Data(update)) => println!("update: {update:?}"),
+    ///             Ok(SubscriptionItem::Notice(notice)) if notice.code == TRANSPORT_RECONNECT_CODE => {
+    ///                 println!("reconnected: rebuild order state from snapshots");
+    ///             }
     ///             Ok(SubscriptionItem::Notice(notice)) if notice.is_error() => {
     ///                 eprintln!("order {:?} rejected: {}", notice.request_id, notice.message);
     ///             }
@@ -241,10 +266,133 @@ impl Client {
         Ok(order_ids)
     }
 
+    /// Submits orders that TWS must release together, such as a parent with its children:
+    /// only the last order transmits.
+    ///
+    /// Each order is sent under its own [`order_id`](crate::orders::Order::order_id), which the
+    /// caller sets, e.g. from [`next_order_id`](Self::next_order_id); a child names its parent
+    /// in [`parent_id`](crate::orders::Order::parent_id). The `transmit` flag of each order is
+    /// overwritten: `false` on all but the last, `true` on the last. TWS holds the earlier
+    /// orders until the last one arrives, then releases them all.
+    ///
+    /// Every order is checked before anything is sent. If a send fails, the submission
+    /// attempts to cancel the orders whose sends completed. See [`LinkedOrdersError`] for
+    /// the information it returns.
+    ///
+    /// # Cancellation
+    /// Dropping the future, including on timeout, can interrupt a place or cancel request
+    /// after its frame is written. Some orders may remain held at TWS, or the last order
+    /// may have transmitted the group. A dropped future gives no cleanup result.
+    ///
+    /// Keep all assigned order IDs before calling this method. Use order updates and open
+    /// and completed order listings to check for transmitted orders. Held orders are absent
+    /// from the listings, even after reconnecting. To discard them, use
+    /// [`cancel_order`](Self::cancel_order) for each unresolved ID with the original client ID
+    /// and check the responses. A retry can modify existing orders or duplicate them, so
+    /// reconcile the original submission before retrying.
+    ///
+    /// # Errors
+    /// [`LinkedOrdersError`], whose [`error`](LinkedOrdersError::error) is:
+    /// - with nothing sent: [`Error::OrderIdInRequestRange`] or [`Error::Validation`] for an
+    ///   order [`submit_order`](Self::submit_order) would reject, [`Error::Validation`] for an
+    ///   order id of 0 or one used twice, and [`Error::InvalidArgument`] for an empty list;
+    /// - the send error, such as [`Error::ConnectionReset`], with the order IDs of completed
+    ///   sends and the result of each attempt to send a cancel request.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::contracts::Contract;
+    /// use ibapi::orders::order_builder::{limit_order, stop};
+    /// use ibapi::orders::Action;
+    /// use ibapi::Client;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
+    ///     let contract = Contract::stock("AAPL").build();
+    ///
+    ///     let mut parent = limit_order(Action::Buy, 100.0, 220.0);
+    ///     parent.order_id = client.next_order_id();
+    ///     let mut take_profit = limit_order(Action::Sell, 100.0, 230.0);
+    ///     take_profit.order_id = client.next_order_id();
+    ///     take_profit.parent_id = parent.order_id;
+    ///     let mut stop_loss = stop(Action::Sell, 100.0, 210.0);
+    ///     stop_loss.order_id = client.next_order_id();
+    ///     stop_loss.parent_id = parent.order_id;
+    ///     let ids = [parent.order_id, take_profit.order_id, stop_loss.order_id];
+    ///     let orders = vec![(contract.clone(), parent), (contract.clone(), take_profit), (contract, stop_loss)];
+    ///
+    ///     match client.submit_linked_orders(orders).await {
+    ///         Ok(()) => println!("sent bracket orders {ids:?}"),
+    ///         Err(e) => eprintln!("reconcile bracket orders {ids:?}: {e}"),
+    ///     }
+    /// }
+    /// ```
+    pub async fn submit_linked_orders(&self, orders: Vec<(Contract, Order)>) -> Result<(), LinkedOrdersError> {
+        let requests = linked::encode_linked_orders(self.id_manager(), self.server_version(), orders).map_err(LinkedOrdersError::unsent)?;
+
+        let mut sent = Vec::with_capacity(requests.len());
+        for (order_id, request) in requests {
+            if let Err(error) = self.send_message(request).await {
+                let mut failure = LinkedOrdersError::after_sends(error, sent);
+                for order_id in failure.sent.clone().into_iter().rev() {
+                    failure.record_cancel(order_id, self.cancel_order(order_id).await);
+                }
+                return Err(failure);
+            }
+            sent.push(order_id);
+        }
+
+        Ok(())
+    }
+
     /// Places or modifies an [`crate::orders::Order`].
     ///
     /// Submits an [`crate::orders::Order`] using [Client] for the given [Contract].
     /// Upon successful submission, the client will start receiving events related to the order's activity via the subscription, including order status updates and execution reports.
+    ///
+    /// The subscription keeps receiving the order's events after
+    /// [`cancel_order`](Self::cancel_order) or a modify (another `place_order`
+    /// with the same ID): each opens its own subscription beside this one, and
+    /// every subscription on the order ID receives each event once. After a
+    /// cancel, this subscription yields the `Cancelled` status and the 202
+    /// notice too, as well as fills and commission reports that arrive after
+    /// the cancel was sent.
+    ///
+    /// To modify a working order, call `place_order` again with its order ID, its contract and
+    /// the full order with the changed fields: clone the order you placed, or take
+    /// [`order`](crate::orders::OrderData::order) and [`contract`](crate::orders::OrderData::contract)
+    /// from [`open_orders`](Self::open_orders). TWS keeps the order's perm ID and answers an
+    /// accepted modify with the order's open order and status. Only the client that placed the
+    /// order can modify it: TWS reads the same ID from another client as a new order. TWS
+    /// (live: 2026-11-24, server 223; `docs/wire-facts/orders.md#modifying-an-order`):
+    ///
+    /// - accepts a new limit price, quantity or time in force;
+    /// - refuses another action or contract with 105, and another order type with 329;
+    /// - refuses a zero quantity with 321, so send every field, not only the changed ones;
+    /// - reads the quantity as the order's total, filled shares included: on a partly filled
+    ///   order it refuses the filled quantity with 434, and a smaller one with 355 sent under
+    ///   order ID 0, which reaches no subscription on the order, only
+    ///   [`order_update_stream`](Self::order_update_stream);
+    /// - refuses the ID of a filled, cancelled or rejected order with 104, and of an order it
+    ///   has not acknowledged yet with 103. A modify that a fill overtakes draws 201 ("Order is
+    ///   already filled") after the `Filled` status; until then the order echoes the new terms
+    ///   with status `PendingSubmit` while it fills on the old ones;
+    /// - sends nothing for a modify of a held order (`transmit` false); the modify that sets
+    ///   `transmit` releases it with the new terms.
+    ///
+    /// A refused modify leaves the order working. TWS sends its error on the order ID, which
+    /// does not say which request it answers. An error ends the subscription for the most
+    /// recently written request. An error that arrives during a socket write follows the
+    /// newer request if the write succeeds, or the earlier request if the write fails
+    /// before sending the frame. If the write's outcome is uncertain and the connection
+    /// resets, queued order errors are delivered as notices before the connection error.
+    /// Earlier subscriptions receive order errors as notices and keep receiving events
+    /// after the newer subscription is dropped. A modify sent with [`submit_order`](Self::submit_order) opens no subscription:
+    /// if this is the order's only subscription, a refusal of that modify ends it with the
+    /// error while the order goes on working. Send modifies with `place_order` to keep this
+    /// subscription open.
     ///
     /// # Arguments
     /// * `order_id` - ID for [`crate::orders::Order`]. Get next valid ID using [Client::next_order_id].
@@ -300,12 +448,106 @@ impl Client {
         ))
     }
 
+    /// Analyzes `order` for margin and commission (what-if): TWS evaluates it without placing it.
+    ///
+    /// For an order built elsewhere; [`OrderBuilder::analyze`]
+    /// calls this with the client's [`next_order_id`](Client::next_order_id). Sends a copy of
+    /// `order` with [`what_if`](crate::orders::Order::what_if) set and
+    /// [`order_id`](crate::orders::Order::order_id) set to `order_id`, the id it is sent under,
+    /// so `order` itself is not changed and needs neither.
+    ///
+    /// TWS treats `order_id` as used once the what-if is sent: a later order or what-if under the
+    /// same id, or under a lower one, draws 103 "Duplicate order id" (live: 2026-11-24, server
+    /// 223; `docs/wire-facts/orders.md#what-if-order-ids`). Pass an id from the same sequence as
+    /// the ids passed to [`place_order`](Client::place_order).
+    ///
+    /// Returns the order state that carries the margins and commission. TWS answers some orders
+    /// (live: US stock limit orders) with a warning-only frame first; the returned state keeps
+    /// that frame's [`warning_text`](crate::orders::OrderState::warning_text) (live: 2026-11-24,
+    /// server 223; `docs/wire-facts/orders.md#what-if-answer-frames`).
+    ///
+    /// The answer's frames also reach [`order_update_stream`](Client::order_update_stream), as
+    /// every order frame does, with `order.what_if` set; a stream consumer that analyzes through
+    /// this call can skip them.
+    ///
+    /// # Errors
+    /// - [`Error::OrderIdInRequestRange`] if `order_id`, or a `parent_id` or preset attached-order id on `order`, is at or above 1,500,000,000 (reserved for request ids).
+    /// - [`Error::Validation`], with nothing sent, for an [`ext_operator`](crate::orders::Order::ext_operator) TWS would reject.
+    /// - The error TWS returns if it rejects the what-if order, including the 201 for an order the account's margin cannot carry.
+    /// - [`Error::UnexpectedEndOfStream`] if the reply ends without the order's state.
+    /// - [`Error::Timeout`] if the order's state has not come within the client's
+    ///   [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout), which defaults to
+    ///   30 seconds. A configured duration outside the clock's range waits without a
+    ///   deadline. TWS sends no end marker for a what-if order, so a warning-only frame
+    ///   or a missing rejection can leave the client waiting for the rest of the reply.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::contracts::Contract;
+    /// use ibapi::orders::{order_builder, Action};
+    /// use ibapi::Client;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
+    ///     let contract = Contract::stock("AAPL").build();
+    ///     let order = order_builder::limit_order(Action::Buy, 100.0, 150.0);
+    ///
+    ///     let state = client.analyze_order(client.next_order_id(), &contract, &order).await.expect("analyze failed");
+    ///     println!(
+    ///         "initial margin {:?} -> {:?}, commission {:?} {}",
+    ///         state.initial_margin_before, state.initial_margin_after, state.commission_and_fees, state.commission_and_fees_currency
+    ///     );
+    /// }
+    /// ```
+    pub async fn analyze_order(&self, order_id: impl Into<OrderId>, contract: &Contract, order: &Order) -> Result<OrderState, Error> {
+        let order_id: OrderId = order_id.into();
+        let order = Order {
+            order_id: order_id.value(),
+            what_if: true,
+            ..order.clone()
+        };
+
+        let subscription = self.place_order(order_id, contract, &order).await?;
+
+        // `?` propagates a rejected what-if order (#735), including the 201 that follows the
+        // margins of an order the account cannot carry.
+        let start = tokio::time::Instant::now();
+        let deadline = reply_deadline(start.into_std(), self.one_shot_timeout());
+        let read = async {
+            let mut reply = WhatIfReply::default();
+            let mut data = subscription.filter_data();
+            while let Some(response) = data.next().await {
+                if let PlaceOrder::OpenOrder(order_data) = response? {
+                    if let Some(state) = reply.observe(order_data.order_state) {
+                        return Ok(state);
+                    }
+                }
+            }
+            Err(Error::UnexpectedEndOfStream)
+        };
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), read).await.unwrap_or(Err(Error::Timeout)),
+            None => read.await,
+        }
+    }
+
     /// Cancels an open [Order].
     ///
     /// The confirmation (TWS code 202) arrives as a non-terminal
     /// [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem);
     /// the subscription stays open until dropped, so break once cancellation
     /// is observed.
+    ///
+    /// The order's [`place_order`](Self::place_order) subscription, if one is
+    /// open, keeps receiving the order's events. Both subscriptions yield the
+    /// order's statuses, `Cancelled` included, and the 202 notice; fills and
+    /// commission reports reach only the `place_order` subscription, since
+    /// [`CancelOrder`] has no variant for them. A refused cancel (10147 for an
+    /// unknown order, 10148 for a finished one) ends only this subscription;
+    /// the `place_order` subscription receives the error as a notice, also when
+    /// this subscription is dropped before TWS answers.
     ///
     /// Sends an immediate cancel with default [`OrderCancel`] fields (no manual cancel
     /// time, operator ID or manual order indicator). To set any of them, use
@@ -490,6 +732,11 @@ impl Client {
     ///
     /// A completed order's `total_quantity` is the quantity left unfilled, not the size
     /// ordered: `0` for a filled order. The size ordered is `total_quantity + filled_quantity`.
+    /// [`OrderData::completed_order_status`](crate::orders::OrderData::completed_order_status)
+    /// gives the record's status with `filled` and `remaining` set this way.
+    /// The order's id is `order.order_id`. A record can carry `0` there (seen for
+    /// cancelled orders, `docs/wire-facts/orders.md#completed-order-ids-can-be-0`); match on
+    /// `order.perm_id` to find one order.
     ///
     /// # Arguments
     /// * `api_only` - [`ApiOnly::Yes`] for only orders placed through the API, [`ApiOnly::No`] for orders submitted from TWS as well.
@@ -550,6 +797,16 @@ impl Client {
 
     /// Requests all *current* open orders in associated accounts.
     ///
+    /// The reply lists other clients' orders too. TWS then raises this
+    /// client's next valid order id above the highest order id listed, and
+    /// refuses a lower one with error 103 ("Duplicate order id"), without
+    /// sending the new id. The client raises its own order-id counter past
+    /// each other client's order as the reply arrives, so
+    /// [`next_order_id`](Self::next_order_id) and the order builders allocate
+    /// above it. Read the reply to its end before placing orders: an order
+    /// placed while it is still arriving can get an id TWS refuses. Use
+    /// [`open_orders`](Self::open_orders) when this client's orders are enough.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -580,6 +837,15 @@ impl Client {
     ///
     /// # Arguments
     /// * `auto_bind` - [`AutoBind::Yes`] assigns newly created orders an API order ID and implicitly associates them with this client; with [`AutoBind::No`] future orders are not bound.
+    ///
+    /// TWS sends nothing in reply to the request itself and the stream has no
+    /// end marker: it runs until dropped. Besides orders bound from TWS, it
+    /// yields the `OpenOrder` and `OrderStatus` frames of this client's own
+    /// orders and of any [`open_orders`](Self::open_orders) or
+    /// [`all_open_orders`](Self::all_open_orders) reply on the same
+    /// connection, but not their `OpenOrderEnd`, so those requests don't end
+    /// it. Live (2026-11-25), an order another API client placed reached it
+    /// only through such a reply.
     ///
     /// # Examples
     ///
@@ -615,8 +881,14 @@ impl Client {
     ///
     /// Both [`ExecutionData`] and
     /// [`CommissionAndFeesReport`] are delivered on this
-    /// stream. Join a commission to its execution by `execution_id`
-    /// (see the [`CommissionAndFeesReport`] docs) — the commission follows its execution.
+    /// stream. To join each commission to its execution, read the reply with
+    /// `collect_to_end_within` and pass it to [`FillMatcher::pair_executions`].
+    ///
+    /// Each execution row reaches the subscription for its request. Commission reports
+    /// contain an execution id and no request id. Until this reply ends, it receives
+    /// reports for every execution it lists, including reports shared with an
+    /// overlapping reply or the live stream. Repeated copies of the current report
+    /// are suppressed. Use `execution_id` to apply a changed report to the same execution.
     ///
     /// # Examples
     ///
@@ -801,29 +1073,162 @@ impl Client {
         }
     }
 
-    /// Look up an order this client has no status for: `None` when this
-    /// client's open orders list it (their statuses reach the order's status
-    /// streams like any other) or neither reply does; otherwise its status
-    /// from completed orders. Each reply is read to its end marker.
+    /// Look up an order this client has no status for: its status from
+    /// completed orders, or `None` when this client's open orders list it
+    /// working (their statuses reach the order's status streams like any
+    /// other) or neither reply does.
     async fn find_finished(&self, order_id: OrderId, deadline: Option<Instant>) -> Result<Option<OrderStatus>, Error> {
-        async fn read(mut subscription: Subscription<Orders>, deadline: Option<Instant>) -> Result<Vec<Orders>, Error> {
-            match deadline {
-                Some(deadline) => subscription.collect_to_end_within(lookup_wait(deadline)).await,
+        let key = OrderKey::Id {
+            client_id: self.client_id(),
+            order_id,
+        };
+        match self.look_up_order(key, Duration::ZERO, || deadline.map(lookup_wait)).await {
+            Ok(OrderLookup::Finished { status, .. }) => Ok(Some(status)),
+            Ok(_) => Ok(None),
+            // A reply cut short (deadline, closed channel, TWS error) proves
+            // nothing: keep waiting.
+            Err(Error::Timeout | Error::UnexpectedEndOfStream | Error::Notice(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Looks up one of this client's orders by its API order id: still
+    /// working, finished, or not known to TWS.
+    ///
+    /// Reads this client's [`open_orders`](Self::open_orders): an order they
+    /// list with a status that is not [terminal](OrderStatusKind::is_terminal)
+    /// is [`OrderLookup::Working`]. Otherwise reads
+    /// [`completed_orders`](Self::completed_orders), which list every client's
+    /// orders: a record of this client with this nonzero id is
+    /// [`OrderLookup::Finished`]. Ids are unique only per client, so another
+    /// client's order with the same id never matches. TWS can list a
+    /// completed order with client id and order id `0`; find such an order
+    /// with [`find_order_by_perm_id`](Self::find_order_by_perm_id).
+    ///
+    /// A finished order leaves open orders before it reaches completed
+    /// orders. Live, an order rejected with error 201 was gone from open
+    /// orders within 50 ms of its `Inactive` status, and first listed among
+    /// completed orders 19 to 204 ms after it. When neither reply lists the
+    /// order, completed orders are read again every 100 ms, every second after
+    /// the first second, until `within` has passed since the call, then the
+    /// answer is [`OrderLookup::NotFound`]. Each completed-orders reply holds
+    /// every client's completed orders (230 records on the paper account
+    /// probed). Open-orders and completed-orders replies have no request ID. The
+    /// client skips earlier replies through their end markers so requests can overlap.
+    /// With `within` zero each reply is read once. Right after an order's
+    /// last status, pass at least a few hundred milliseconds.
+    ///
+    /// Each reply is read to its end marker, within 30 seconds or the
+    /// [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout) when set;
+    /// a reply cut short is an error, never `NotFound`. With client id 0, the
+    /// open-orders request also binds manual TWS orders to this client.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OrderIdInRequestRange`] if `order_id` is at or above 1,500,000,000
+    /// (reserved for request ids), [`Error::Timeout`] if a reply does not end
+    /// in time, [`Error::ConnectionReset`] if the connection is down or drops
+    /// during the lookup, [`Error::UnexpectedEndOfStream`] if a reply ends
+    /// without its end marker.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use ibapi::orders::{OrderLookup, OrderStatusKind};
+    /// use ibapi::Client;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
+    ///
+    ///     match client.find_order(42, Duration::from_secs(1)).await.expect("lookup failed") {
+    ///         OrderLookup::Working { status, .. } => println!("working: {status:?}"),
+    ///         OrderLookup::Finished { status, .. } if status.status == OrderStatusKind::Filled => println!("filled {}", status.filled),
+    ///         OrderLookup::Finished { status, .. } => println!("{} after {} filled", status.status, status.filled),
+    ///         OrderLookup::NotFound => println!("unknown to TWS"),
+    ///     }
+    /// }
+    /// ```
+    pub async fn find_order(&self, order_id: impl Into<OrderId>, within: Duration) -> Result<OrderLookup, Error> {
+        let key = OrderKey::Id {
+            client_id: self.client_id(),
+            order_id: order_id.into().checked()?,
+        };
+        let reply_wait = self.one_shot_timeout().unwrap_or(ONE_SHOT_TIMEOUT);
+        self.look_up_order(key, within, || Some(reply_wait)).await
+    }
+
+    /// Looks up an order of any client by its TWS permanent id (`perm_id`):
+    /// still working, finished, or not known to TWS.
+    ///
+    /// [`find_order`](Self::find_order) with the order matched by `perm_id`,
+    /// on open orders and completed orders alike. Completed orders list every
+    /// client's orders, so a finished order of another client is found. Open
+    /// orders are this client's only: another client's working order is
+    /// `NotFound`. Use [`all_open_orders`](Self::all_open_orders) to list
+    /// other clients' working orders. Read that reply to its end before
+    /// allocating order ids, because it can raise this client's next order id.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Validation`] if `perm_id` is `0` or below (TWS assigns
+    /// positive perm ids; a record without one carries `0`), with nothing
+    /// sent; [`Error::Timeout`] if a reply does not end in time,
+    /// [`Error::ConnectionReset`] if the connection is down or drops during
+    /// the lookup, [`Error::UnexpectedEndOfStream`] if a reply ends without
+    /// its end marker.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use ibapi::orders::OrderLookup;
+    /// use ibapi::Client;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
+    ///
+    ///     match client.find_order_by_perm_id(1290490951, Duration::ZERO).await.expect("lookup failed") {
+    ///         OrderLookup::Working { order, .. } => println!("working: {order:?}"),
+    ///         OrderLookup::Finished { order, status } => println!("{} ({})", status.status, order.order_state.completed_status),
+    ///         OrderLookup::NotFound => println!("not listed"),
+    ///     }
+    /// }
+    /// ```
+    pub async fn find_order_by_perm_id(&self, perm_id: i64, within: Duration) -> Result<OrderLookup, Error> {
+        let key = OrderKey::perm_id(perm_id)?;
+        let reply_wait = self.one_shot_timeout().unwrap_or(ONE_SHOT_TIMEOUT);
+        self.look_up_order(key, within, || Some(reply_wait)).await
+    }
+
+    /// Reads open orders once, then completed orders until they list the
+    /// order or `within` has passed since the call. `reply_wait` bounds each
+    /// read; `None` reads without a bound.
+    async fn look_up_order(&self, key: OrderKey, within: Duration, reply_wait: impl Fn() -> Option<Duration>) -> Result<OrderLookup, Error> {
+        async fn read(mut subscription: Subscription<Orders>, wait: Option<Duration>) -> Result<Vec<Orders>, Error> {
+            match wait {
+                Some(wait) => subscription.collect_to_end_within(wait).await,
                 None => subscription.collect_to_end().await,
             }
         }
-        // A reply cut short (deadline, dropped connection) proves nothing:
-        // keep waiting; the status stream reports a dropped connection.
-        let Ok(open) = read(self.open_orders().await?, deadline).await else {
-            return Ok(None);
-        };
-        if lists_order(&open, order_id) {
-            return Ok(None);
+        let start = Instant::now();
+        let deadline = start.checked_add(within);
+        if let Some(working) = key.working(read(self.open_orders().await?, reply_wait()).await?) {
+            return Ok(working);
         }
-        let Ok(completed) = read(self.completed_orders(ApiOnly::No).await?, deadline).await else {
-            return Ok(None);
-        };
-        Ok(completed_status(&completed, self.client_id(), order_id))
+        loop {
+            if let Some(finished) = key.finished(read(self.completed_orders(ApiOnly::No).await?, reply_wait()).await?) {
+                return Ok(finished);
+            }
+            match recheck_delay(deadline, start, Instant::now()) {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => return Ok(OrderLookup::NotFound),
+            }
+        }
     }
 
     /// Exercise or lapse an option position.

@@ -12,13 +12,13 @@ pub(crate) use io::read_framed_message;
 /// The stream traits, for test fixtures that stand in for a socket.
 #[cfg(test)]
 pub(crate) use io::{AsyncIo, AsyncReconnect};
-pub(crate) use io::{AsyncSocket, AsyncStream, Connector};
-use registry::{Route, SenderHash, SharedChannels};
+pub(crate) use io::{AsyncSocket, AsyncStream, Connector, WriteAdmission};
+use registry::{Route, SenderHash, SharedChannels, SharedReplySkip};
 pub(crate) use shutdown::ShutdownSignal;
 
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -30,6 +30,7 @@ use tokio::task;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 
+use super::farm_watch::async_impl::FarmWatch;
 use crate::accounts::types::AccountId;
 use crate::client::handshake_state::HandshakeState;
 use crate::client::ids::{OrderId, RequestId, WireId};
@@ -37,7 +38,7 @@ use crate::connection::r#async::AsyncConnection;
 use crate::messages::{is_cancel_frame, transport_reconnect_notice, IncomingMessages, Notice, OutgoingMessages, ResponseMessage};
 use crate::Error;
 
-use super::common::{lock, log_orphan, report_unroutable_frame, Lease, LeaseRef};
+use super::common::{lock, log_orphan, report_unroutable_frame, Lease, LeaseRef, LiveExecutions, OrderFrame, OrderWrites, ORDER_CAPACITY};
 use super::order_taps::{NewTap, OrderTaps};
 use super::rate_limiter::RateLimiter;
 use super::routing::{
@@ -52,12 +53,6 @@ use super::{BufferBound, RoutedItem, SharedTicket};
 /// more than the capacity, the channel evicts the oldest frames and a data
 /// subscription receives a `SUBSCRIPTION_LAG_CODE` notice naming the count.
 pub(crate) const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
-
-/// Capacity floor for order-class request routes: one per order
-/// (`place_order`, `cancel_order`, `exercise_options`) and `executions`.
-/// Their traffic is per order or per request and ends, so this floor only
-/// keeps a small `ClientBuilder::channel_capacity` from shrinking them; see #896.
-pub(crate) const ORDER_CAPACITY: usize = 1024;
 
 /// Capacity floor for the order-class streams that aggregate every order's
 /// traffic for the session: the order update stream and the shared
@@ -112,6 +107,8 @@ impl ChannelClass {
 pub(crate) struct NoticeBroadcaster {
     /// `None` once closed.
     sender: std::sync::Mutex<Option<broadcast::Sender<Notice>>>,
+    /// Fed every notice before the fan-out; reset by the bus on a transport drop.
+    pub(crate) farms: FarmWatch,
 }
 
 impl super::common::NoticeSink for NoticeBroadcaster {
@@ -124,6 +121,7 @@ impl NoticeBroadcaster {
     pub(crate) fn new(sender: broadcast::Sender<Notice>) -> Self {
         Self {
             sender: std::sync::Mutex::new(Some(sender)),
+            farms: FarmWatch::default(),
         }
     }
 
@@ -137,6 +135,7 @@ impl NoticeBroadcaster {
     }
 
     pub(crate) fn broadcast(&self, notice: Notice) {
+        self.farms.observe(&notice);
         if let Some(sender) = lock(&self.sender).as_ref() {
             let _ = sender.send(notice);
         }
@@ -146,6 +145,7 @@ impl NoticeBroadcaster {
     /// every later subscription on arrival.
     pub(crate) fn close(&self) {
         *lock(&self.sender) = None;
+        self.farms.close();
     }
 }
 
@@ -184,6 +184,7 @@ impl RouteKey {
 }
 
 /// Asynchronous message bus trait
+#[allow(private_interfaces)] // The transport is private, including the account admission token.
 #[async_trait]
 pub trait AsyncMessageBus: Send + Sync {
     /// Open a request-id route and write `message`. With `bound`, unread
@@ -195,11 +196,12 @@ pub trait AsyncMessageBus: Send + Sync {
         request_id: RequestId,
         message: Vec<u8>,
         bound: Option<BufferBound>,
+        admission: Option<WriteAdmission>,
     ) -> Result<AsyncInternalSubscription, Error>;
 
     /// [`send_request_capped`](Self::send_request_capped) without a cap.
     async fn send_request(&self, request_id: RequestId, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
-        self.send_request_capped(request_id, message, None).await
+        self.send_request_capped(request_id, message, None, None).await
     }
 
     /// [`send_request`](Self::send_request) for `executions`: an order-class
@@ -211,8 +213,17 @@ pub trait AsyncMessageBus: Send + Sync {
     async fn send_shared_request(&self, message_type: OutgoingMessages, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error>;
 
     /// `send_shared_request` for `RequestAccountData`, refused with
-    /// `Error::AccountUpdatesInUse` while another account is live.
-    async fn send_account_updates_request(&self, account: &AccountId, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error>;
+    /// `Error::AccountUpdatesInUse` while another account is live. While
+    /// `account` is live already, writes `unsubscribe` ahead of `message`:
+    /// TWS answers a repeated subscribe with nothing, but an unsubscribe and
+    /// subscribe with the full initial dump, which reaches every subscription.
+    async fn send_account_updates_request(
+        &self,
+        account: &AccountId,
+        message: Vec<u8>,
+        unsubscribe: Vec<u8>,
+        admission: &WriteAdmission,
+    ) -> Result<AsyncInternalSubscription, Error>;
 
     async fn send_message(&self, message: Vec<u8>) -> Result<(), Error>;
 
@@ -257,6 +268,10 @@ pub trait AsyncMessageBus: Send + Sync {
     /// cleanup here, so it runs even when the drop is on a thread with no
     /// runtime of its own.
     fn runtime_handle(&self) -> &Handle;
+
+    /// Historical-data farm state from the global notices, which
+    /// `Client::resubscribing` waits on after a 10182.
+    fn farm_watch(&self) -> &super::farm_watch::async_impl::FarmWatch;
 }
 
 /// Internal subscription for async implementation.
@@ -277,6 +292,9 @@ pub struct AsyncInternalSubscription {
     lease: Option<(Lease, RouteKey)>,
     /// The shared-channel ticket, for a shared-channel subscription.
     shared: Option<SharedTicket>,
+    /// The earlier replies a shared-channel subscription passes over; see
+    /// `UnansweredReplies`.
+    skip: SharedReplySkip,
     /// The bus session generation the request was sent in; see
     /// [`AsyncMessageBus::session_generation`].
     session: u64,
@@ -297,7 +315,7 @@ impl Clone for AsyncInternalSubscription {
         // the broadcast channel — clones see future messages, not the
         // original's history.
         let new_template = self.template_receiver.resubscribe();
-        let new_polling = self.template_receiver.resubscribe();
+        let (new_polling, skip) = self.skip.resubscribe(&self.template_receiver);
         Self {
             template_receiver: new_template,
             stream: BroadcastStream::new(new_polling),
@@ -306,6 +324,7 @@ impl Clone for AsyncInternalSubscription {
             // no-op while another clone still holds the lease.
             lease: self.lease.clone(),
             shared: self.shared,
+            skip,
             session: self.session,
             reads: None,
             class: self.class,
@@ -334,6 +353,7 @@ impl AsyncInternalSubscription {
             cleanup_sender: None,
             lease: None,
             shared: None,
+            skip: SharedReplySkip::default(),
             session: 0,
             reads: None,
             class: ChannelClass::default(),
@@ -348,6 +368,7 @@ impl AsyncInternalSubscription {
             cleanup_sender: Some(cleanup_sender),
             lease: None,
             shared: None,
+            skip: SharedReplySkip::default(),
             session: 0,
             reads: None,
             class: ChannelClass::default(),
@@ -360,9 +381,11 @@ impl AsyncInternalSubscription {
         self
     }
 
-    /// Mark this a subscription to the shared channel `ticket` names.
-    fn shared(mut self, ticket: SharedTicket) -> Self {
+    /// Mark this a subscription to the shared channel `ticket` names, which
+    /// passes over the earlier replies `skip` counts.
+    fn shared(mut self, ticket: SharedTicket, skip: SharedReplySkip) -> Self {
         self.shared = Some(ticket);
+        self.skip = skip;
         self
     }
 
@@ -384,29 +407,50 @@ impl AsyncInternalSubscription {
         self
     }
 
-    /// Poll the underlying broadcast stream, converting a `Lagged` error into
-    /// an in-band [`SUBSCRIPTION_LAG_CODE`](crate::messages::SUBSCRIPTION_LAG_CODE)
-    /// notice (which also logs: `error!` on an order-class channel, else
-    /// `warn!`). The single place lag is handled — every
-    /// consumer polls through here, so none can reintroduce a silent swallow.
+    /// Report lag as an in-band notice, or as a terminal error while waiting
+    /// for an earlier shared reply's end marker.
     pub(crate) fn poll_next_routed(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<RoutedItem>> {
         use std::task::Poll;
-        match std::pin::Pin::new(&mut self.stream).poll_next(cx) {
-            Poll::Ready(Some(Ok(item))) => {
-                if let Some(reads) = &self.reads {
-                    reads.fetch_add(1, Ordering::Relaxed);
+        if self.skip.finished {
+            return Poll::Ready(None);
+        }
+        loop {
+            let item = match std::pin::Pin::new(&mut self.stream).poll_next(cx) {
+                Poll::Ready(Some(Ok(item))) => item,
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(skipped)))) => {
+                    let notice = match self.class {
+                        ChannelClass::MarketData => crate::messages::subscription_lag_notice(skipped),
+                        ChannelClass::Order | ChannelClass::OrderStream => crate::messages::order_lag_notice(skipped),
+                    };
+                    if self.skip.waiting_for_end() {
+                        // A dropped frame could be the End that separates our
+                        // reply from the earlier one.
+                        self.skip.finished = true;
+                        let error = if self.skip.session_reset() {
+                            Error::ConnectionReset
+                        } else {
+                            Error::Notice(notice)
+                        };
+                        return Poll::Ready(Some(RoutedItem::Error(error)));
+                    }
+                    return Poll::Ready(Some(RoutedItem::Notice(notice)));
                 }
-                Poll::Ready(Some(item))
+                Poll::Ready(None) if self.skip.session_reset() => {
+                    self.skip.finished = true;
+                    return Poll::Ready(Some(RoutedItem::Error(Error::ConnectionReset)));
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            };
+            if let Some(reads) = &self.reads {
+                reads.fetch_add(1, Ordering::Relaxed);
             }
-            Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(skipped)))) => {
-                let notice = match self.class {
-                    ChannelClass::MarketData => crate::messages::subscription_lag_notice(skipped),
-                    ChannelClass::Order | ChannelClass::OrderStream => crate::messages::order_lag_notice(skipped),
-                };
-                Poll::Ready(Some(RoutedItem::Notice(notice)))
+            if let RoutedItem::Response(message) = &item {
+                if self.skip.skips(message.message_type()) {
+                    continue;
+                }
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            return Poll::Ready(Some(item));
         }
     }
 
@@ -492,10 +536,17 @@ pub struct AsyncTcpMessageBus<S: AsyncStream = AsyncSocket> {
     connection: Arc<AsyncConnection<S>>,
     requests: Arc<SenderHash<RequestId>>,
     orders: Arc<SenderHash<OrderId>>,
-    /// Execution-id aliases of request and order routes, for the commission
-    /// reports that follow an execution. Pruned when the owning request or
-    /// order subscription is cleaned up.
+    /// Execution-id aliases of order routes, for the commission report that
+    /// follows a live execution. Pruned when the owning order subscription is
+    /// cleaned up.
     executions: Arc<SenderHash<String>>,
+    /// Execution-id aliases of `executions` request routes, for the
+    /// commission reports in a reply. Kept apart from [`Self::executions`]
+    /// because a reply's commission report goes to the request alone, not to
+    /// the order update stream. Pruned when the request is cleaned up.
+    executions_requested: Arc<SenderHash<String>>,
+    /// This client's live fills still waiting for their commission report.
+    live_executions: LiveExecutions,
     shared_channels: SharedChannels,
     /// The order-update stream and the per-order status streams. A std lock
     /// inside, like the registries', so shutdown can close it from `Drop`.
@@ -535,6 +586,8 @@ pub struct AsyncTcpMessageBus<S: AsyncStream = AsyncSocket> {
     /// starts, or is refused: none reaches the socket the reconnect installs
     /// until the handshake on it is done.
     session: tokio::sync::RwLock<()>,
+    outbound_writer: tokio::sync::Mutex<()>,
+    order_writes: OrderWrites,
 }
 
 impl<S: AsyncStream> Drop for AsyncTcpMessageBus<S> {
@@ -571,6 +624,8 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             requests: Arc::new(SenderHash::new()),
             orders: Arc::new(SenderHash::new()),
             executions: Arc::new(SenderHash::new()),
+            executions_requested: Arc::new(SenderHash::new()),
+            live_executions: LiveExecutions::default(),
             shared_channels: SharedChannels::new(|request| ChannelClass::of_shared(request).capacity(channel_capacity)),
             order_taps,
             channel_capacity,
@@ -585,12 +640,15 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             rate_limiter: OnceLock::new(),
             connection_state: Arc::new(ConnectionSignal::default()),
             session: tokio::sync::RwLock::new(()),
+            outbound_writer: tokio::sync::Mutex::new(()),
+            order_writes: OrderWrites::default(),
         };
 
         // Start cleanup task
         let requests = message_bus.requests.clone();
         let orders = message_bus.orders.clone();
         let executions = message_bus.executions.clone();
+        let executions_requested = message_bus.executions_requested.clone();
         let order_taps = message_bus.order_taps.clone();
         #[cfg(test)]
         let cleanup_gate = message_bus.cleanup_gate.clone();
@@ -608,7 +666,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                 match signal {
                     CleanupSignal::Request(request_id, lease) => {
                         requests.release(request_id, &lease, "request");
-                        executions.prune_dead();
+                        executions_requested.prune_dead();
                     }
                     CleanupSignal::Order(order_id, lease) => {
                         orders.release(order_id, &lease, "order");
@@ -686,11 +744,6 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                                 // reconnect can run for minutes.
                                 message_bus.reset_channels().await;
 
-                                // Fail any write still on the dead
-                                // connection, so the gate below need not wait
-                                // for a peer that stopped reading.
-                                message_bus.connection.socket.sever();
-
                                 // Waits out writes whose state check passed
                                 // before the flip (a write stuck on the dead
                                 // socket must not delay the failures above);
@@ -734,6 +787,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                                         // that resubscribes on it lands on the new session,
                                         // into maps the reset above can no longer wipe.
                                         message_bus.connection.notice_broadcaster.broadcast(transport_reconnect_notice());
+                                        message_bus.order_taps.reconnected();
                                     }
                                     // Shutdown was requested while reconnecting:
                                     // not a failure, and the flag is already
@@ -841,7 +895,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     /// handshake writes through `AsyncConnection`, not here.
     async fn write_message(&self, message: &[u8]) -> Result<(), Error> {
         self.throttle(message).await;
-        self.write_now(message).await
+        self.write_now(message, None).await
     }
 
     /// Waits for the rate limiter, if any. Shared-channel paths call this
@@ -857,12 +911,42 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     /// under the `session` gate. The gate held for write is a reconnect in
     /// progress, whatever the state signal says yet, so the write is refused
     /// as `ensure_connected` would refuse it once the signal catches up.
-    async fn write_now(&self, message: &[u8]) -> Result<(), Error> {
-        let Ok(_session) = self.session.try_read() else {
+    async fn write_now(&self, message: &[u8], admission: Option<&WriteAdmission>) -> Result<(), Error> {
+        self.write_in_session(self.session_generation(), message, admission).await
+    }
+
+    async fn write_in_session(&self, generation: u64, message: &[u8], admission: Option<&WriteAdmission>) -> Result<(), Error> {
+        let _session = self.session_for_write()?;
+        let _writer = self.writer_for_admission(admission).await?;
+        self.ensure_write_generation(generation)?;
+        self.connection.write_message(message, admission).await
+    }
+
+    async fn writer_for_admission(&self, admission: Option<&WriteAdmission>) -> Result<tokio::sync::MutexGuard<'_, ()>, Error> {
+        match admission {
+            Some(admission) => tokio::select! {
+                biased;
+                error = admission.stopped() => Err(error),
+                writer = self.outbound_writer.lock() => Ok(writer),
+            },
+            None => Ok(self.outbound_writer.lock().await),
+        }
+    }
+
+    fn ensure_write_generation(&self, generation: u64) -> Result<(), Error> {
+        self.ensure_connected()?;
+        if generation != self.session_generation() {
+            return Err(Error::ConnectionReset);
+        }
+        Ok(())
+    }
+
+    fn session_for_write(&self) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, Error> {
+        let Ok(session) = self.session.try_read() else {
             return Err(self.ended_reason(Error::ConnectionReset));
         };
         self.ensure_connected()?;
-        self.connection.write_message(message).await
+        Ok(session)
     }
 
     /// Fail all registered channels with `Error::ConnectionReset`, before a
@@ -873,20 +957,19 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         // already sees the new generation.
         self.session_generation.fetch_add(1, Ordering::AcqRel);
 
+        self.order_writes.drain(|id, frames| self.drain_order_write(id, frames, true));
         self.requests.fail_all(|| Error::ConnectionReset.into());
         self.orders.fail_all(|| Error::ConnectionReset.into());
         // Aliases of the routes just failed.
         self.executions.clear();
-        // Shared channels too, mirroring sync's `fail_all`: an in-flight
-        // open_orders/positions subscription awaits an end marker only the
-        // pre-reconnect request could produce, so it would hang forever.
-        // Unfiltered on purpose — `fail_one_shot_channels`' one-shot filter
-        // protects live streams from *unrelated* errors, but a reset
-        // terminates every stream by definition. The channels persist across
-        // sessions, so they are not closed.
-        self.shared_channels.notify_all(|| Error::ConnectionReset.into());
+        self.executions_requested.clear();
+        self.live_executions.clear();
+        self.shared_channels.retire_session();
+        // Shared writes can hold the count lock until their flush returns.
+        self.connection.socket.sever();
         self.shared_channels.reset_counts().await;
         self.order_taps.reset();
+        self.connection.notice_broadcaster.farms.reset();
     }
 
     /// Shut down, then release the socket, which retained clients and
@@ -908,10 +991,12 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 
         // Fail every subscription, then drop its sender so it ends; the
         // sync bus does the same. Notice streams just end.
+        self.order_writes.drain(|id, frames| self.drain_order_write(id, frames, true));
         self.requests.fail_all(|| Error::Shutdown.into());
         self.orders.fail_all(|| Error::Shutdown.into());
         // Execution aliases hold sender clones; clear them or the channels stay open.
         self.executions.clear();
+        self.executions_requested.clear();
         self.shared_channels.close(|| Error::Shutdown.into());
         self.order_taps.close();
 
@@ -946,13 +1031,69 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     /// subscription its id names.
     async fn deliver(&self, id: WireId, item: RoutedItem, sent_to_update_stream: bool) {
         let unrouted = match id {
-            WireId::Request(request_id) => self.requests.deliver(&request_id, item),
-            WireId::Order(order_id) => self.orders.deliver(&order_id, item),
+            WireId::Request(request_id) => self.requests.deliver(
+                &request_id,
+                item.with_farm_disconnect_mark(|| self.connection.notice_broadcaster.farms.mark()),
+            ),
+            WireId::Order(order_id) => self.deliver_order(order_id, item),
         };
         if let Err(item) = unrouted {
             if !sent_to_update_stream {
                 log_orphan(id, &item);
             }
+        }
+    }
+
+    fn deliver_order(&self, order_id: OrderId, item: RoutedItem) -> Result<(), RoutedItem> {
+        self.dispatch_order_frame(order_id, OrderFrame::Direct(item))
+    }
+
+    fn dispatch_order_frame(&self, order_id: OrderId, frame: OrderFrame) -> Result<(), RoutedItem> {
+        self.order_writes
+            .deliver(order_id, frame, |frame| self.deliver_order_frame(order_id, frame))
+    }
+
+    fn deliver_order_frame(&self, order_id: OrderId, frame: OrderFrame) -> Result<(), RoutedItem> {
+        match frame {
+            OrderFrame::Direct(item) => self.orders.deliver(&order_id, item),
+            OrderFrame::Execution {
+                item,
+                execution_id,
+                request_id,
+            } => {
+                debug_assert!(request_id.is_none());
+                self.orders.deliver_aliased(&order_id, item, execution_id.as_ref(), &self.executions)
+            }
+            OrderFrame::Commission { item, execution_id } => {
+                let leases = self.orders.leases(&order_id);
+                let (delivered, _) = self
+                    .executions
+                    .deliver_selected(&execution_id, &item, |lease| leases.iter().any(|order_lease| order_lease.is(lease)));
+                if delivered {
+                    Ok(())
+                } else {
+                    Err(item)
+                }
+            }
+        }
+    }
+
+    fn deliver_order_commission(&self, execution_id: String, item: RoutedItem) -> Result<(), RoutedItem> {
+        self.order_writes
+            .deliver_commission(execution_id, item, |pending_id, execution_id, item| {
+                let leases = pending_id.map_or_else(Vec::new, |id| self.orders.leases(&id));
+                self.executions
+                    .deliver_selected(execution_id, item, |lease| !leases.iter().any(|order_lease| order_lease.is(lease)))
+            })
+    }
+
+    fn drain_order_write(&self, order_id: OrderId, frames: Vec<OrderFrame>, uncertain: bool) {
+        for frame in frames {
+            let frame = match frame {
+                OrderFrame::Direct(item) if uncertain => OrderFrame::Direct(item.for_earlier_subscription()),
+                frame => frame,
+            };
+            let _ = self.deliver_order_frame(order_id, frame);
         }
     }
 
@@ -969,34 +1110,62 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     /// Route message to order-specific channel
     async fn route_to_order_channel(&self, order_id: i32, message: ResponseMessage) -> Result<(), Error> {
         let foreign = is_foreign(&message, self.connection.client_id);
-        let routed = !foreign && self.send_order_update(&message);
-        let strategy = order_routing_strategy(message.message_type(), foreign);
         let message_order_id = message.order_id().map(OrderId::from);
         let message_request_id = message.request_id().and_then(RequestId::from_raw);
+        let strategy = order_routing_strategy(message.message_type(), foreign, message_request_id.is_some());
+        // An execution reply, its end marker and its commission reports stay
+        // off the update stream; the commission arm decides for itself.
+        let routed = !foreign
+            && !matches!(
+                strategy,
+                OrderRoutingStrategy::ByRequestId | OrderRoutingStrategy::ExecutionDataEnd | OrderRoutingStrategy::ByExecutionId
+            )
+            && self.send_order_update(&message);
 
         if !foreign {
             self.order_taps.publish_status(&message);
+        } else if message.message_type() == IncomingMessages::OpenOrder {
+            if let (Some(state), Some(order_id)) = (self.handshake_state.get(), message_order_id) {
+                state.raise_past_listed_order(order_id.value());
+            }
         }
 
         match strategy {
             OrderRoutingStrategy::OrderUpdateOnly => {}
             OrderRoutingStrategy::ExecutionData => {
                 let execution_id = message.execution_id();
-                if let Err(item) = self.deliver_to_order_or_request(message_order_id, message_request_id, message.into(), execution_id.as_ref()) {
+                if let Some(execution_id) = &execution_id {
+                    self.live_executions.insert(execution_id);
+                }
+                let unrouted = match message_order_id {
+                    Some(id) => self.dispatch_order_frame(
+                        id,
+                        OrderFrame::Execution {
+                            item: message.into(),
+                            execution_id,
+                            request_id: None,
+                        },
+                    ),
+                    None => Err(message.into()),
+                };
+                if let Err(item) = unrouted {
                     if !routed {
                         warn!("could not route ExecutionData message {item:?}");
                     }
                 }
             }
             OrderRoutingStrategy::ExecutionDataEnd => {
-                if let Err(item) = self.deliver_to_order_or_request(message_order_id, message_request_id, message.into(), None) {
+                if let Some(id) = message_request_id {
+                    self.requests.end_commission_aliases(&id, &self.executions_requested);
+                }
+                if let Err(item) = self.deliver_to_order_or_request(message_order_id, message_request_id, message.into()) {
                     warn!("could not route ExecutionDataEnd message {item:?}");
                 }
             }
             OrderRoutingStrategy::OrderAndShared => {
                 let shared = self.shared_channels.send_message(message.message_type(), &message);
                 let unrouted = match message_order_id {
-                    Some(order_id) => self.orders.deliver(&order_id, message.into()).err(),
+                    Some(order_id) => self.deliver_order(order_id, message.into()).err(),
                     None => Some(message.into()),
                 };
                 if let Some(item) = unrouted {
@@ -1005,17 +1174,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                     }
                 }
             }
-            OrderRoutingStrategy::ByExecutionId => {
-                let unrouted = match message.execution_id() {
-                    Some(execution_id) => self.executions.deliver(&execution_id, message.into()),
-                    None => Err(message.into()),
-                };
-                if let Err(item) = unrouted {
-                    if !routed {
-                        warn!("could not route commission report {item:?}");
-                    }
-                }
-            }
+            OrderRoutingStrategy::ByExecutionId => self.route_commission(message),
             OrderRoutingStrategy::SharedOnly => {
                 if !self.shared_channels.send_message(message.message_type(), &message) && !routed {
                     warn!("could not route message {:?}", message);
@@ -1023,14 +1182,20 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             }
             OrderRoutingStrategy::ByRequestId => {
                 let execution_id = message.execution_id();
-                if let Err(item) = self.deliver_to_order_or_request(None, message_request_id, message.into(), execution_id.as_ref()) {
-                    debug!("another client's execution answers no request: {item:?}");
+                let unrouted = match message_request_id {
+                    Some(id) => self
+                        .requests
+                        .deliver_aliased(&id, message.into(), execution_id.as_ref(), &self.executions_requested),
+                    None => Err(message.into()),
+                };
+                if let Err(item) = unrouted {
+                    debug!("execution answers no live request: {item:?}");
                 }
             }
             OrderRoutingStrategy::Ignore => {}
             OrderRoutingStrategy::ByOrderId => {
                 let unrouted = if order_id >= 0 {
-                    self.orders.deliver(&OrderId::from(order_id), message.into())
+                    self.deliver_order(OrderId::from(order_id), message.into())
                 } else {
                     Err(message.into())
                 };
@@ -1045,22 +1210,32 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         Ok(())
     }
 
-    /// Deliver to `order_id`'s route, else `request_id`'s, aliasing the route
-    /// under `execution_id` for the commission report that follows. Hands
-    /// the item back when neither is registered.
-    fn deliver_to_order_or_request(
-        &self,
-        order_id: Option<OrderId>,
-        request_id: Option<RequestId>,
-        item: RoutedItem,
-        execution_id: Option<&String>,
-    ) -> Result<(), RoutedItem> {
+    fn route_commission(&self, message: ResponseMessage) {
+        let Some((id, payload)) = super::common::commission_version(&message) else {
+            self.live_executions.warn_unmapped();
+            return;
+        };
+
+        let requested = self.executions_requested.deliver_commission(&id, &payload, &message);
+        match self.live_executions.record_commission(&id, &payload) {
+            Some(true) => {
+                self.send_order_update(&message);
+                let _ = self.deliver_order_commission(id, message.into());
+            }
+            None if !requested => self.live_executions.warn_unmapped(),
+            _ => {}
+        }
+    }
+
+    /// Deliver to `order_id`'s route, else `request_id`'s. Hands the item
+    /// back when neither is registered.
+    fn deliver_to_order_or_request(&self, order_id: Option<OrderId>, request_id: Option<RequestId>, item: RoutedItem) -> Result<(), RoutedItem> {
         match order_id {
-            Some(id) => self.orders.deliver_aliased(&id, item, execution_id, &self.executions),
+            Some(id) => self.deliver_order(id, item),
             None => Err(item),
         }
         .or_else(|item| match request_id {
-            Some(id) => self.requests.deliver_aliased(&id, item, execution_id, &self.executions),
+            Some(id) => self.requests.deliver(&id, item),
             None => Err(item),
         })
     }
@@ -1075,18 +1250,21 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         key: fn(K) -> RouteKey,
         message: Vec<u8>,
         class: ChannelClass,
-        bound: Option<BufferBound>,
+        (bound, admission): (Option<BufferBound>, Option<&WriteAdmission>),
     ) -> Result<AsyncInternalSubscription, Error> {
+        if let Some(admission) = admission {
+            admission.ensure_open()?;
+        }
         // Read before the gate: a reset after this read leaves the
         // subscription in the old session, which is where its request went.
         let session = self.session_generation();
         self.ensure_connected()?;
 
-        let capacity = bound.map_or(class.capacity(self.channel_capacity), |bound| bound.limit + 1);
+        let capacity = bound.as_ref().map_or(class.capacity(self.channel_capacity), |bound| bound.limit + 1);
         let (sender, receiver) = broadcast::channel(capacity);
         let lease = Lease::new();
         let lease_ref = lease.downgrade();
-        let reads = bound.map(|_| Arc::new(AtomicUsize::new(0)));
+        let reads = bound.as_ref().map(|_| Arc::new(AtomicUsize::new(0)));
         let route = match (bound, &reads) {
             (Some(bound), Some(reads)) => Route::bounded(sender, lease_ref.clone(), bound, reads.clone()),
             _ => Route::unbounded(sender, lease_ref.clone()),
@@ -1111,10 +1289,26 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         // the registration back out on failure rather than leave a channel no
         // reset will clear. `remove_if_same` so a newer registration under the
         // same id survives.
-        if let Err(e) = self.write_message(&message).await {
+        let admitted = match (admission.map(|admission| (admission, admission.deadline())), self.rate_limiter.get()) {
+            (Some((admission, Some(deadline))), Some(limiter)) => tokio::select! {
+                biased;
+                e = admission.stopped() => Err(e),
+                result = limiter.acquire_before(deadline) => result,
+            },
+            _ => {
+                self.throttle(&message).await;
+                Ok(())
+            }
+        };
+        let send = match admitted {
+            Ok(()) => self.write_in_session(session, &message, admission).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = send {
             routes.remove_if_same(id, &lease_ref);
             return Err(e);
         }
+        routes.supersede_earlier(&id, &lease_ref);
 
         Ok(subscription)
     }
@@ -1141,66 +1335,215 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 
     // Registers a subscription of `message_type` and writes its request;
     // `account` for account updates (see `SharedCounts`).
+    /// `unsubscribe` goes out ahead of `message` when `account`'s updates are
+    /// live already; see `AsyncMessageBus::send_account_updates_request`.
     async fn send_shared(
         &self,
         message_type: OutgoingMessages,
         account: Option<&AccountId>,
         message: Vec<u8>,
+        replay: Option<(Vec<u8>, &WriteAdmission)>,
     ) -> Result<AsyncInternalSubscription, Error> {
         // See `open_route`.
         let session = self.session_generation();
         self.ensure_connected()?;
-        self.throttle(&message).await;
-
-        let (receiver, ticket) = self.shared_channels.subscribe(message_type, account, || self.write_now(&message)).await?;
+        if replay.is_none() {
+            self.throttle(&message).await;
+        }
+        let admission = replay.as_ref().map(|(_, admission)| *admission);
+        let started = AtomicBool::new(false);
+        let write = |live| self.write_shared(session, &message, replay.as_ref(), live, &started);
+        let (receiver, ticket, skip) = self.shared_channels.subscribe(message_type, account, admission, &started, write).await?;
 
         Ok(AsyncInternalSubscription::with_cleanup(receiver, self.cleanup_sender.clone())
-            .shared(ticket)
+            .shared(ticket, skip)
             .in_session(session)
             .class(ChannelClass::of_shared(message_type)))
+    }
+
+    async fn write_shared(
+        &self,
+        session: u64,
+        message: &[u8],
+        replay: Option<&(Vec<u8>, &WriteAdmission)>,
+        live: bool,
+        started: &AtomicBool,
+    ) -> Result<(), Error> {
+        let _session = self.session_for_write()?;
+        self.ensure_write_generation(session)?;
+        if let Some((unsubscribe, admission)) = replay {
+            admission.ensure_open()?;
+            let permit = tokio::select! {
+                biased;
+                error = admission.stopped() => return Err(error),
+                paced = self.throttle_account_request() => paced?,
+            };
+            if live {
+                self.write_shared_frame(session, unsubscribe, &AtomicBool::new(false), Some(admission))
+                    .await?;
+                self.observe_account_write(permit);
+                let mut replay = AccountReplay {
+                    socket: &self.connection.socket,
+                    armed: true,
+                };
+                let permit = self.throttle_account_request().await?;
+                self.write_shared_frame(session, message, started, None).await?;
+                self.observe_account_write(permit);
+                replay.armed = false;
+                return Ok(());
+            }
+            self.write_shared_frame(session, message, started, Some(admission)).await?;
+            self.observe_account_write(permit);
+            return Ok(());
+        }
+        self.write_shared_frame(session, message, started, None).await
+    }
+
+    async fn write_shared_frame(
+        &self,
+        generation: u64,
+        message: &[u8],
+        started: &AtomicBool,
+        admission: Option<&WriteAdmission>,
+    ) -> Result<(), Error> {
+        // The account replay holds the session read guard across both frames.
+        let _writer = self.writer_for_admission(admission).await?;
+        self.ensure_write_generation(generation)?;
+        self.connection.write_message_tracked(message, started, admission).await
+    }
+
+    async fn throttle_account_request(&self) -> Result<tokio::time::Instant, Error> {
+        let now = tokio::time::Instant::now();
+        let Some(limiter) = self.rate_limiter.get() else {
+            return self.ensure_connected().map(|()| now);
+        };
+        let permit = now + limiter.reserve(now.into_std(), false);
+        if permit == now {
+            return self.ensure_connected().map(|()| permit);
+        }
+        tokio::select! {
+            biased;
+            error = self.connection_state.disconnected() => Err(error),
+            () = tokio::time::sleep_until(permit) => self.ensure_connected().map(|()| permit),
+        }
+    }
+
+    fn observe_account_write(&self, permit: tokio::time::Instant) {
+        if let Some(limiter) = self.rate_limiter.get() {
+            limiter.observe_account_write(permit.into_std(), tokio::time::Instant::now().into_std());
+        }
+    }
+}
+
+struct AccountReplay<'a, S: AsyncStream> {
+    socket: &'a S,
+    armed: bool,
+}
+
+impl<S: AsyncStream> Drop for AccountReplay<'_, S> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.socket.sever();
+        }
     }
 }
 
 #[async_trait]
+#[allow(private_interfaces)]
 impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
     async fn send_request_capped(
         &self,
         request_id: RequestId,
         message: Vec<u8>,
         bound: Option<BufferBound>,
+        admission: Option<WriteAdmission>,
     ) -> Result<AsyncInternalSubscription, Error> {
-        self.open_route(&self.requests, request_id, RouteKey::Request, message, ChannelClass::MarketData, bound)
-            .await
+        self.open_route(
+            &self.requests,
+            request_id,
+            RouteKey::Request,
+            message,
+            ChannelClass::MarketData,
+            (bound, admission.as_ref()),
+        )
+        .await
     }
 
     async fn send_executions_request(&self, request_id: RequestId, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
-        self.open_route(&self.requests, request_id, RouteKey::Request, message, ChannelClass::Order, None)
+        self.open_route(&self.requests, request_id, RouteKey::Request, message, ChannelClass::Order, (None, None))
             .await
     }
 
     async fn send_order_request(&self, order_id: OrderId, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
-        self.open_route(&self.orders, order_id, RouteKey::Order, message, ChannelClass::Order, None)
-            .await
+        self.ensure_connected()?;
+        self.throttle(&message).await;
+        let _session = self.session_for_write()?;
+        let _writer = self.outbound_writer.lock().await;
+        let session = self.session_generation();
+
+        let class = ChannelClass::Order;
+        let (sender, receiver) = broadcast::channel(class.capacity(self.channel_capacity));
+        let lease = Lease::new();
+        let lease_ref = lease.downgrade();
+        let started = AtomicBool::new(false);
+        let write = self.order_writes.begin(
+            order_id,
+            || self.ensure_connected(),
+            |sent, id, frames| {
+                if sent {
+                    self.orders.insert(id, Route::unbounded(sender, lease_ref.clone()));
+                    self.orders.supersede_earlier(&id, &lease_ref);
+                }
+                let uncertain = !sent && started.load(Ordering::Relaxed);
+                self.drain_order_write(id, frames, uncertain);
+            },
+        )?;
+        self.connection.write_message_tracked(&message, &started, None).await?;
+        if !write.commit() {
+            return Err(self.ended_reason(Error::ConnectionReset));
+        }
+
+        Ok(AsyncInternalSubscription::with_cleanup(receiver, self.cleanup_sender.clone())
+            .leased(lease, RouteKey::Order(order_id))
+            .in_session(session)
+            .class(class))
     }
 
     async fn send_shared_request(&self, message_type: OutgoingMessages, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
-        self.send_shared(message_type, None, message).await
+        self.send_shared(message_type, None, message, None).await
     }
 
-    async fn send_account_updates_request(&self, account: &AccountId, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
-        self.send_shared(OutgoingMessages::RequestAccountData, Some(account), message).await
+    async fn send_account_updates_request(
+        &self,
+        account: &AccountId,
+        message: Vec<u8>,
+        unsubscribe: Vec<u8>,
+        admission: &WriteAdmission,
+    ) -> Result<AsyncInternalSubscription, Error> {
+        self.send_shared(
+            OutgoingMessages::RequestAccountData,
+            Some(account),
+            message,
+            Some((unsubscribe, admission)),
+        )
+        .await
     }
 
     async fn cancel_shared_subscription(&self, ticket: SharedTicket, message: Option<Vec<u8>>) -> Result<(), Error> {
-        // Throttled before the lock: some cancels (account updates) are
-        // requests with an off flag and do wait.
-        if let Some(message) = &message {
-            self.throttle(message).await;
-        }
         self.shared_channels
-            .unsubscribe(ticket, || async move {
+            .unsubscribe(ticket, message.is_some(), || async move {
                 match message {
-                    Some(message) => self.write_now(&message).await,
+                    Some(message) => {
+                        if ticket.message_type == OutgoingMessages::RequestAccountData {
+                            let permit = self.throttle_account_request().await?;
+                            self.write_now(&message, None).await?;
+                            self.observe_account_write(permit);
+                            return Ok(());
+                        } else {
+                            self.throttle(&message).await;
+                        }
+                        self.write_now(&message, None).await
+                    }
                     None => Ok(()),
                 }
             })
@@ -1273,6 +1616,10 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
 
     fn session_generation(&self) -> u64 {
         self.session_generation.load(Ordering::Acquire)
+    }
+
+    fn farm_watch(&self) -> &super::farm_watch::async_impl::FarmWatch {
+        &self.connection.notice_broadcaster.farms
     }
 
     fn runtime_handle(&self) -> &Handle {

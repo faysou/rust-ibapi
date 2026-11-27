@@ -13,7 +13,7 @@ use log::warn;
 
 use super::common::{lock, Lease, LeaseRef};
 use crate::client::ids::{OrderId, WireId};
-use crate::messages::{IncomingMessages, Notice, ResponseMessage};
+use crate::messages::{order_update_gap_notice, IncomingMessages, Notice, ResponseMessage};
 use crate::orders::common::decode_order_status;
 use crate::transport::RoutedItem;
 use crate::Error;
@@ -203,6 +203,12 @@ impl<S: TapSender> OrderTaps<S> {
         sent
     }
 
+    /// Tell the order-update stream the transport reconnected: it survives
+    /// the reconnect, but TWS does not replay what it sent during the outage.
+    pub(crate) fn reconnected(&self) {
+        self.send_update(RoutedItem::Notice(order_update_gap_notice()));
+    }
+
     /// Remove the order-update stream if `lease` names it and it has gone.
     pub(crate) fn release_updates(&self, lease: &LeaseRef) -> bool {
         let mut state = self.lock();
@@ -267,11 +273,18 @@ impl<S: TapSender> OrderTaps<S> {
     /// order's status streams, which end on it. Only before any status or
     /// earlier rejection: once TWS has sent a status the order exists, and an
     /// error (e.g. a refused modify) leaves it working; its statuses report
-    /// how it ends. Anything else is ignored.
+    /// how it ends. A refused cancel or modify
+    /// ([`NoticeCategory::OrderChangeRejection`](crate::NoticeCategory::OrderChangeRejection)) changed nothing, so it is not
+    /// the order's rejection either: a 10148 or 10147 for an order filled before
+    /// this connection must not end a wait that would find the fill. Anything else
+    /// is ignored.
     pub(crate) fn publish_rejection(&self, id: WireId, item: &RoutedItem) {
         let (WireId::Order(order_id), RoutedItem::Error(Error::Notice(notice))) = (id, item) else {
             return;
         };
+        if notice.is_order_change_rejection() {
+            return;
+        }
         let mut state = self.lock();
         let slot = state.statuses.entry(order_id).or_default();
         if slot.latest.is_some() {

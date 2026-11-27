@@ -8,7 +8,7 @@ use crate::common::test_utils::helpers::{
 };
 use crate::contracts::Contract;
 use crate::market_data::historical::common::test_tables::{HMDS_CONNECTED_MESSAGE, PRE_DATA_NOTICES};
-use crate::market_data::historical::BarTimestamp;
+use crate::market_data::historical::{BarCompletion, BarTimestamp, StreamedBar};
 use crate::market_data::historical::{TickBidAsk, TickLast, TickMidpoint, ToDuration};
 use crate::market_data::{IgnoreSize, TradingHours};
 use crate::messages::{IncomingMessages, OutgoingMessages, HMDS_QUERY_MESSAGE_CODE};
@@ -897,6 +897,63 @@ fn historical_data_streaming_with_updates() {
     );
 }
 
+// Bars from 2023 have ended by now, so each update completes its bar on arrival.
+#[test]
+fn historical_data_streaming_bar_completion() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+        proto_response(
+            IncomingMessages::HistoricalData,
+            historical_data_response()
+                .bar(historical_data_bar(1_678_886_400).ohlc(1.0, 1.0, 1.0, 1.0))
+                .bar(historical_data_bar(1_678_886_460).ohlc(2.0, 2.0, 2.0, 2.0))
+                .encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::HistoricalDataUpdate,
+            historical_data_update_response()
+                .bar(historical_data_bar(1_678_886_460).ohlc(2.0, 2.5, 2.0, 2.5))
+                .encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::HistoricalDataUpdate,
+            historical_data_update_response()
+                .bar(historical_data_bar(1_678_886_520).ohlc(3.0, 3.0, 3.0, 3.0))
+                .encode_proto(),
+        ),
+    ]));
+    let client = Client::stubbed(message_bus, server_versions::PROTOBUF_REST_MESSAGES_3);
+    let contract = Contract::stock("SPY").build();
+    let subscription = client
+        .historical_data(&contract, BarSize::Min)
+        .duration(Duration::days(1))
+        .subscribe_with_updates()
+        .expect("streaming request should succeed");
+
+    let mut completion = BarCompletion::new(BarSize::Min);
+    let mut items = Vec::new();
+    for _ in 0..3 {
+        let update = subscription.next_data().expect("update").expect("expected Ok");
+        items.extend(completion.apply(update));
+    }
+
+    let summary: Vec<(bool, BarTimestamp, f64)> = items
+        .iter()
+        .map(|item| match item {
+            StreamedBar::Completed(bar) => (true, bar.date, bar.close),
+            StreamedBar::Forming(bar) => (false, bar.date, bar.close),
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (true, BarTimestamp::DateTime(datetime!(2023-03-15 13:20 UTC)), 1.0),
+            (false, BarTimestamp::DateTime(datetime!(2023-03-15 13:21 UTC)), 2.0),
+            (true, BarTimestamp::DateTime(datetime!(2023-03-15 13:21 UTC)), 2.5),
+            (true, BarTimestamp::DateTime(datetime!(2023-03-15 13:22 UTC)), 3.0),
+        ]
+    );
+}
+
 // The dispatcher classifies the error frame; this asserts that *this API* hands
 // it to the caller rather than swallowing it. The transport tests prove
 // delivery, not consumption — see blocking `matching_symbols` (#735).
@@ -919,6 +976,54 @@ fn historical_data_streaming_error_response() {
         panic!("error should arrive as Some(Err(_))");
     };
     assert_tws_error_message(err, 162, "No market data permissions");
+}
+
+/// The codes after which TWS answers a cancel of a `keepUpToDate` request
+/// with 366: the request is already over at TWS.
+const STREAM_ENDING_REJECTIONS: [(i32, &str); 2] = [
+    (200, "No security definition has been found for the request"),
+    (
+        321,
+        "Error validating request.-'D' : cause - Source price not supported with live updates",
+    ),
+];
+
+#[test]
+fn historical_data_streaming_rejection_ended_at_tws_writes_no_cancel() {
+    for (code, message) in STREAM_ENDING_REJECTIONS {
+        let (client, bus) = create_blocking_test_client_with_ordered_proto_responses(vec![proto_error_response(9000, code, message)]);
+        let subscription = client
+            .historical_data(&Contract::stock("SAP").build(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .subscribe_with_updates()
+            .expect("streaming request should succeed");
+
+        let Some(Err(err)) = subscription.next_data() else {
+            panic!("{code}: error should arrive as Some(Err(_))");
+        };
+        assert_tws_error_message(err, code, message);
+        drop(subscription);
+        assert_eq!(historical_requests_and_cancels(&bus), (1, 0), "{code} {message}");
+    }
+}
+
+/// 10197 is terminal on our side but unverified at TWS: the cancel stays.
+#[test]
+fn historical_data_streaming_unverified_rejection_still_cancels() {
+    let (client, bus) = create_blocking_test_client_with_ordered_proto_responses(vec![proto_error_response(
+        9000,
+        10197,
+        "No market data during competing live session",
+    )]);
+    let subscription = client
+        .historical_data(&Contract::stock("AAPL").build(), BarSize::Hour)
+        .duration(Duration::days(1))
+        .subscribe_with_updates()
+        .expect("streaming request should succeed");
+
+    assert!(matches!(subscription.next_data(), Some(Err(Error::Notice(n))) if n.code == 10197));
+    drop(subscription);
+    assert_eq!(historical_requests_and_cancels(&bus), (1, 1));
 }
 
 /// 165 "HMDS server connection was successful" ahead of the bars is a notice:
@@ -1418,6 +1523,56 @@ fn tick_subscription_is_terminated_false_while_nothing_has_arrived() {
     assert!(subscription.try_next().is_none(), "open, empty channel: nothing queued");
     assert!(!subscription.is_terminated());
     subscription.done.store(true, Ordering::Relaxed); // prevent cancel-on-drop noise
+}
+
+/// A TRADES request for a contract without trades (EUR.USD, XAUUSD, an index
+/// CFD) is answered with one midpoint frame, `done` set, and nothing more.
+fn eurusd_midpoints_for_trades() -> crate::messages::ResponseMessage {
+    proto_response(
+        IncomingMessages::HistoricalTick,
+        historical_ticks_response()
+            .tick(tick_midpoint(1_795_463_984, 1.09043))
+            .done(true)
+            .encode_proto(),
+    )
+}
+
+#[test]
+fn historical_ticks_last_answered_with_midpoints_fails() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![eurusd_midpoints_for_trades()]));
+    let client = Client::stubbed(message_bus, server_versions::PROTOBUF_REST_MESSAGES_3);
+    let contract = Contract::stock("MSFT").build();
+
+    let subscription = client.historical_ticks(&contract, 50).last().expect("subscription should be created");
+
+    let first = subscription.next();
+    let end = subscription.next();
+
+    assert!(
+        matches!(
+            first,
+            Some(Err(Error::UnexpectedTickKind {
+                requested: WhatToShow::Trades,
+                received: WhatToShow::MidPoint
+            }))
+        ),
+        "got {first:?}"
+    );
+    assert!(end.is_none(), "terminal error ends the stream, got {end:?}");
+}
+
+#[test]
+fn tick_subscription_of_another_kind_ends_while_channel_stays_open() {
+    // The dispatcher keeps the request's channel open after the frame, so a
+    // skipped frame left the reader blocked forever.
+    let (subscription, _signal_rx, _sender) = tick_sub_with_sender::<TickLast>(vec![RoutedItem::Response(eurusd_midpoints_for_trades())]);
+
+    let first = subscription.next_timeout(std::time::Duration::from_secs(1));
+
+    assert!(
+        matches!(first, Some(Err(Error::UnexpectedTickKind { .. }))),
+        "expected the error before the timeout, got {first:?}"
+    );
 }
 
 #[test]

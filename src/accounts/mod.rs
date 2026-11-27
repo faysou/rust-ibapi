@@ -279,7 +279,10 @@ pub struct PnLSingle {
 pub struct Position {
     /// Account holding position
     pub account: String,
-    /// Contract
+    /// The position's contract. `exchange` is a listing exchange, not where the position traded
+    /// (AAPL options: `AMEX`; stocks: their primary listing, with `primary_exchange` empty); match
+    /// positions to orders and executions by `contract_id` (live: 2026-11-24, server 223;
+    /// `docs/wire-facts/accounts.md#exchange-on-positions-executions-and-order-echoes`).
     pub contract: Contract,
     /// Number of shares held
     pub position: f64,
@@ -630,10 +633,10 @@ pub struct VerificationResult {
 pub(crate) mod sync;
 
 #[cfg(all(feature = "sync", not(feature = "async")))]
-pub use sync::AccountSummarySnapshots;
+pub use sync::{AccountSummarySnapshots, AccountSummarySnapshotsResubscribing};
 
 #[cfg(feature = "async")]
-pub use r#async::AccountSummarySnapshots;
+pub use r#async::{AccountSummarySnapshots, AccountSummarySnapshotsResubscribing};
 
 #[cfg(feature = "async")]
 mod r#async;

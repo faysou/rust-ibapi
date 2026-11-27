@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::accounts::types::AccountId;
 use crate::builder::ValidationError;
+use crate::market_data::historical::{BarsBetweenError, WhatToShow};
 use crate::messages::{Notice, ResponseMessage};
 
 /// The main error type for IBAPI operations.
@@ -147,6 +148,22 @@ pub enum Error {
     #[error("UnexpectedEndOfStream")]
     UnexpectedEndOfStream,
 
+    /// TWS answered a historical-ticks request with ticks of another kind. It
+    /// does this when the contract has no ticks of the requested kind: a
+    /// `TRADES` request (`historical_ticks(..).last()`) for a forex pair, a
+    /// spot metal or an index CFD is answered with midpoint ticks. Terminal;
+    /// TWS sends nothing more for the request. Request `received` instead.
+    ///
+    /// A window with no ticks of the requested kind is not this error: TWS
+    /// answers it with an empty batch of the requested kind.
+    #[error("historical ticks requested as {requested}, but TWS answered with {received} ticks")]
+    UnexpectedTickKind {
+        /// The kind the request asked for.
+        requested: WhatToShow,
+        /// The kind TWS sent.
+        received: WhatToShow,
+    },
+
     /// The deadline passed before the request ended. Says nothing about the
     /// request at TWS, which may still be running; see
     /// `Subscription::cancel_and_drain`.
@@ -195,7 +212,8 @@ pub enum Error {
     #[error("{0}")]
     Notice(Notice),
 
-    /// Attempted to create a duplicate subscription.
+    /// Attempted to create a duplicate subscription or to reuse its shared
+    /// channel before an abandoned reply has ended.
     #[error("AlreadySubscribed")]
     AlreadySubscribed,
 
@@ -225,6 +243,11 @@ pub enum Error {
     /// `Display`; [`source`](std::error::Error::source) is `None`.
     #[error("protobuf decode error: {0}")]
     ProtobufDecode(ProtobufDecodeError),
+
+    /// A request after the first in a split `historical_data(..).between(..).fetch()` of
+    /// 1-second bars failed. Carries that request's error and the bars fetched before it.
+    #[error("{0}")]
+    BarsBetween(Box<BarsBetweenError>),
 }
 
 /// A protobuf message from TWS failed to decode. Payload of
@@ -390,6 +413,93 @@ impl Error {
         }
     }
 
+    /// Returns `true` if this error was raised before the failing call wrote anything to TWS, so
+    /// the request it would have sent certainly did not go out. Returns `false` when the request
+    /// may have reached TWS: an order call must then ask TWS (open orders, executions, the order
+    /// update stream) what became of it.
+    ///
+    /// Written for the calls that place, modify, cancel or exercise orders: `place_order`,
+    /// `submit_order`, `cancel_order`, `cancel_order_with`, `global_cancel`, `global_cancel_with`,
+    /// the order builder's `submit` and `analyze`, and `exercise_options`. Each runs its checks,
+    /// then encodes, then writes the request once; only the write can fail after bytes left.
+    ///
+    /// `true` for the errors only those checks raise:
+    ///
+    /// | Variant | Raised by |
+    /// |---|---|
+    /// | [`Validation`](Error::Validation) | a value check: an order builder's inputs, an `ext_operator` TWS would reject |
+    /// | [`InvalidArgument`](Error::InvalidArgument) | a caller-bug check before the write |
+    /// | [`OrderIdInRequestRange`](Error::OrderIdInRequestRange) | an order id at or above the request-id range |
+    /// | [`ServerVersion`](Error::ServerVersion) | an order field the connected server does not support |
+    /// | [`AlreadySubscribed`](Error::AlreadySubscribed) | a second order update stream, which writes nothing |
+    /// | [`AccountUpdatesInUse`](Error::AccountUpdatesInUse) | the account-updates slot check, before the request is written |
+    ///
+    /// `false` for every other variant, including those raised both before and after a write:
+    ///
+    /// - [`ConnectionReset`](Error::ConnectionReset) refuses a request while the client
+    ///   reconnects, but is also what a write cut off by a dropped connection returns, when part
+    ///   of the frame may have gone out.
+    /// - [`ConnectionFailed`](Error::ConnectionFailed), [`Shutdown`](Error::Shutdown) and
+    ///   [`Timeout`](Error::Timeout) refuse a request up front, but a closed socket fails a
+    ///   pending write with `Shutdown`, and a one-shot request retried after a reset returns
+    ///   them once its first attempt was written.
+    /// - [`Io`](Error::Io) is a failed socket write.
+    /// - [`Notice`](Error::Notice) and the decode, parse and stream variants report what TWS
+    ///   sent back, so the request was sent.
+    ///
+    /// A call that sends several requests reports only on the one that failed: the bracket
+    /// builder's `submit_all` and `submit_oca_orders` send their orders one at a time, so a
+    /// `true` error on a later order leaves the earlier ones sent. Likewise
+    /// `next_valid_order_id` returns `OrderIdInRequestRange` for an id TWS sent back, after its
+    /// id request was written; that request places nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::Error;
+    ///
+    /// fn report(err: &Error) -> &'static str {
+    ///     if err.is_unsent() {
+    ///         "not sent"
+    ///     } else {
+    ///         "unknown: query the order"
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(report(&Error::InvalidArgument("buffer_limit must be above zero".into())), "not sent");
+    /// assert_eq!(report(&Error::ConnectionReset), "unknown: query the order");
+    /// ```
+    pub fn is_unsent(&self) -> bool {
+        match self {
+            Error::Validation(_)
+            | Error::InvalidArgument(_)
+            | Error::OrderIdInRequestRange { .. }
+            | Error::ServerVersion { .. }
+            | Error::AlreadySubscribed
+            | Error::AccountUpdatesInUse { .. } => true,
+            Error::Io(_)
+            | Error::ParseTime(_)
+            | Error::Parse { .. }
+            | Error::ConnectionFailed
+            | Error::ConnectionRejected(_)
+            | Error::ClientIdInUse { .. }
+            | Error::UnsupportedTimeZone(_)
+            | Error::ConnectionReset
+            | Error::Cancelled
+            | Error::Shutdown
+            | Error::UnexpectedResponse(_)
+            | Error::UnexpectedWireFormat(_)
+            | Error::UnexpectedEndOfStream
+            | Error::UnexpectedTickKind { .. }
+            | Error::Timeout
+            | Error::BufferLimitExceeded { .. }
+            | Error::InvalidFrame(_)
+            | Error::Notice(_)
+            | Error::ProtobufDecode(_)
+            | Error::BarsBetween(_) => false,
+        }
+    }
+
     /// Returns `true` if a read timed out before any byte of the next frame
     /// arrived, which both dispatchers treat as "nothing yet" rather than a
     /// failure — the socket is fine and the next poll continues. A timeout
@@ -440,6 +550,10 @@ impl Clone for Error {
             Error::UnexpectedResponse(m) => Error::UnexpectedResponse(m.clone()),
             Error::UnexpectedWireFormat(m) => Error::UnexpectedWireFormat(m.clone()),
             Error::UnexpectedEndOfStream => Error::UnexpectedEndOfStream,
+            Error::UnexpectedTickKind { requested, received } => Error::UnexpectedTickKind {
+                requested: *requested,
+                received: *received,
+            },
             Error::Timeout => Error::Timeout,
             Error::BufferLimitExceeded { limit } => Error::BufferLimitExceeded { limit: *limit },
             Error::InvalidFrame(m) => Error::InvalidFrame(m.clone()),
@@ -451,6 +565,7 @@ impl Clone for Error {
             },
             Error::OrderIdInRequestRange { order_id } => Error::OrderIdInRequestRange { order_id: *order_id },
             Error::ProtobufDecode(e) => Error::ProtobufDecode(e.clone()),
+            Error::BarsBetween(e) => Error::BarsBetween(e.clone()),
         }
     }
 }

@@ -188,16 +188,42 @@ fn notice_is_system_message() {
 
 #[test]
 fn notice_is_informational() {
-    // Informational includes cancellations, warnings, and system messages
-    let informational_codes = [202, 1100, 1101, 1102, 1300, *WARNING_CODE_RANGE.start(), 2107, *WARNING_CODE_RANGE.end()];
+    // Informational includes cancellations, warnings, system messages, and
+    // the client-synthesized notices about the client's own state.
+    let informational_codes = [
+        202,
+        1100,
+        1101,
+        1102,
+        1300,
+        *WARNING_CODE_RANGE.start(),
+        2107,
+        *WARNING_CODE_RANGE.end(),
+        TRANSPORT_RECONNECT_CODE,
+        SUBSCRIPTION_LAG_CODE,
+        NOTICE_STREAM_LAG_CODE,
+    ];
     for code in informational_codes {
         let notice = helpers::test_notice(code, "");
         assert!(notice.is_informational(), "Code {} should be informational", code);
         assert!(!notice.is_error(), "Code {} should not be an error", code);
     }
 
-    // Non-informational (actual errors)
-    let error_codes = [100, 200, 201, 316, 321, 354, 502, 10000];
+    // Non-informational (actual errors), the frames the client could not
+    // handle included.
+    let error_codes = [
+        100,
+        200,
+        201,
+        316,
+        321,
+        354,
+        502,
+        10000,
+        HANDSHAKE_UNKNOWN_FRAME_CODE,
+        HANDSHAKE_DECODE_FAILURE_CODE,
+        UNKNOWN_MESSAGE_TYPE_CODE,
+    ];
     for code in error_codes {
         let notice = helpers::test_notice(code, "");
         assert!(!notice.is_informational(), "Code {} should not be informational", code);
@@ -257,7 +283,7 @@ fn notice_is_order_rejection() {
     let start = *ORDER_REJECTION_CODE_RANGE.start();
     let end = *ORDER_REJECTION_CODE_RANGE.end();
 
-    for code in [201, 203, 355, end - 1, end] {
+    for code in [201, 203, 355, end - 1, end, 103, 110, 461, 10244, 10311, 10317] {
         assert!(
             helpers::test_notice(code, "").is_order_rejection(),
             "code {code} should be order rejection"
@@ -270,6 +296,22 @@ fn notice_is_order_rejection() {
         assert!(
             !helpers::test_notice(code, "").is_order_rejection(),
             "code {code} should not be order rejection"
+        );
+    }
+}
+
+#[test]
+fn notice_is_order_change_rejection() {
+    for code in [104, 105, 10067, 10147, 10148, 10241, 10242] {
+        let notice = helpers::test_notice(code, "");
+        assert!(notice.is_order_change_rejection(), "code {code} should be an order change rejection");
+        assert!(notice.is_error(), "code {code} should still end the request");
+        assert_eq!(notice.log_level(), log::Level::Error, "code {code}");
+    }
+    for code in [103, 110, 161, 201, 202, 10149] {
+        assert!(
+            !helpers::test_notice(code, "").is_order_change_rejection(),
+            "code {code} should not be an order change rejection"
         );
     }
 }
@@ -294,7 +336,8 @@ fn notice_is_request_error() {
 }
 
 /// Every category predicate is `category() == X`: at most one is true, and it
-/// names the category. `Error` has no predicate of its own.
+/// names the category. `Error`, `UnhandledFrame` and `ClientSynthesized` have
+/// no predicate of their own.
 #[test]
 fn notice_category_predicates_are_disjoint() {
     let messages = ["", "Order Message:\nWarning: outside RTH"];
@@ -308,15 +351,21 @@ fn notice_category_predicates_are_disjoint() {
                 (notice.is_system_message(), NoticeCategory::SystemMessage),
                 (notice.is_request_error(), NoticeCategory::RequestError),
                 (notice.is_order_rejection(), NoticeCategory::OrderRejection),
+                (notice.is_order_change_rejection(), NoticeCategory::OrderChangeRejection),
             ]
             .into_iter()
             .filter_map(|(hit, category)| hit.then_some(category))
             .collect();
             let expected: Vec<NoticeCategory> = match notice.category() {
-                NoticeCategory::Error => vec![],
+                NoticeCategory::Error | NoticeCategory::UnhandledFrame | NoticeCategory::ClientSynthesized => vec![],
                 category => vec![category],
             };
             assert_eq!(hits, expected, "code {code} message {message:?}");
+            assert_eq!(
+                notice.is_client_synthesized(),
+                matches!(notice.category(), NoticeCategory::ClientSynthesized | NoticeCategory::UnhandledFrame),
+                "code {code} message {message:?}"
+            );
         }
     }
 }
@@ -324,6 +373,13 @@ fn notice_category_predicates_are_disjoint() {
 #[test]
 fn notice_category_partition() {
     let cases: &[(i32, NoticeCategory)] = &[
+        (TRANSPORT_RECONNECT_CODE, NoticeCategory::ClientSynthesized),
+        (SUBSCRIPTION_LAG_CODE, NoticeCategory::ClientSynthesized),
+        (NOTICE_STREAM_LAG_CODE, NoticeCategory::ClientSynthesized),
+        (-1, NoticeCategory::ClientSynthesized),
+        (HANDSHAKE_UNKNOWN_FRAME_CODE, NoticeCategory::UnhandledFrame),
+        (HANDSHAKE_DECODE_FAILURE_CODE, NoticeCategory::UnhandledFrame),
+        (UNKNOWN_MESSAGE_TYPE_CODE, NoticeCategory::UnhandledFrame),
         (ORDER_CANCELLED_CODE, NoticeCategory::Cancellation), // 202 — precedence over OrderRejection
         (0, NoticeCategory::Warning),                         // code-less frame: error_code absent on the wire
         (*WARNING_CODE_RANGE.start(), NoticeCategory::Warning),
@@ -342,10 +398,25 @@ fn notice_category_partition() {
         (*ORDER_REJECTION_CODE_RANGE.end(), NoticeCategory::OrderRejection),   // 399
         (317, NoticeCategory::DataAdvisory),                                   // precedence over the 200..=399 band (#806)
         (2188, NoticeCategory::DataAdvisory),                                  // precedence over the 21xx band
-        (10089, NoticeCategory::DataAdvisory),
+        (10089, NoticeCategory::Error),                                        // ends the request: nothing follows it
         (10090, NoticeCategory::DataAdvisory),
         (10091, NoticeCategory::DataAdvisory),
         (10167, NoticeCategory::DataAdvisory),
+        (103, NoticeCategory::OrderRejection),            // duplicate order id: no order created
+        (110, NoticeCategory::OrderRejection),            // price off the minimum tick
+        (10244, NoticeCategory::OrderRejection),          // cash quantity not allowed
+        (10317, NoticeCategory::OrderRejection),          // cash quantity off its minimum variation
+        (461, NoticeCategory::OrderRejection),            // size not a multiple of the board lot
+        (10311, NoticeCategory::OrderRejection),          // direct routing refused by a precautionary setting
+        (104, NoticeCategory::OrderChangeRejection),      // modify of a finished order
+        (105, NoticeCategory::OrderChangeRejection),      // modify changes side or contract
+        (10067, NoticeCategory::OrderChangeRejection),    // trailing stop price changed alone
+        (10241, NoticeCategory::OrderChangeRejection),    // modify of a cash-quantity order
+        (10242, NoticeCategory::OrderChangeRejection),    // modify of a fractional order
+        (10147, NoticeCategory::OrderChangeRejection),    // cancel of an order not found
+        (10148, NoticeCategory::OrderChangeRejection),    // cancel of a finished order
+        (161, NoticeCategory::Error),                     // also follows a cancel that ended the order
+        (10318, NoticeCategory::Error),                   // not verified against a cancel
         (ORDER_PRESET_TIF_CODE, NoticeCategory::Warning), // 10349: TWS goes on with the order
         (ORDER_PRESET_TIF_CODE + 1, NoticeCategory::Error),
         (100, NoticeCategory::Error),
@@ -469,6 +540,32 @@ fn data_farm_reads_kind_status_and_name() {
         assert_eq!(notice.connectivity_status(), Some(status), "{message:?}");
     }
     assert_eq!(helpers::test_notice(500, "Not connected:usfarm").data_farm(), None);
+}
+
+#[test]
+fn pending_order_ids_reads_1104() {
+    // The first two messages are as paper TWS sent them
+    // (docs/wire-facts/orders.md#orders-tws-names-in-1104); the rest are spacing edge cases.
+    let cases = [
+        ("Pending to create 1 orders: 55", Some(vec![55])),
+        ("Pending to create 2 orders: 55, 57", Some(vec![55, 57])),
+        ("Pending to create 2 orders:55,57", Some(vec![55, 57])),
+        ("Pending to create 3 orders:  60 ,62,  64 ", Some(vec![60, 62, 64])),
+        ("Pending to create 2 orders: 55, 57,", Some(vec![55, 57])),
+        ("Pending to create 2 orders: 55, 57,  ", Some(vec![55, 57])),
+        ("Pending to create 1 orders: 55x", None),
+        ("Pending to create orders", None),
+        ("Pending to create orders:", None),
+        ("Pending to create orders:  ", None),
+        ("Pending to create orders: ,", None),
+        ("Pending to create 2 orders: ,55, 57", None),
+        ("Pending to create 2 orders: 55, ,57", None),
+        ("Pending to create 2 orders: 55, 57,,", None),
+    ];
+    for (message, expected) in cases {
+        assert_eq!(helpers::test_notice(1104, message).pending_order_ids(), expected, "{message:?}");
+    }
+    assert_eq!(helpers::test_notice(1100, "Pending to create 1 orders: 55").pending_order_ids(), None);
 }
 
 #[test]
@@ -613,6 +710,7 @@ fn log_level_follows_category() {
     .into_iter()
     .chain(farm_codes(ConnectivityStatus::Broken))
     .chain(DATA_ADVISORY_CODES.iter().copied())
+    .chain([TRANSPORT_RECONNECT_CODE, SUBSCRIPTION_LAG_CODE, NOTICE_STREAM_LAG_CODE])
     {
         assert_eq!(Notice::synthesized(code, String::new()).log_level(), log::Level::Warn, "code {code}");
     }
@@ -629,7 +727,7 @@ fn log_level_follows_category() {
         );
     }
     // Connectivity lost, socket reset, request errors (316, 354), order
-    // rejections (200, 201) and errors: error.
+    // rejections (200, 201), errors and unhandled frames: error.
     for code in [
         CONNECTIVITY_LOST_CODE,
         SOCKET_PORT_RESET_CODE,
@@ -639,6 +737,9 @@ fn log_level_follows_category() {
         354,
         *WARNING_CODE_RANGE.end() + 1,
         10000,
+        HANDSHAKE_UNKNOWN_FRAME_CODE,
+        HANDSHAKE_DECODE_FAILURE_CODE,
+        UNKNOWN_MESSAGE_TYPE_CODE,
     ] {
         assert_eq!(Notice::synthesized(code, String::new()).log_level(), log::Level::Error, "code {code}");
     }

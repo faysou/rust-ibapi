@@ -48,23 +48,35 @@ fn for_stream_validates_the_limit_and_takes_the_end_from_the_decoder() {
     use crate::contracts::{ContractDetails, OptionChain};
     use crate::market_data::historical::HistoricalDataFrame;
     use crate::messages::IncomingMessages;
+    use crate::subscriptions::DecoderContext;
 
-    assert!(BufferBound::for_stream::<ContractDetails>(None).unwrap().is_none());
+    assert!(BufferBound::for_stream::<ContractDetails>(None, &DecoderContext::default())
+        .unwrap()
+        .is_none());
     for limit in [0, MAX_BUFFER_LIMIT + 1] {
         assert!(
-            matches!(BufferBound::for_stream::<ContractDetails>(Some(limit)), Err(Error::InvalidArgument(_))),
+            matches!(
+                BufferBound::for_stream::<ContractDetails>(Some(limit), &DecoderContext::default()),
+                Err(Error::InvalidArgument(_))
+            ),
             "limit {limit} must be rejected"
         );
     }
     for limit in [1, MAX_BUFFER_LIMIT] {
-        let bound = BufferBound::for_stream::<ContractDetails>(Some(limit)).unwrap().unwrap();
+        let bound = BufferBound::for_stream::<ContractDetails>(Some(limit), &DecoderContext::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(bound.limit, limit);
         assert_eq!(bound.end, &[IncomingMessages::ContractDataEnd]);
     }
-    let bound = BufferBound::for_stream::<OptionChain>(Some(8)).unwrap().unwrap();
+    let bound = BufferBound::for_stream::<OptionChain>(Some(8), &DecoderContext::default())
+        .unwrap()
+        .unwrap();
     assert_eq!(bound.end, &[IncomingMessages::SecurityDefinitionOptionParameterEnd]);
     // `HistoricalDataEnd` is a data item on this stream, not an end marker.
-    let bound = BufferBound::for_stream::<HistoricalDataFrame>(Some(8)).unwrap().unwrap();
+    let bound = BufferBound::for_stream::<HistoricalDataFrame>(Some(8), &DecoderContext::default())
+        .unwrap()
+        .unwrap();
     assert!(bound.end.is_empty());
 }
 
@@ -78,16 +90,57 @@ fn response(kind: crate::messages::IncomingMessages) -> RoutedItem {
 fn admit_without_an_end_marker_closes_only_on_error_or_overflow() {
     use crate::messages::IncomingMessages::{HistoricalData, HistoricalDataEnd};
 
-    let state = BoundState::new(BufferBound { limit: 2, end: &[] });
+    let state = BoundState::new(BufferBound {
+        limit: 2,
+        end: &[],
+        continues: |_, _| false,
+        context: crate::subscriptions::DecoderContext::default(),
+    });
     assert_eq!(state.admit(&response(HistoricalData), 0), Admit::Deliver);
     assert_eq!(state.admit(&response(HistoricalDataEnd), 1), Admit::Deliver);
     assert!(!state.closed(), "no response is terminal without an end marker");
     assert_eq!(state.admit(&response(HistoricalData), 2), Admit::Overflow);
     assert_eq!(state.admit(&response(HistoricalData), 0), Admit::Discard);
 
-    let state = BoundState::new(BufferBound { limit: 2, end: &[] });
+    let state = BoundState::new(BufferBound {
+        limit: 2,
+        end: &[],
+        continues: |_, _| false,
+        context: crate::subscriptions::DecoderContext::default(),
+    });
     assert_eq!(state.admit(&Error::ConnectionReset.into(), 0), Admit::Deliver);
     assert!(state.closed(), "an error is terminal");
+}
+
+/// An error the decoder continues after (10299 on historical bars) is queued like data:
+/// the route stays open, and past the cap it overflows. Any other error still closes it.
+#[test]
+fn admit_keeps_the_route_open_after_an_error_the_decoder_continues() {
+    use crate::market_data::historical::HistoricalDataFrame;
+    use crate::messages::IncomingMessages::HistoricalData;
+    use crate::messages::Notice;
+    use crate::subscriptions::DecoderContext;
+
+    let error = |code| RoutedItem::Error(Error::Notice(Notice::synthesized(code, String::new())));
+    let bound = || {
+        BufferBound::for_stream::<HistoricalDataFrame>(Some(2), &DecoderContext::default())
+            .unwrap()
+            .unwrap()
+    };
+
+    let state = BoundState::new(bound());
+    assert_eq!(state.admit(&error(10299), 0), Admit::Deliver);
+    assert!(!state.closed(), "10299 does not end a historical request");
+    assert_eq!(state.admit(&response(HistoricalData), 1), Admit::Deliver);
+    assert_eq!(state.admit(&error(162), 2), Admit::Deliver);
+    assert!(state.closed(), "162 does");
+
+    let state = BoundState::new(bound());
+    assert_eq!(
+        state.admit(&error(10299), 2),
+        Admit::Overflow,
+        "a continuing error counts against the cap"
+    );
 }
 
 #[test]
@@ -98,10 +151,92 @@ fn admit_closes_on_any_of_several_end_markers() {
         let state = BoundState::new(BufferBound {
             limit: 1,
             end: &[OpenOrderEnd, CompletedOrdersEnd],
+            continues: |_, _| false,
+            context: crate::subscriptions::DecoderContext::default(),
         });
         assert_eq!(state.admit(&response(OpenOrder), 0), Admit::Deliver);
         // At the cap, an end marker still gets through.
         assert_eq!(state.admit(&response(end), 1), Admit::Deliver);
         assert!(state.closed(), "{end:?} is terminal");
+    }
+}
+
+/// Requests sharing an end marker share one count, an end marker with
+/// nothing outstanding (the `OpenOrderEnd` TWS sends at connect) is ignored,
+/// and a skip passes over every frame up to and including its last end marker.
+#[test]
+fn unanswered_replies_count_by_end_marker() {
+    use crate::messages::IncomingMessages as M;
+    let mut unanswered = UnansweredReplies::default();
+
+    unanswered.answered(M::OpenOrderEnd);
+    assert!(!unanswered.add(OutgoingMessages::RequestOpenOrders).skips(M::OpenOrder));
+    assert!(
+        !unanswered.add(OutgoingMessages::RequestCurrentTime).skips(M::CurrentTime),
+        "one-shots never skip"
+    );
+
+    let mut all = unanswered.add(OutgoingMessages::RequestAllOpenOrders);
+    let mut completed = unanswered.add(OutgoingMessages::RequestCompletedOrders);
+    assert_eq!(unanswered.pending(M::OpenOrderEnd), 2);
+    assert!(!completed.skips(M::CompletedOrder), "another end marker's requests counted");
+
+    for frame in [M::OpenOrder, M::OrderStatus, M::OpenOrderEnd] {
+        assert!(all.skips(frame), "{frame:?} of the earlier reply delivered");
+    }
+    assert!(!all.skips(M::OpenOrder), "own reply skipped");
+
+    unanswered.answered(M::OpenOrderEnd);
+    unanswered.answered(M::OpenOrderEnd);
+    unanswered.answered(M::OpenOrderEnd);
+    assert_eq!(unanswered.pending(M::OpenOrderEnd), 0);
+
+    unanswered.add(OutgoingMessages::RequestPositions);
+    unanswered.withdraw(OutgoingMessages::RequestPositions);
+    assert_eq!(unanswered.pending(M::PositionEnd), 0, "a withdrawn request still counted");
+
+    unanswered.add(OutgoingMessages::RequestPositions);
+    unanswered.add(OutgoingMessages::RequestPositions);
+    unanswered.cancelled(OutgoingMessages::RequestPositions);
+    assert_eq!(unanswered.pending(M::PositionEnd), 0, "a cancel kept a count");
+    unanswered.add(OutgoingMessages::RequestAccountData);
+    assert_eq!(unanswered.pending(M::AccountDownloadEnd), 1, "account updates are counted");
+
+    unanswered.add(OutgoingMessages::RequestOpenOrders);
+    unanswered.clear();
+    assert_eq!(unanswered.pending(M::OpenOrderEnd), 0, "clear kept a count");
+}
+
+pub(super) fn account_update_dump(value: &str) -> [Vec<u8>; 2] {
+    use crate::common::test_utils::helpers::binary_proto;
+    use crate::messages::IncomingMessages as M;
+
+    [
+        binary_proto(
+            M::AccountValue as i32,
+            &crate::proto::AccountValue {
+                key: Some("NetLiquidation".to_string()),
+                value: Some(value.to_string()),
+                currency: Some("USD".to_string()),
+                account_name: Some("DU1".to_string()),
+            },
+        ),
+        binary_proto(
+            M::AccountDownloadEnd as i32,
+            &crate::proto::AccountDataEnd {
+                account_name: Some("DU1".to_string()),
+            },
+        ),
+    ]
+}
+
+pub(super) fn account_update_value(item: crate::subscriptions::SubscriptionItem<crate::accounts::AccountUpdate>) -> Option<String> {
+    use crate::accounts::AccountUpdate;
+    use crate::subscriptions::SubscriptionItem;
+
+    match item {
+        SubscriptionItem::Data(AccountUpdate::AccountValue(value)) => Some(value.value),
+        SubscriptionItem::Data(AccountUpdate::End) => None,
+        other => panic!("unexpected account update {other:?}"),
     }
 }

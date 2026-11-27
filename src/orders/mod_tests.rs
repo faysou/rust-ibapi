@@ -25,6 +25,7 @@ const ALL_TIFS: &[(TimeInForce, &str)] = &[
     (TimeInForce::DayTillCanceled, "DTC"),
     (TimeInForce::Auction, "AUC"),
     (TimeInForce::GoodTillCrossing, "GTX"),
+    (TimeInForce::Minutes, "Minutes"),
 ];
 
 #[test]
@@ -375,6 +376,7 @@ fn all_tifs_covers_every_variant() {
             TimeInForce::DayTillCanceled => Some(6),
             TimeInForce::Auction => Some(7),
             TimeInForce::GoodTillCrossing => Some(8),
+            TimeInForce::Minutes => Some(9),
             // Unknown carries a raw string, so it has no place in a table of
             // modeled wire values; `time_in_force_preserves_unknown_wire_value`
             // covers it.
@@ -382,7 +384,7 @@ fn all_tifs_covers_every_variant() {
         }
     }
 
-    let mut seen = [false; 9];
+    let mut seen = [false; 10];
     for (variant, _) in ALL_TIFS {
         if let Some(index) = modeled_index(variant) {
             seen[index] = true;
@@ -516,6 +518,94 @@ fn order_type_serde_round_trips_as_plain_string() {
     assert!(serde_json::from_str::<OrderType>("\"\"").is_err());
 }
 
+/// Decode an open-order echo with the trailing fields TWS sent in the live probe
+/// (`docs/wire-facts/orders.md#trailing-order-echo`).
+fn decoded_echo(order_type: &str, aux: Option<f64>, percent: Option<f64>, stop: Option<f64>, offset: Option<f64>, limit: Option<f64>) -> Order {
+    use crate::testdata::builders::orders::open_order;
+    use crate::testdata::builders::ResponseProtoEncoder;
+
+    let mut proto = open_order().to_proto();
+    let order = proto.order.as_mut().unwrap();
+    order.order_type = Some(order_type.to_string());
+    order.aux_price = aux;
+    order.trailing_percent = percent;
+    order.trail_stop_price = stop;
+    order.lmt_price_offset = offset;
+    order.lmt_price = limit;
+    crate::orders::common::decoders::decode_open_order_proto(proto).unwrap().order
+}
+
+#[test]
+fn trailing_reads_back_a_decoded_echo() {
+    let cases = [
+        (
+            "TRAIL by amount",
+            decoded_echo("TRAIL", Some(0.3), None, Some(0.79045), None, Some(0.0)),
+            Some(Trailing {
+                trail: builder::TrailBy::Amount(0.3),
+                stop_price: Some(0.79045),
+                limit_offset: None,
+            }),
+        ),
+        (
+            "TRAIL by percent, limit price echoed",
+            decoded_echo("TRAIL", None, Some(20.0), Some(0.7), None, Some(1.09047)),
+            Some(Trailing {
+                trail: builder::TrailBy::Percent(20.0),
+                stop_price: Some(0.7),
+                limit_offset: None,
+            }),
+        ),
+        (
+            "TRAIL LIMIT by amount",
+            decoded_echo("TRAIL LIMIT", Some(0.3), None, Some(0.7), Some(0.007), Some(0.0)),
+            Some(Trailing {
+                trail: builder::TrailBy::Amount(0.3),
+                stop_price: Some(0.7),
+                limit_offset: Some(0.007),
+            }),
+        ),
+        ("TRAIL with no trail", decoded_echo("TRAIL", None, None, Some(0.7), None, None), None),
+        (
+            "LMT echoing a trail stop price",
+            decoded_echo("LMT", Some(0.0), None, Some(2.0), None, Some(1.0)),
+            None,
+        ),
+    ];
+    for (label, order, expected) in cases {
+        assert_eq!(order.trailing(), expected, "{label}");
+    }
+}
+
+#[test]
+fn trailing_inverts_the_builder() {
+    use builder::TrailBy;
+
+    for trail in [TrailBy::Amount(2.0), TrailBy::Percent(1.5)] {
+        let stop = Order::builder().sell(100).trailing_stop(trail, 148.0).build().unwrap();
+        let stop_limit = Order::builder().sell(100).trailing_stop_limit(trail, 148.0, 0.5).build().unwrap();
+
+        assert_eq!(
+            stop.trailing(),
+            Some(Trailing {
+                trail,
+                stop_price: Some(148.0),
+                limit_offset: None
+            }),
+            "{trail:?}"
+        );
+        assert_eq!(
+            stop_limit.trailing(),
+            Some(Trailing {
+                trail,
+                stop_price: Some(148.0),
+                limit_offset: Some(0.5)
+            }),
+            "{trail:?}"
+        );
+    }
+}
+
 #[test]
 fn order_type_fields_serde_unset_is_null_and_reads_legacy_strings() {
     // An unset order-type field serializes as null. 5.x JSON holds "" for an unset
@@ -538,4 +628,96 @@ fn order_type_fields_serde_unset_is_null_and_reads_legacy_strings() {
     let order: Order = serde_json::from_str(&set).unwrap();
     assert_eq!(order.order_type, Some(OrderType::StopLimit));
     assert_eq!(order.adjusted_order_type, Some(OrderType::TrailingStop));
+}
+
+/// Completed-order frames as TWS sends them (`docs/wire-facts/orders.md`): `totalQuantity`
+/// is the unfilled quantity, so it is `remaining` as is.
+#[test]
+fn completed_order_status_of_a_decoded_record() {
+    use crate::orders::common::decoders::decode_completed_order_proto;
+
+    let cases = [
+        ("filled", "Filled", "0", "1000", OrderStatusKind::Filled, 1000.0, 0.0),
+        (
+            "cancelled after a partial fill",
+            "Cancelled",
+            "400",
+            "600",
+            OrderStatusKind::Cancelled,
+            600.0,
+            400.0,
+        ),
+    ];
+    for (name, status, total, filled_quantity, kind, filled, remaining) in cases {
+        let frame = crate::proto::CompletedOrder {
+            contract: Some(crate::proto::Contract {
+                con_id: Some(41329),
+                symbol: Some("EWN".into()),
+                sec_type: Some("STK".into()),
+                ..Default::default()
+            }),
+            order: Some(crate::proto::Order {
+                client_id: Some(7),
+                order_id: Some(13),
+                perm_id: Some(913),
+                parent_id: Some(3),
+                action: Some("BUY".into()),
+                total_quantity: Some(total.into()),
+                filled_quantity: Some(filled_quantity.into()),
+                order_type: Some("LMT".into()),
+                ..Default::default()
+            }),
+            order_state: Some(crate::proto::OrderState {
+                status: Some(status.into()),
+                ..Default::default()
+            }),
+        };
+
+        let data = decode_completed_order_proto(frame).unwrap();
+
+        let expected = OrderStatus {
+            order_id: 13,
+            status: kind,
+            filled,
+            remaining,
+            average_fill_price: None,
+            perm_id: 913,
+            parent_id: 3,
+            last_fill_price: None,
+            client_id: 7,
+            why_held: String::new(),
+            market_cap_price: None,
+        };
+        assert_eq!(data.order.order_id, 13, "{name}: order_id");
+        assert_eq!(data.completed_order_status(), expected, "{name}");
+    }
+}
+
+#[test]
+fn utc_time_accessors_parse_only_the_utc_rendering() {
+    use time::macros::datetime;
+
+    let instant = Some(datetime!(2026-11-11 02:17:28 UTC));
+    let cases = [
+        ("20261111-02:17:28Z", instant),
+        ("20261111-02:17:28", instant),
+        ("20261110 20:17:28 US/Central", None),
+        ("20261111 02:17:28 Europe/London", None),
+        ("20261111-02:17:28 UTC", None),
+        ("20261311-02:17:28Z", None),
+        ("", None),
+    ];
+
+    for (text, expected) in cases {
+        let execution = Execution {
+            time: text.to_string(),
+            ..Execution::default()
+        };
+        let state = OrderState {
+            completed_time: text.to_string(),
+            ..OrderState::default()
+        };
+        assert_eq!(execution.time_utc(), expected, "Execution::time {text:?}");
+        assert_eq!(state.completed_time_utc(), expected, "OrderState::completed_time {text:?}");
+    }
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::client::ids::RequestId;
+use crate::client::ids::{OrderId, RequestId};
 use crate::transport::common::Lease;
 use crate::transport::BufferBound;
 
@@ -41,6 +41,8 @@ fn fail_all_skips_a_closed_bounded_route() {
     let bound = BufferBound {
         limit: 1,
         end: &[IncomingMessages::ContractDataEnd],
+        continues: |_, _| false,
+        context: crate::subscriptions::DecoderContext::default(),
     };
     let lease = Lease::new();
     let route = Route::bounded(sender, lease.downgrade(), bound, Arc::new(AtomicUsize::new(0)));
@@ -58,6 +60,104 @@ fn deliver_hands_the_item_back_when_unrouted() {
     let routes = SenderHash::<RequestId>::new();
     let item = routes.deliver(&RequestId::nth(1), RoutedItem::Error(Error::Cancelled));
     assert!(matches!(item, Err(RoutedItem::Error(Error::Cancelled))));
+}
+
+/// Two subscriptions under one key both receive each item; registering a
+/// lease again replaces its route instead of adding a second.
+#[test]
+fn insert_keeps_other_leases_and_replaces_the_same_lease() {
+    let routes = SenderHash::new();
+    let (first, mut first_receiver, _first_lease) = route();
+    let (second, mut second_receiver, second_lease) = route();
+    let (sender, mut second_again_receiver) = broadcast::channel(8);
+    routes.insert(OrderId::from(7), first);
+    routes.insert(OrderId::from(7), second);
+    routes.insert(OrderId::from(7), Route::unbounded(sender, second_lease.downgrade()));
+
+    routes.deliver(&OrderId::from(7), RoutedItem::Error(Error::Cancelled)).unwrap();
+
+    let counts = [
+        items(&mut first_receiver).len(),
+        items(&mut second_receiver).len(),
+        items(&mut second_again_receiver).len(),
+    ];
+    assert_eq!(counts, [1, 0, 1]);
+}
+
+/// A route stays superseded once a later route under its key is removed: an
+/// error frame reaches it as a notice, and a lone route still gets the error.
+#[test]
+fn superseded_route_gets_errors_as_notices_after_the_newer_route_goes() {
+    let routes = SenderHash::new();
+    let (first, mut first_receiver, _first_lease) = route();
+    let (second, _second_receiver, second_lease) = route();
+    let (lone, mut lone_receiver, _lone_lease) = route();
+    routes.insert(OrderId::from(7), first);
+    routes.insert(OrderId::from(7), second);
+    routes.supersede_earlier(&OrderId::from(7), &second_lease.downgrade());
+    routes.remove_if_same(OrderId::from(7), &second_lease.downgrade());
+    routes.insert(OrderId::from(8), lone);
+    let refusal = || RoutedItem::Error(Error::Notice(crate::Notice::synthesized(10148, "can not be cancelled".into())));
+
+    routes.deliver(&OrderId::from(7), refusal()).unwrap();
+    routes.deliver(&OrderId::from(8), refusal()).unwrap();
+
+    let first_items = items(&mut first_receiver);
+    let lone_items = items(&mut lone_receiver);
+    assert!(
+        matches!(first_items.as_slice(), [RoutedItem::Notice(n)] if n.code == 10148),
+        "{first_items:?}"
+    );
+    assert!(
+        matches!(lone_items.as_slice(), [RoutedItem::Error(Error::Notice(n))] if n.code == 10148),
+        "{lone_items:?}"
+    );
+}
+
+/// `supersede_earlier` marks only the routes registered before the given
+/// lease: a route registered after it, whose request is still being written,
+/// keeps getting errors once the given route goes.
+#[test]
+fn supersede_earlier_spares_routes_registered_after_the_lease() {
+    let routes = SenderHash::new();
+    let (first, mut first_receiver, _first_lease) = route();
+    let (second, _second_receiver, second_lease) = route();
+    let (third, mut third_receiver, _third_lease) = route();
+    routes.insert(OrderId::from(7), first);
+    routes.insert(OrderId::from(7), second);
+    routes.insert(OrderId::from(7), third);
+    routes.supersede_earlier(&OrderId::from(7), &second_lease.downgrade());
+    routes.remove_if_same(OrderId::from(7), &second_lease.downgrade());
+    let refusal = RoutedItem::Error(Error::Notice(crate::Notice::synthesized(105, "does not match".into())));
+
+    routes.deliver(&OrderId::from(7), refusal).unwrap();
+
+    let first_items = items(&mut first_receiver);
+    let third_items = items(&mut third_receiver);
+    assert!(
+        matches!(first_items.as_slice(), [RoutedItem::Notice(n)] if n.code == 105),
+        "{first_items:?}"
+    );
+    assert!(
+        matches!(third_items.as_slice(), [RoutedItem::Error(Error::Notice(n))] if n.code == 105),
+        "{third_items:?}"
+    );
+}
+
+/// Removing one subscription's route leaves the others under the key.
+#[test]
+fn remove_if_same_keeps_the_other_routes_under_the_key() {
+    let routes = SenderHash::new();
+    let (first, _first_receiver, first_lease) = route();
+    let (second, mut second_receiver, _second_lease) = route();
+    routes.insert(OrderId::from(7), first);
+    routes.insert(OrderId::from(7), second);
+
+    routes.remove_if_same(OrderId::from(7), &first_lease.downgrade());
+    routes.deliver(&OrderId::from(7), RoutedItem::Error(Error::Cancelled)).unwrap();
+
+    assert_eq!(items(&mut second_receiver).len(), 1);
+    assert_eq!(routes.len(), 1);
 }
 
 #[test]
@@ -172,7 +272,11 @@ fn prune_dead_drops_only_dead_routes() {
 }
 
 async fn subscribe(channels: &SharedChannels, request: OutgoingMessages) -> broadcast::Receiver<RoutedItem> {
-    channels.subscribe(request, None, || async { Ok(()) }).await.unwrap().0
+    channels
+        .subscribe(request, None, None, &AtomicBool::new(false), |_| async { Ok(()) })
+        .await
+        .unwrap()
+        .0
 }
 
 #[tokio::test]
@@ -191,7 +295,9 @@ async fn fail_one_shot_channels_spares_streaming_channels() {
 async fn subscribe_counts_only_a_written_request() {
     let channels = SharedChannels::new(|_| 8);
     let failed = channels
-        .subscribe(OutgoingMessages::RequestPositions, None, || async { Err(Error::ConnectionReset) })
+        .subscribe(OutgoingMessages::RequestPositions, None, None, &AtomicBool::new(false), |_| async {
+            Err(Error::ConnectionReset)
+        })
         .await;
     assert!(matches!(failed, Err(Error::ConnectionReset)));
     assert_eq!(channels.live(OutgoingMessages::RequestPositions).await, 0);
@@ -209,7 +315,11 @@ async fn close_fails_then_ends_every_channel() {
 
     assert!(matches!(positions.try_recv(), Ok(RoutedItem::Error(Error::Shutdown))));
     assert!(matches!(positions.try_recv(), Err(broadcast::error::TryRecvError::Closed)));
-    let refused = channels.subscribe(OutgoingMessages::RequestPositions, None, || async { Ok(()) }).await;
+    let refused = channels
+        .subscribe(OutgoingMessages::RequestPositions, None, None, &AtomicBool::new(false), |_| async {
+            Ok(())
+        })
+        .await;
     assert!(matches!(refused, Err(Error::InvalidArgument(_))));
 }
 
@@ -228,4 +338,21 @@ async fn shared_channels_take_per_type_capacity_lazily() {
 
     assert_eq!(items(&mut completed).len(), 2, "capacity-4 channel lost an item");
     assert!(matches!(positions.try_recv(), Err(broadcast::error::TryRecvError::Lagged(1))));
+}
+
+/// A caller's future dropped while its request write is pending (a `timeout`
+/// around `open_orders()` with the writer busy) withdraws the count, so later
+/// requests do not pass over a reply that will never come.
+#[tokio::test]
+async fn subscribe_dropped_during_its_write_withdraws_the_count() {
+    let channels = SharedChannels::new(|_| 16);
+
+    let started = AtomicBool::new(false);
+    let pending = channels.subscribe(OutgoingMessages::RequestOpenOrders, None, None, &started, |_| {
+        std::future::pending::<Result<(), Error>>()
+    });
+    let timed_out = tokio::time::timeout(std::time::Duration::from_millis(10), pending).await.is_err();
+
+    assert!(timed_out, "the write never completes");
+    assert_eq!(channels.unanswered(IncomingMessages::OpenOrderEnd), 0);
 }

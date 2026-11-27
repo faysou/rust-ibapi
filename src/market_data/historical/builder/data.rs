@@ -2,11 +2,14 @@ use time::OffsetDateTime;
 
 use crate::client::ids::RequestId;
 use crate::contracts::Contract;
-use crate::market_data::historical::{BarRequest, BarSize, Duration, HistoricalData, HistoricalDataFrame, WhatToShow};
+use crate::market_data::historical::{
+    Bar, BarRequest, BarSize, BarTimestamp, BarsBetweenError, Duration, HistoricalData, HistoricalDataFrame, WhatToShow,
+};
 use crate::market_data::TradingHours;
+use crate::messages::HMDS_ERROR_CODE;
 use crate::Error;
 
-use super::date_spec::{Between, DateSpec, DurationEnding, DurationOnly, EndingOnly, Resolved};
+use super::date_spec::{covering_duration, max_request_span, Between, DateSpec, DurationEnding, DurationOnly, EndingOnly, Resolved};
 use crate::builder::Missing;
 
 #[cfg(test)]
@@ -78,9 +81,14 @@ impl<'a, C> HistoricalDataBuilder<'a, C> {
     /// for one the request has no end date and covers `[start, now)`; the bars after `end` are
     /// then dropped. Such a range must start before now. The request size grows with
     /// `now - start`, not `end - start`: a short range far in the past fetches every bar since
-    /// `start`. TWS still applies its bar-size step limit (error 162), and a large request is
-    /// slow: a month of 1-minute ES bars took over a minute (live: 2026-11-22). Use
-    /// [`duration`](Self::duration) alone for one, or a larger bar size.
+    /// `start`. A continuous future's one-second request cannot be split, so a start more than
+    /// 2000 seconds before now returns [`Error::InvalidArgument`] without sending.
+    ///
+    /// For other contracts, `fetch` splits a range of one-second bars over 2000 seconds into
+    /// requests of up to 2000 seconds each. `subscribe` sends a single request and rejects
+    /// a range that needs splitting. Other bar sizes are never split. TWS still applies its
+    /// bar-size step limit (error 162), and a large request is slow: a month of 1-minute ES
+    /// bars took over a minute (live: 2026-11-22).
     ///
     /// The range is complete: `between` takes no `duration` or `ending`.
     ///
@@ -270,8 +278,151 @@ impl<C, D: DateSpec> HistoricalDataBuilder<'_, C, D> {
                 "historical_data().fetch(): buffer_limit applies to .subscribe() and .subscribe_with_updates() only".to_owned(),
             ));
         }
-        self.dates.resolve(self.contract)
+        self.dates.resolve(self.contract, self.bar_size)
     }
+
+    fn bar_pages(&self, resolved: &Resolved) -> Option<BarPages> {
+        let (start, end) = resolved.range?;
+        // Continuous futures have no wire end date and cannot use the pager.
+        resolved.end_date?;
+        let limit = max_request_span(self.bar_size).filter(|limit| end - start > *limit)?;
+        Some(BarPages::new(start, end, limit))
+    }
+
+    fn bar_pages_for_fetch(&self, resolved: &Resolved) -> Result<Option<BarPages>, Error> {
+        let Some(pages) = self.bar_pages(resolved) else {
+            return Ok(None);
+        };
+        let max_span = pages.limit * SPLIT_MAX_REQUESTS as i32;
+        if pages.end - pages.start > max_span {
+            return Err(Error::InvalidArgument(format!(
+                "historical_data().fetch(): a .between(..) range of {} bars over {} S needs more than {SPLIT_MAX_REQUESTS} requests of {} S; split it",
+                self.bar_size,
+                max_span.whole_seconds(),
+                pages.limit.whole_seconds()
+            )));
+        }
+        Ok(Some(pages))
+    }
+
+    fn resolve_for_subscribe(&self) -> Result<Resolved, Error> {
+        let resolved = self.dates.resolve(self.contract, self.bar_size)?;
+        if let Some(pages) = self.bar_pages(&resolved) {
+            return Err(Error::InvalidArgument(format!(
+                "historical_data().subscribe(): TWS serves at most {} S of {} bars per request (error 162); .fetch() splits a longer .between(..) range",
+                pages.limit.whole_seconds(),
+                self.bar_size
+            )));
+        }
+        Ok(resolved)
+    }
+}
+
+/// The most requests `fetch` splits a range into: half of IB's pacing limit of 60 requests for
+/// bars of 30 seconds or less in any ten minutes, which other requests on the account share.
+const SPLIT_MAX_REQUESTS: i64 = 30;
+/// The least time between the starts of two split requests. IB's pacing rules refuse six or more
+/// requests for the same contract and `whatToShow` within two seconds.
+const SPLIT_REQUEST_SPACING: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The requests of a [`between`](HistoricalDataBuilder::between) range that `fetch` splits to
+/// stay within TWS's request limit, sent from `end` backward, and the bars they returned.
+///
+/// TWS counts a duration in trading time back from the end date and serves the bars before it:
+/// a request ending at 09:40 on a Monday also returns the previous Friday's last bars. So each
+/// request ends at the earliest bar the one before returned, which neither skips nor repeats a
+/// bar, or one limit before its own end in wall-clock time if that is earlier: a duration in
+/// trading time covers at least as much wall-clock time, so the bars in between, if any, came
+/// back already. Each request so moves back at least one limit, and a range of `n` limits takes
+/// at most `n` requests. The requests stop once one covers `start`.
+struct BarPages {
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+    limit: time::Duration,
+    /// The end of the next request; `None` once the requests reach `start`.
+    request_end: Option<OffsetDateTime>,
+    pages: Vec<Vec<Bar>>,
+}
+
+impl BarPages {
+    fn new(start: OffsetDateTime, end: OffsetDateTime, limit: time::Duration) -> Self {
+        Self {
+            start,
+            end,
+            limit,
+            request_end: Some(end),
+            pages: Vec::new(),
+        }
+    }
+
+    /// The end date and duration of the next request, or `None` once the requests reach `start`.
+    fn next_request(&self) -> Option<(OffsetDateTime, Duration)> {
+        let end = self.request_end?;
+        Some((end, covering_duration((end - self.start).min(self.limit))))
+    }
+
+    fn with_response(mut self, result: Result<HistoricalData, Error>) -> Result<Self, Error> {
+        const NO_DATA_PREFIX: &str = "Historical Market Data Service error message:HMDS query returned no data: ";
+
+        let bars = match result {
+            Ok(data) => data.bars,
+            Err(Error::Notice(notice)) if notice.code == HMDS_ERROR_CODE && notice.message.starts_with(NO_DATA_PREFIX) => Vec::new(),
+            Err(e) => return Err(self.fail(e)),
+        };
+        self.push(bars);
+        Ok(self)
+    }
+
+    /// Adds the bars the request from [`next_request`](Self::next_request) returned. Bars at or
+    /// after its end belong to the request before and are dropped.
+    fn push(&mut self, bars: Vec<Bar>) {
+        let Some(request_end) = self.request_end else {
+            return;
+        };
+        let before = BarTimestamp::from(request_end);
+        let bars: Vec<Bar> = bars.into_iter().filter(|bar| bar.date < before).collect();
+        let next_end = match bars.iter().map(|bar| bar.date).min() {
+            Some(BarTimestamp::DateTime(earliest)) => earliest,
+            Some(BarTimestamp::Date(earliest)) => earliest.midnight().assume_utc(),
+            None => request_end,
+        }
+        .min(request_end - self.limit);
+        let covered_start = request_end - self.start <= self.limit || next_end <= self.start;
+        self.request_end = (!covered_start).then_some(next_end);
+        self.pages.push(bars);
+    }
+
+    /// The bars in `[start, end)`, oldest first.
+    fn finish(self) -> HistoricalData {
+        let (start, end) = (self.start, self.end);
+        self.fetched(start).trim_to(start, end)
+    }
+
+    /// The error a failed request returns: as it is for the first request, and as
+    /// [`Error::BarsBetween`] with the bars fetched before it for a later one.
+    fn fail(self, error: Error) -> Error {
+        match (self.pages.is_empty(), self.request_end) {
+            (false, Some(from)) => {
+                let end = self.end;
+                let fetched = self.fetched(from).trim_to(from, end);
+                Error::BarsBetween(Box::new(BarsBetweenError { error, fetched }))
+            }
+            _ => error,
+        }
+    }
+
+    fn fetched(self, start: OffsetDateTime) -> HistoricalData {
+        HistoricalData {
+            start,
+            end: self.end,
+            bars: self.pages.into_iter().rev().flatten().collect(),
+        }
+    }
+}
+
+/// How long to wait before the next split request, `elapsed` after the previous one started.
+fn split_request_wait(elapsed: std::time::Duration) -> std::time::Duration {
+    SPLIT_REQUEST_SPACING.saturating_sub(elapsed)
 }
 
 /// Drop bars outside `[start, end)` when the request came from [`between`](HistoricalDataBuilder::between).
@@ -288,6 +439,11 @@ impl<'a, D: DateSpec> HistoricalDataBuilder<'a, crate::client::sync::Client, D> 
     ///
     /// Succeeds only after TWS sends its end marker; an empty result with the marker is valid.
     ///
+    /// For a `between` range over 2000 seconds of one-second bars, this fetches up to
+    /// 30 pages of at most 2000 seconds, with at least 0.5 seconds between requests. Each
+    /// page has its own one-shot timeout. Empty HMDS no-data replies count as empty pages.
+    /// A later request failure returns [`Error::BarsBetween`] with the part already covered.
+    ///
     /// # Errors
     /// - [`Error::InvalidArgument`] for a range the client rejects before sending (see [`between`](HistoricalDataBuilder::between)
     ///   and [`ending`](HistoricalDataBuilder::ending)), or if
@@ -298,6 +454,12 @@ impl<'a, D: DateSpec> HistoricalDataBuilder<'a, crate::client::sync::Client, D> 
     /// - [`Error::UnexpectedResponse`] if the bars and the end marker arrive out of order.
     /// - [`Error::Timeout`] if the end marker hasn't arrived within the client's
     ///   [`one_shot_timeout`](crate::client::blocking::ClientBuilder::one_shot_timeout).
+    ///
+    /// After error 10299 TWS goes on with the series the error names, and this returns that
+    /// series' bars with nothing to show the substitution: AGGTRADES bars for crypto `TRADES`,
+    /// TRADES bars for `AGGTRADES` on a stock or future (`docs/wire-facts/market-data.md#10299-whattoshow-substitution`). Request
+    /// [`WhatToShow::AggTrades`] for crypto and [`WhatToShow::Trades`] otherwise to get the
+    /// series you name; [`WhatToShow::trades_for`] picks it.
     ///
     /// Without a `one_shot_timeout`, waits without a time limit. Any error
     /// before the end marker cancels the request at TWS.
@@ -341,8 +503,26 @@ impl<'a, D: DateSpec> HistoricalDataBuilder<'a, crate::client::sync::Client, D> 
     /// ```
     pub fn fetch(self) -> Result<HistoricalData, Error> {
         let resolved = self.resolve_for_fetch()?;
-        let request = self.bar_request(resolved.end_date, resolved.duration);
-        let data = crate::market_data::historical::sync::historical_data(self.client, request, self.request_id)?;
+        if let Some(mut pages) = self.bar_pages_for_fetch(&resolved)? {
+            let mut first_id = Some(self.request_id);
+            let mut last_sent: Option<std::time::Instant> = None;
+            while let Some((end_date, duration)) = pages.next_request() {
+                if let Some(sent) = last_sent {
+                    std::thread::sleep(split_request_wait(sent.elapsed()));
+                }
+                last_sent = Some(std::time::Instant::now());
+                let request_id = first_id.take().unwrap_or_else(|| self.client.mint_request_id());
+                let result =
+                    crate::market_data::historical::sync::historical_data(self.client, self.bar_request(Some(end_date), duration), request_id);
+                pages = pages.with_response(result)?;
+            }
+            return Ok(pages.finish());
+        }
+        let data = crate::market_data::historical::sync::historical_data(
+            self.client,
+            self.bar_request(resolved.end_date, resolved.duration),
+            self.request_id,
+        )?;
         Ok(trim_to_range(data, resolved.range))
     }
 
@@ -361,12 +541,19 @@ impl<'a, D: DateSpec> HistoricalDataBuilder<'a, crate::client::sync::Client, D> 
     /// window and call [`trim_to`](HistoricalData::trim_to).
     ///
     /// Dropping the subscription before `End` sends `cancelHistoricalData`. To
-    /// know when TWS is done with the request, use `cancel_and_drain`. Any TWS
+    /// know when TWS is done with the request, use `cancel_and_drain`. Except 10299, a TWS
     /// error ends a historical request, so after one it returns `Rejected`
     /// without writing a cancel. Observed live (server 226), TWS answers a
     /// cancel of a request still running with error 162 ("API historical data
     /// query cancelled"), so `cancel_and_drain` returns `Rejected` with code
     /// 162: the request is over at TWS.
+    ///
+    /// Error 10299, TWS substituting AGGTRADES for crypto `TRADES` or TRADES for `AGGTRADES` on a
+    /// stock or future, does not end the request: the subscription yields it as a
+    /// [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem::Notice), then the
+    /// substituted series' bars (`docs/wire-facts/market-data.md#10299-whattoshow-substitution`). The notice still classifies as an error
+    /// ([`Notice::is_error`](crate::Notice::is_error) is `true`), so match code 10299 before
+    /// stopping on an error notice, or the bars that follow are never read.
     ///
     /// # Errors
     /// [`Error::InvalidArgument`], with nothing sent, for a range the client rejects before sending (see
@@ -424,7 +611,7 @@ impl<'a, D: DateSpec> HistoricalDataBuilder<'a, crate::client::sync::Client, D> 
     /// }
     /// ```
     pub fn subscribe(self) -> Result<crate::subscriptions::sync::Subscription<HistoricalDataFrame>, Error> {
-        let resolved = self.dates.resolve(self.contract)?;
+        let resolved = self.resolve_for_subscribe()?;
         crate::market_data::historical::sync::historical_data_subscription(
             self.client,
             self.bar_request(resolved.end_date, resolved.duration),
@@ -444,6 +631,21 @@ impl HistoricalDataBuilder<'_, crate::client::sync::Client, DurationOnly> {
     /// `end_date = None` for streaming, so a builder with
     /// [`ending`](HistoricalDataBuilder::ending) or [`between`](HistoricalDataBuilder::between)
     /// has no `subscribe_with_updates`.
+    ///
+    /// For crypto, stream `TRADES`. TWS answers it with error 10299 and streams the AGGTRADES
+    /// series anyway; the subscription yields the 10299 as a
+    /// [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem::Notice), then the bars
+    /// and updates. The notice still classifies as an error
+    /// ([`Notice::is_error`](crate::Notice::is_error) is `true`), so match code 10299 before
+    /// stopping on an error notice, or the bars that follow are never read. `AGGTRADES` with live
+    /// updates draws 321 ("Source price not supported with live updates"), which ends the
+    /// subscription: on crypto with no 10299 first, and on a stock, future or forex pair after a
+    /// 10299 (`docs/wire-facts/market-data.md#10299-whattoshow-substitution`).
+    ///
+    /// Dropping the subscription as soon as the 10299 arrives can leave the request running at
+    /// TWS. In a paper TWS capture, a cancel sent within about 1 ms of the crypto `TRADES`
+    /// notice drew 366 ("No historical data query found"), and updates still arrived.
+    /// A cancel sent seconds later drew 162 and stopped the updates.
     ///
     /// ```compile_fail,E0599
     /// # use ibapi::client::blocking::Client;
@@ -496,6 +698,11 @@ impl<'a, D: DateSpec> HistoricalDataBuilder<'a, crate::client::r#async::Client, 
     ///
     /// Succeeds only after TWS sends its end marker; an empty result with the marker is valid.
     ///
+    /// For a `between` range over 2000 seconds of one-second bars, this fetches up to
+    /// 30 pages of at most 2000 seconds, with at least 0.5 seconds between requests. Each
+    /// page has its own one-shot timeout. Empty HMDS no-data replies count as empty pages.
+    /// A later request failure returns [`Error::BarsBetween`] with the part already covered.
+    ///
     /// # Errors
     /// - [`Error::InvalidArgument`] for a range the client rejects before sending (see [`between`](HistoricalDataBuilder::between)
     ///   and [`ending`](HistoricalDataBuilder::ending)), or if
@@ -506,6 +713,12 @@ impl<'a, D: DateSpec> HistoricalDataBuilder<'a, crate::client::r#async::Client, 
     /// - [`Error::UnexpectedResponse`] if the bars and the end marker arrive out of order.
     /// - [`Error::Timeout`] if the end marker hasn't arrived within the client's
     ///   [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout).
+    ///
+    /// After error 10299 TWS goes on with the series the error names, and this returns that
+    /// series' bars with nothing to show the substitution: AGGTRADES bars for crypto `TRADES`,
+    /// TRADES bars for `AGGTRADES` on a stock or future (`docs/wire-facts/market-data.md#10299-whattoshow-substitution`). Request
+    /// [`WhatToShow::AggTrades`] for crypto and [`WhatToShow::Trades`] otherwise to get the
+    /// series you name; [`WhatToShow::trades_for`] picks it.
     ///
     /// Without a `one_shot_timeout`, waits without a time limit; to bound one
     /// call, wrap the future in `tokio::time::timeout`. Dropping it, or any
@@ -553,8 +766,28 @@ impl<'a, D: DateSpec> HistoricalDataBuilder<'a, crate::client::r#async::Client, 
     /// ```
     pub async fn fetch(self) -> Result<HistoricalData, Error> {
         let resolved = self.resolve_for_fetch()?;
-        let request = self.bar_request(resolved.end_date, resolved.duration);
-        let data = crate::market_data::historical::r#async::historical_data(self.client, request, self.request_id).await?;
+        if let Some(mut pages) = self.bar_pages_for_fetch(&resolved)? {
+            let mut first_id = Some(self.request_id);
+            let mut last_sent: Option<tokio::time::Instant> = None;
+            while let Some((end_date, duration)) = pages.next_request() {
+                if let Some(sent) = last_sent {
+                    tokio::time::sleep(split_request_wait(sent.elapsed())).await;
+                }
+                last_sent = Some(tokio::time::Instant::now());
+                let request_id = first_id.take().unwrap_or_else(|| self.client.mint_request_id());
+                let result =
+                    crate::market_data::historical::r#async::historical_data(self.client, self.bar_request(Some(end_date), duration), request_id)
+                        .await;
+                pages = pages.with_response(result)?;
+            }
+            return Ok(pages.finish());
+        }
+        let data = crate::market_data::historical::r#async::historical_data(
+            self.client,
+            self.bar_request(resolved.end_date, resolved.duration),
+            self.request_id,
+        )
+        .await?;
         Ok(trim_to_range(data, resolved.range))
     }
 
@@ -573,12 +806,19 @@ impl<'a, D: DateSpec> HistoricalDataBuilder<'a, crate::client::r#async::Client, 
     /// window and call [`trim_to`](HistoricalData::trim_to).
     ///
     /// Dropping the subscription before `End` sends `cancelHistoricalData`. To
-    /// know when TWS is done with the request, use `cancel_and_drain`. Any TWS
+    /// know when TWS is done with the request, use `cancel_and_drain`. Except 10299, a TWS
     /// error ends a historical request, so after one it returns `Rejected`
     /// without writing a cancel. Observed live (server 226), TWS answers a
     /// cancel of a request still running with error 162 ("API historical data
     /// query cancelled"), so `cancel_and_drain` returns `Rejected` with code
     /// 162: the request is over at TWS.
+    ///
+    /// Error 10299, TWS substituting AGGTRADES for crypto `TRADES` or TRADES for `AGGTRADES` on a
+    /// stock or future, does not end the request: the subscription yields it as a
+    /// [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem::Notice), then the
+    /// substituted series' bars (`docs/wire-facts/market-data.md#10299-whattoshow-substitution`). The notice still classifies as an error
+    /// ([`Notice::is_error`](crate::Notice::is_error) is `true`), so match code 10299 before
+    /// stopping on an error notice, or the bars that follow are never read.
     ///
     /// # Errors
     /// [`Error::InvalidArgument`], with nothing sent, for a range the client rejects before sending (see
@@ -636,7 +876,7 @@ impl<'a, D: DateSpec> HistoricalDataBuilder<'a, crate::client::r#async::Client, 
     /// }
     /// ```
     pub async fn subscribe(self) -> Result<crate::subscriptions::r#async::Subscription<HistoricalDataFrame>, Error> {
-        let resolved = self.dates.resolve(self.contract)?;
+        let resolved = self.resolve_for_subscribe()?;
         crate::market_data::historical::r#async::historical_data_subscription(
             self.client,
             self.bar_request(resolved.end_date, resolved.duration),
@@ -657,6 +897,21 @@ impl HistoricalDataBuilder<'_, crate::client::r#async::Client, DurationOnly> {
     /// `end_date = None` for streaming, so a builder with
     /// [`ending`](HistoricalDataBuilder::ending) or [`between`](HistoricalDataBuilder::between)
     /// has no `subscribe_with_updates`.
+    ///
+    /// For crypto, stream `TRADES`. TWS answers it with error 10299 and streams the AGGTRADES
+    /// series anyway; the subscription yields the 10299 as a
+    /// [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem::Notice), then the bars
+    /// and updates. The notice still classifies as an error
+    /// ([`Notice::is_error`](crate::Notice::is_error) is `true`), so match code 10299 before
+    /// stopping on an error notice, or the bars that follow are never read. `AGGTRADES` with live
+    /// updates draws 321 ("Source price not supported with live updates"), which ends the
+    /// subscription: on crypto with no 10299 first, and on a stock, future or forex pair after a
+    /// 10299 (`docs/wire-facts/market-data.md#10299-whattoshow-substitution`).
+    ///
+    /// Dropping the subscription as soon as the 10299 arrives can leave the request running at
+    /// TWS. In a paper TWS capture, a cancel sent within about 1 ms of the crypto `TRADES`
+    /// notice drew 366 ("No historical data query found"), and updates still arrived.
+    /// A cancel sent seconds later drew 162 and stopped the updates.
     ///
     /// ```compile_fail,E0599
     /// # use ibapi::client::Client;

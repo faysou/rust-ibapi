@@ -19,7 +19,11 @@ use crate::client::ids::{OrderId, RequestId, WireId};
 use crate::connection::common::STARTUP_STALL;
 use crate::connection::sync::Connection;
 
-use super::common::{lock, log_orphan, read_lock, report_unroutable_frame, validate_frame_length, write_lock, Lease, LeaseRef};
+use super::common::{
+    lock, log_orphan, read_lock, record_commission, report_unroutable_frame, validate_frame_length, write_lock, Lease, LeaseRef, LiveExecutions,
+    OrderFrame, OrderWrites,
+};
+use super::farm_watch::sync_impl::FarmWatch;
 use super::order_taps::{NewTap, OrderTaps};
 use super::rate_limiter::RateLimiter;
 use super::raw_capture::RawFrameTap;
@@ -28,7 +32,8 @@ use super::routing::{
     RoutingDecision,
 };
 use super::{
-    Admit, BoundState, BufferBound, InternalSubscription, MessageBus, Response, RoutedItem, SharedCounts, SharedTicket, Signal, SubscriptionBuilder,
+    Admit, BoundState, BufferBound, InternalSubscription, MessageBus, ReplySkip, Response, RoutedItem, SharedCounts, SharedTicket, Signal,
+    SubscriptionBuilder, UnansweredReplies,
 };
 use crate::messages::{
     is_cancel_frame, shared_channel_configuration, transport_reconnect_notice, IncomingMessages, Notice, OutgoingMessages, ResponseMessage,
@@ -82,12 +87,39 @@ struct SharedSubscriber {
     responses: &'static [IncomingMessages],
     sender: Sender<RoutedItem>,
     lease: LeaseRef,
+    // The earlier replies this subscription passes over; see `UnansweredReplies`.
+    skip: ReplySkip,
 }
 
 impl SharedSubscriber {
     fn receives(&self, message_type: IncomingMessages) -> bool {
         self.responses.contains(&message_type)
     }
+
+    // Queues `item`; `false` when the queue is gone (its handle was dropped
+    // and the cleanup signal has not been processed yet), so the caller
+    // removes this registration.
+    fn deliver(&self, item: RoutedItem) -> bool {
+        match self.sender.send(item) {
+            Ok(()) => {
+                warn_if_backlogged(format_args!("shared channel for {:?}", self.request), self.sender.len());
+                true
+            }
+            Err(_) => {
+                debug!("shared subscription {:?} dropped: removed", self.request);
+                false
+            }
+        }
+    }
+}
+
+// The live subscriptions and the replies outstanding ahead of a new one,
+// under one lock: a new subscription's skip count and the end markers the
+// dispatcher delivers to it then agree.
+#[derive(Debug, Default)]
+struct SharedSubscribers {
+    live: Vec<SharedSubscriber>,
+    unanswered: UnansweredReplies,
 }
 
 // For requests without an identifier, responses are routed by message type
@@ -104,9 +136,10 @@ struct SharedChannels {
     // Live subscriptions, added in `send_shared_request` and removed by the
     // cleanup thread on cancel or drop or, lazily, when a send finds the
     // queue gone.
-    subscribers: Mutex<Vec<SharedSubscriber>>,
+    subscribers: Mutex<SharedSubscribers>,
     // Live subscriptions per request type; see `SharedCounts`.
     counts: Mutex<SharedCounts>,
+    account_counts: Mutex<SharedCounts>,
 }
 
 impl SharedChannels {
@@ -116,111 +149,145 @@ impl SharedChannels {
                 .iter()
                 .flat_map(|mapping| mapping.responses.iter().copied())
                 .collect(),
-            subscribers: Mutex::new(Vec::new()),
+            subscribers: Mutex::new(SharedSubscribers::default()),
             counts: Mutex::new(SharedCounts::default()),
+            account_counts: Mutex::new(SharedCounts::default()),
         }
     }
 
-    fn subscribers(&self) -> MutexGuard<'_, Vec<SharedSubscriber>> {
+    fn subscribers(&self) -> MutexGuard<'_, SharedSubscribers> {
         lock(&self.subscribers)
     }
 
-    // Registers `sender` for every response type of `request`. Panics if
-    // `request` has no mapping.
-    fn add(&self, request: OutgoingMessages, sender: Sender<RoutedItem>, lease: LeaseRef) {
+    fn counts_for(&self, request: OutgoingMessages) -> &Mutex<SharedCounts> {
+        if request == OutgoingMessages::RequestAccountData {
+            &self.account_counts
+        } else {
+            &self.counts
+        }
+    }
+
+    // Registers `sender` for every response type of `request`, counting the
+    // request as unanswered. Panics if `request` has no mapping.
+    fn add(&self, request: OutgoingMessages, sender: Sender<RoutedItem>, lease: LeaseRef, account_live: bool) -> Result<(), Error> {
         let responses = shared_channel_configuration::response_types(request)
             .unwrap_or_else(|| panic!("unsupported request message {request:?}. check mapping in messages::shared_channel_configuration"));
-        self.subscribers().push(SharedSubscriber {
+        let mut subscribers = self.subscribers();
+        subscribers.unanswered.check_account_updates(request, account_live)?;
+        let skip = subscribers.unanswered.add(request);
+        subscribers.live.push(SharedSubscriber {
             request,
             responses,
             sender,
             lease,
+            skip,
         });
+        Ok(())
     }
 
     // Removes the subscription holding `lease`, if still registered.
     fn remove(&self, lease: &LeaseRef) {
         let mut subscribers = self.subscribers();
-        let before = subscribers.len();
-        subscribers.retain(|subscriber| !subscriber.lease.is(lease));
-        debug!("cleanup shared subscription: removed={}", before != subscribers.len());
+        let before = subscribers.live.len();
+        subscribers.live.retain(|subscriber| !subscriber.lease.is(lease));
+        debug!("cleanup shared subscription: removed={}", before != subscribers.live.len());
     }
 
     fn is_shared_response(&self, message_type: IncomingMessages) -> bool {
         self.response_types.contains(&message_type)
     }
 
-    // Runs `write` for a new subscription of `message_type` and counts it on
-    // success. The lock spans the write so the count and the wire agree.
-    // `account` is the account-updates account, checked before the write.
+    // Registers `sender` for a new subscription of `message_type`, runs
+    // `write` and counts the subscription on success. The lock spans the
+    // write so the count and the wire agree, and the registration comes
+    // under it, before the write, so no response can arrive ahead of it and
+    // unanswered requests are counted in wire order. `account` is the
+    // account-updates account, checked before anything is registered;
+    // `write` is told whether that account's updates are live already.
     fn subscribe(
         &self,
         message_type: OutgoingMessages,
         account: Option<&AccountId>,
-        write: impl FnOnce() -> Result<(), Error>,
+        sender: Sender<RoutedItem>,
+        lease: LeaseRef,
+        write: impl FnOnce(bool) -> Result<(), Error>,
     ) -> Result<SharedTicket, Error> {
-        let mut counts = lock(&self.counts);
+        let mut counts = lock(self.counts_for(message_type));
         counts.check_account_updates(account)?;
-        write()?;
+        let live = account.is_some_and(|account| counts.is_account_updates_live(account));
+        self.add(message_type, sender, lease.clone(), live)?;
+        if let Err(e) = write(live) {
+            self.remove(&lease);
+            self.subscribers().unanswered.withdraw(message_type);
+            return Err(e);
+        }
         Ok(counts.subscribe(message_type, account))
     }
 
     // Uncounts `ticket`'s subscription; runs `write` (the cancel) only when
     // `SharedCounts::unsubscribe` says so.
-    fn unsubscribe(&self, ticket: SharedTicket, write: impl FnOnce() -> Result<(), Error>) -> Result<(), Error> {
-        let mut counts = lock(&self.counts);
-        if counts.unsubscribe(ticket) {
-            write()
-        } else {
-            Ok(())
+    // `cancels` says whether `write` sends a cancel. Account dumps can still
+    // arrive after the last cancel, so their replies stay counted.
+    fn unsubscribe(&self, ticket: SharedTicket, cancels: bool, write: impl FnOnce() -> Result<(), Error>) -> Result<(), Error> {
+        let mut counts = lock(self.counts_for(ticket.message_type));
+        if !counts.unsubscribe(ticket) {
+            return Ok(());
         }
+        write()?;
+        if cancels {
+            self.subscribers().unanswered.cancelled(ticket.message_type);
+        }
+        Ok(())
     }
 
     // Every live shared subscription has just been failed: start a new
     // generation so their later drops cannot touch the next session's counts.
     fn reset_counts(&self) {
-        lock(&self.counts).reset();
+        let mut counts = lock(&self.counts);
+        let mut account_counts = lock(&self.account_counts);
+        counts.reset();
+        account_counts.reset();
+        self.subscribers().unanswered.clear();
     }
 
     // Sends `item()` to every subscriber selected by `filter`; returns how
-    // many were selected. A send fails only when the subscriber's queue is
-    // gone (its handle was dropped and the cleanup signal has not been
-    // processed yet); it is removed here.
+    // many were selected. A subscriber whose queue is gone is removed here.
     fn send_to<F, I>(&self, filter: F, item: I) -> usize
     where
         F: Fn(&SharedSubscriber) -> bool,
         I: Fn() -> RoutedItem,
     {
         let mut selected = 0;
-        self.subscribers().retain(|subscriber| {
+        self.subscribers().live.retain(|subscriber| {
             if !filter(subscriber) {
                 return true;
             }
             selected += 1;
-            match subscriber.sender.send(item()) {
-                Ok(()) => {
-                    warn_if_backlogged(format_args!("shared channel for {:?}", subscriber.request), subscriber.sender.len());
-                    true
-                }
-                Err(_) => {
-                    debug!("shared subscription {:?} dropped: removed", subscriber.request);
-                    false
-                }
-            }
+            subscriber.deliver(item())
         });
         selected
     }
 
-    // Deliver `message` to every live subscription registered for its type;
-    // returns whether any was. With none, the frame is dropped: a shared
+    // Deliver `message` to every live subscription registered for its type,
+    // except one still passing over an earlier request's reply; returns
+    // whether any was registered. With none, the frame is dropped: a shared
     // response nobody asked for (e.g. `OpenOrder` from another client, or
     // after the requester's drop).
     fn send_message(&self, message_type: IncomingMessages, message: &ResponseMessage) -> bool {
-        let delivered = self.send_to(|subscriber| subscriber.receives(message_type), || message.clone().into()) > 0;
-        if !delivered {
+        let mut subscribers = self.subscribers();
+        let mut registered = false;
+        subscribers.live.retain_mut(|subscriber| {
+            if !subscriber.receives(message_type) {
+                return true;
+            }
+            registered = true;
+            subscriber.skip.skips(message_type) || subscriber.deliver(message.clone().into())
+        });
+        subscribers.unanswered.answered(message_type);
+        if !registered {
             trace!("no shared subscription for {message_type:?}: frame dropped");
         }
-        delivered
+        registered
     }
 
     // Deliver `message_fn()` once to every live subscription, then remove
@@ -232,10 +299,10 @@ impl SharedChannels {
         F: Fn() -> RoutedItem,
     {
         let mut subscribers = self.subscribers();
-        for subscriber in subscribers.iter() {
+        for subscriber in subscribers.live.iter() {
             let _ = subscriber.sender.send(message_fn());
         }
-        subscribers.clear();
+        subscribers.live.clear();
     }
 
     // Fail in-flight one-shot requests fast by delivering an error to the
@@ -259,6 +326,8 @@ impl SharedChannels {
 pub(crate) struct NoticeBroadcaster {
     /// `None` once closed.
     senders: Mutex<Option<Vec<Sender<Notice>>>>,
+    /// Fed every notice before the fan-out; reset by the bus on a transport drop.
+    pub(crate) farms: FarmWatch,
 }
 
 impl super::common::NoticeSink for NoticeBroadcaster {
@@ -271,6 +340,7 @@ impl NoticeBroadcaster {
     pub(crate) fn new() -> Self {
         Self {
             senders: Mutex::new(Some(Vec::new())),
+            farms: FarmWatch::default(),
         }
     }
 
@@ -285,6 +355,7 @@ impl NoticeBroadcaster {
     }
 
     pub(crate) fn broadcast(&self, notice: Notice) {
+        self.farms.observe(&notice);
         if let Some(senders) = lock(&self.senders).as_mut() {
             senders.retain(|s| {
                 let sent = s.send(notice.clone()).is_ok();
@@ -300,6 +371,7 @@ impl NoticeBroadcaster {
     /// every later subscription on arrival.
     pub(crate) fn close(&self) {
         *lock(&self.senders) = None;
+        self.farms.close();
     }
 }
 
@@ -309,7 +381,15 @@ pub struct TcpMessageBus<S: Stream> {
     handles: Mutex<Vec<JoinHandle<()>>>,
     requests: SenderHash<RequestId, RoutedItem>,
     orders: SenderHash<OrderId, RoutedItem>,
+    /// Execution-id aliases of order routes, for the commission report that
+    /// follows a live execution.
     executions: SenderHash<String, RoutedItem>,
+    /// Execution-id aliases of `executions` request routes, for the
+    /// commission reports in a reply, which go to the request alone and not
+    /// to the order update stream.
+    executions_requested: SenderHash<String, RoutedItem>,
+    /// This client's live fills still waiting for their commission report.
+    live_executions: LiveExecutions,
     shared_channels: SharedChannels,
     signals_send: Sender<Signal>,
     signals_recv: Receiver<Signal>,
@@ -338,6 +418,8 @@ pub struct TcpMessageBus<S: Stream> {
     /// starts, or is refused: none reaches the socket the reconnect installs
     /// until the handshake on it is done.
     session: RwLock<()>,
+    outbound_writer: Mutex<()>,
+    order_writes: OrderWrites,
 }
 
 impl<S: Stream> TcpMessageBus<S> {
@@ -353,6 +435,8 @@ impl<S: Stream> TcpMessageBus<S> {
             requests: SenderHash::new(),
             orders: SenderHash::new(),
             executions: SenderHash::new(),
+            executions_requested: SenderHash::new(),
+            live_executions: LiveExecutions::default(),
             shared_channels: SharedChannels::new(),
             signals_send,
             signals_recv,
@@ -365,6 +449,8 @@ impl<S: Stream> TcpMessageBus<S> {
             order_taps,
             connection_state: ConnectionSignal::default(),
             session: RwLock::new(()),
+            outbound_writer: Mutex::new(()),
+            order_writes: OrderWrites::default(),
         }
     }
 
@@ -387,18 +473,18 @@ impl<S: Stream> TcpMessageBus<S> {
     fn request_shutdown(&self) {
         debug!("shutdown requested");
 
+        // Release connection waiters and stop reconnect backoff before draining routes.
+        self.connection_state.shutdown();
+        self.shutdown.request();
+
+        self.order_writes.drain(|id, frames| self.drain_order_write(id, frames, true));
         self.requests.fail_all(|| Error::Shutdown.into());
         self.orders.fail_all(|| Error::Shutdown.into());
         self.shared_channels.fail_all(|| Error::Shutdown.into());
         // Aliases of the routes just failed.
         self.executions.clear();
+        self.executions_requested.clear();
         self.connection.notice_broadcaster.close();
-
-        // Both latch: the connection signal releases every `wait_connected`
-        // with `Error::Shutdown`, and the shutdown signal ends any backoff
-        // wait `Connection::reconnect` is in.
-        self.connection_state.shutdown();
-        self.shutdown.request();
 
         self.order_taps.close();
 
@@ -452,7 +538,7 @@ impl<S: Stream> TcpMessageBus<S> {
     /// handshake writes through `Connection`, not here.
     fn write_message(&self, message: &[u8]) -> Result<(), Error> {
         self.throttle(message);
-        self.write_now(message)
+        self.write_now(message, None)
     }
 
     /// Waits for the rate limiter, if any. Shared-channel paths call this
@@ -468,15 +554,34 @@ impl<S: Stream> TcpMessageBus<S> {
     /// under the `session` gate. The gate held for write is a reconnect in
     /// progress, whatever the state signal says yet, so the write is refused
     /// as `ensure_connected` would refuse it once the signal catches up.
-    fn write_now(&self, message: &[u8]) -> Result<(), Error> {
-        let _session = match self.session.try_read() {
+    fn write_now(&self, message: &[u8], deadline: Option<Instant>) -> Result<(), Error> {
+        self.write_in_session(self.session_generation(), message, deadline)
+    }
+
+    fn write_in_session(&self, generation: u64, message: &[u8], deadline: Option<Instant>) -> Result<(), Error> {
+        let _session = self.session_for_write()?;
+        let _writer = lock(&self.outbound_writer);
+        self.ensure_write_generation(generation)?;
+        self.connection.write_message(message, deadline)
+    }
+
+    fn ensure_write_generation(&self, generation: u64) -> Result<(), Error> {
+        self.ensure_connected()?;
+        if generation != self.session_generation() {
+            return Err(Error::ConnectionReset);
+        }
+        Ok(())
+    }
+
+    fn session_for_write(&self) -> Result<RwLockReadGuard<'_, ()>, Error> {
+        let session = match self.session.try_read() {
             Ok(guard) => guard,
             // Poison recovery, as `common::lock`: the guard holds nothing.
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => return Err(self.ended_reason(Error::ConnectionReset)),
         };
         self.ensure_connected()?;
-        self.connection.write_message(message)
+        Ok(session)
     }
 
     fn reset(&self) {
@@ -485,13 +590,19 @@ impl<S: Stream> TcpMessageBus<S> {
         // already sees the new generation.
         self.session_generation.fetch_add(1, Ordering::AcqRel);
 
+        self.order_writes.drain(|id, frames| self.drain_order_write(id, frames, true));
         self.requests.fail_all(|| Error::ConnectionReset.into());
         self.orders.fail_all(|| Error::ConnectionReset.into());
         self.shared_channels.fail_all(|| Error::ConnectionReset.into());
+        // Shared writes can hold the count lock until the socket write returns.
+        self.connection.socket.sever();
         self.shared_channels.reset_counts();
         // Aliases of the routes just failed.
         self.executions.clear();
+        self.executions_requested.clear();
+        self.live_executions.clear();
         self.order_taps.reset();
+        self.connection.notice_broadcaster.farms.reset();
     }
 
     // The three cleanup handlers below remove a registration only when it
@@ -509,7 +620,7 @@ impl<S: Stream> TcpMessageBus<S> {
 
     fn clean_request(&self, request_id: RequestId, lease: &LeaseRef) {
         let removed = self.requests.remove_if_same(request_id, lease);
-        let aliases = self.executions.remove_all_same(lease);
+        let aliases = self.executions_requested.remove_all_same(lease);
         debug!(
             "cleanup request_id {request_id}: removed={removed}, aliases={aliases}, requests.len()={}",
             self.requests.len()
@@ -564,10 +675,6 @@ impl<S: Stream> TcpMessageBus<S> {
                 // session, and the reconnect can run for minutes.
                 self.reset();
 
-                // Fail any write still on the dead connection, so the gate
-                // below need not wait for a peer that stopped reading.
-                self.connection.socket.sever();
-
                 // Waits out writes whose state check passed before the flip
                 // (a write stuck on the dead socket must not delay the
                 // failures above); every later one is refused until the
@@ -621,6 +728,7 @@ impl<S: Stream> TcpMessageBus<S> {
                 // so a consumer that resubscribes on it lands on the new session,
                 // into maps the reset above can no longer wipe.
                 self.connection.notice_broadcaster.broadcast(transport_reconnect_notice());
+                self.order_taps.reconnected();
                 Ok(())
             }
             Err(Error::Shutdown) => {
@@ -709,7 +817,7 @@ impl<S: Stream> TcpMessageBus<S> {
                 return;
             }
             Some(WireId::Order(order_id)) if self.orders.contains(&order_id) => {
-                let _ = self.orders.deliver(&order_id, message.into());
+                let _ = self.deliver_order(order_id, message.into());
                 return;
             }
             _ => {}
@@ -725,8 +833,11 @@ impl<S: Stream> TcpMessageBus<S> {
     /// subscription its id names.
     fn deliver(&self, id: WireId, item: RoutedItem, sent_to_update_stream: bool) {
         let unrouted = match id {
-            WireId::Request(request_id) => self.requests.deliver(&request_id, item),
-            WireId::Order(order_id) => self.orders.deliver(&order_id, item),
+            WireId::Request(request_id) => self.requests.deliver(
+                &request_id,
+                item.with_farm_disconnect_mark(|| self.connection.notice_broadcaster.farms.mark()),
+            ),
+            WireId::Order(order_id) => self.deliver_order(order_id, item),
         };
         if let Err(item) = unrouted {
             if !sent_to_update_stream {
@@ -735,14 +846,71 @@ impl<S: Stream> TcpMessageBus<S> {
         }
     }
 
+    fn deliver_order(&self, order_id: OrderId, item: RoutedItem) -> Result<(), RoutedItem> {
+        self.dispatch_order_frame(order_id, OrderFrame::Direct(item))
+    }
+
+    fn dispatch_order_frame(&self, order_id: OrderId, frame: OrderFrame) -> Result<(), RoutedItem> {
+        self.order_writes
+            .deliver(order_id, frame, |frame| self.deliver_order_frame(order_id, frame))
+    }
+
+    fn deliver_order_frame(&self, order_id: OrderId, frame: OrderFrame) -> Result<(), RoutedItem> {
+        match frame {
+            OrderFrame::Direct(item) => self.orders.deliver(&order_id, item),
+            OrderFrame::Execution {
+                item,
+                execution_id,
+                request_id,
+            } => {
+                debug_assert!(request_id.is_none());
+                self.orders.deliver_aliased(&order_id, item, execution_id.as_ref(), &self.executions)
+            }
+            OrderFrame::Commission { item, execution_id } => {
+                let leases = self.orders.leases(&order_id);
+                let (delivered, _) = self
+                    .executions
+                    .deliver_selected(&execution_id, &item, |lease| leases.iter().any(|order_lease| order_lease.is(lease)));
+                if delivered {
+                    Ok(())
+                } else {
+                    Err(item)
+                }
+            }
+        }
+    }
+
+    fn deliver_order_commission(&self, execution_id: String, item: RoutedItem) -> Result<(), RoutedItem> {
+        self.order_writes
+            .deliver_commission(execution_id, item, |pending_id, execution_id, item| {
+                let leases = pending_id.map_or_else(Vec::new, |id| self.orders.leases(&id));
+                self.executions
+                    .deliver_selected(execution_id, item, |lease| !leases.iter().any(|order_lease| order_lease.is(lease)))
+            })
+    }
+
+    fn drain_order_write(&self, order_id: OrderId, frames: Vec<OrderFrame>, uncertain: bool) {
+        for frame in frames {
+            let frame = match frame {
+                OrderFrame::Direct(item) if uncertain => OrderFrame::Direct(item.for_earlier_subscription()),
+                frame => frame,
+            };
+            let _ = self.deliver_order_frame(order_id, frame);
+        }
+    }
+
     fn process_orders(&self, message: ResponseMessage) {
         let foreign = is_foreign(&message, self.connection.client_id);
-        let strategy = order_routing_strategy(message.message_type(), foreign);
         let message_order_id = message.order_id().map(OrderId::from);
         let message_request_id = message.request_id().and_then(RequestId::from_raw);
+        let strategy = order_routing_strategy(message.message_type(), foreign, message_request_id.is_some());
 
         if !foreign {
             self.order_taps.publish_status(&message);
+        } else if message.message_type() == IncomingMessages::OpenOrder {
+            if let (Some(state), Some(order_id)) = (self.handshake_state.get(), message_order_id) {
+                state.raise_past_listed_order(order_id.value());
+            }
         }
 
         match strategy {
@@ -752,14 +920,31 @@ impl<S: Stream> TcpMessageBus<S> {
             OrderRoutingStrategy::ExecutionData => {
                 let sent_to_update_stream = self.send_order_update(&message);
                 let execution_id = message.execution_id();
-                if let Err(item) = self.deliver_to_order_or_request(message_order_id, message_request_id, message.into(), execution_id.as_ref()) {
+                if let Some(execution_id) = &execution_id {
+                    self.live_executions.insert(execution_id);
+                }
+                let unrouted = match message_order_id {
+                    Some(id) => self.dispatch_order_frame(
+                        id,
+                        OrderFrame::Execution {
+                            item: message.into(),
+                            execution_id,
+                            request_id: None,
+                        },
+                    ),
+                    None => Err(message.into()),
+                };
+                if let Err(item) = unrouted {
                     if !sent_to_update_stream {
                         warn!("could not route message {item:?}");
                     }
                 }
             }
             OrderRoutingStrategy::ExecutionDataEnd => {
-                if let Err(item) = self.deliver_to_order_or_request(message_order_id, message_request_id, message.into(), None) {
+                if let Some(id) = message_request_id {
+                    self.requests.end_commission_aliases(&id, &self.executions_requested);
+                }
+                if let Err(item) = self.deliver_to_order_or_request(message_order_id, message_request_id, message.into()) {
                     warn!("could not route message {item:?}");
                 }
             }
@@ -767,7 +952,7 @@ impl<S: Stream> TcpMessageBus<S> {
                 let sent_to_update_stream = self.send_order_update(&message);
                 let shared = self.shared_channels.send_message(message.message_type(), &message);
                 let unrouted = match message_order_id {
-                    Some(order_id) => self.orders.deliver(&order_id, message.into()).err(),
+                    Some(order_id) => self.deliver_order(order_id, message.into()).err(),
                     None => Some(message.into()),
                 };
                 if let Some(item) = unrouted {
@@ -776,26 +961,20 @@ impl<S: Stream> TcpMessageBus<S> {
                     }
                 }
             }
-            OrderRoutingStrategy::ByExecutionId => {
-                let sent_to_update_stream = self.send_order_update(&message);
-
-                let unrouted = match message.execution_id() {
-                    Some(execution_id) => self.executions.deliver(&execution_id, message.into()),
-                    None => Err(message.into()),
-                };
-                if let Err(item) = unrouted {
-                    if !sent_to_update_stream {
-                        warn!("could not route commission report {item:?}");
-                    }
-                }
-            }
+            OrderRoutingStrategy::ByExecutionId => self.route_commission(message),
             OrderRoutingStrategy::SharedOnly => {
                 self.shared_channels.send_message(message.message_type(), &message);
             }
             OrderRoutingStrategy::ByRequestId => {
                 let execution_id = message.execution_id();
-                if let Err(item) = self.deliver_to_order_or_request(None, message_request_id, message.into(), execution_id.as_ref()) {
-                    debug!("another client's execution answers no request: {item:?}");
+                let unrouted = match message_request_id {
+                    Some(id) => self
+                        .requests
+                        .deliver_aliased(&id, message.into(), execution_id.as_ref(), &self.executions_requested),
+                    None => Err(message.into()),
+                };
+                if let Err(item) = unrouted {
+                    debug!("execution answers no live request: {item:?}");
                 }
             }
             OrderRoutingStrategy::Ignore => {}
@@ -805,9 +984,35 @@ impl<S: Stream> TcpMessageBus<S> {
         }
     }
 
+    fn route_commission(&self, message: ResponseMessage) {
+        let Some((id, payload)) = super::common::commission_version(&message) else {
+            self.live_executions.warn_unmapped();
+            return;
+        };
+
+        let requested = self.executions_requested.deliver_commission(&id, &payload, &message);
+        match self.live_executions.record_commission(&id, &payload) {
+            Some(true) => {
+                self.send_order_update(&message);
+                let _ = self.deliver_order_commission(id, message.into());
+            }
+            None if !requested => self.live_executions.warn_unmapped(),
+            _ => {}
+        }
+    }
+
     /// Register `request_id`'s channel, optionally with an unread-item cap,
     /// then write the request.
-    fn open_request(&self, request_id: RequestId, message: &[u8], bound: Option<BufferBound>) -> Result<InternalSubscription, Error> {
+    fn open_request(
+        &self,
+        request_id: RequestId,
+        message: &[u8],
+        bound: Option<BufferBound>,
+        deadline: Option<Instant>,
+    ) -> Result<InternalSubscription, Error> {
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            return Err(Error::Timeout);
+        }
         // Read before the gate: a reset after this read leaves the
         // subscription in the old session, which is where its request went.
         let session = self.session_generation();
@@ -826,7 +1031,15 @@ impl<S: Stream> TcpMessageBus<S> {
         // the registration back out on failure rather than leave a channel no
         // reset will clear. `remove_if_same` so a newer registration under the
         // same id survives.
-        if let Err(e) = self.write_message(message) {
+        let send = match (deadline, self.rate_limiter.get()) {
+            (Some(deadline), Some(limiter)) => limiter.acquire_blocking_before(deadline),
+            _ => {
+                self.throttle(message);
+                Ok(())
+            }
+        }
+        .and_then(|()| self.write_in_session(session, message, deadline));
+        if let Err(e) = send {
             self.requests.remove_if_same(request_id, &lease_ref);
             return Err(e);
         }
@@ -843,22 +1056,15 @@ impl<S: Stream> TcpMessageBus<S> {
         Ok(subscription)
     }
 
-    /// Deliver to `order_id`'s route, else `request_id`'s, aliasing the route
-    /// under `execution_id` for the commission report that follows. Hands
-    /// the item back when neither is registered.
-    fn deliver_to_order_or_request(
-        &self,
-        order_id: Option<OrderId>,
-        request_id: Option<RequestId>,
-        item: RoutedItem,
-        execution_id: Option<&String>,
-    ) -> Result<(), RoutedItem> {
+    /// Deliver to `order_id`'s route, else `request_id`'s. Hands the item
+    /// back when neither is registered.
+    fn deliver_to_order_or_request(&self, order_id: Option<OrderId>, request_id: Option<RequestId>, item: RoutedItem) -> Result<(), RoutedItem> {
         match order_id {
-            Some(id) => self.orders.deliver_aliased(&id, item, execution_id, &self.executions),
+            Some(id) => self.deliver_order(id, item),
             None => Err(item),
         }
         .or_else(|item| match request_id {
-            Some(id) => self.requests.deliver_aliased(&id, item, execution_id, &self.executions),
+            Some(id) => self.requests.deliver(&id, item),
             None => Err(item),
         })
     }
@@ -933,26 +1139,35 @@ impl<S: Stream> TcpMessageBus<S> {
 
     // Registers a subscription of `message_type` and writes its request;
     // `account` for account updates (see `SharedCounts`).
-    fn send_shared(&self, message_type: OutgoingMessages, account: Option<&AccountId>, message: &[u8]) -> Result<InternalSubscription, Error> {
+    // `unsubscribe` goes out ahead of `message` when `account`'s updates are
+    // live already; see `MessageBus::send_account_updates_request`.
+    fn send_shared(
+        &self,
+        message_type: OutgoingMessages,
+        account: Option<&AccountId>,
+        message: &[u8],
+        unsubscribe: Option<&[u8]>,
+    ) -> Result<InternalSubscription, Error> {
         // See `open_request`.
         let session = self.session_generation();
         self.ensure_connected()?;
 
-        // A queue of its own, registered before the write so no response can
-        // arrive ahead of it. A failed write or a refused account takes the
-        // registration with it.
+        // A queue of its own; `subscribe` registers it before the write, and
+        // a failed write takes the registration with it.
         let (sender, receiver) = channel::unbounded();
         let lease = Lease::new();
-        let lease_ref = lease.downgrade();
-        self.shared_channels.add(message_type, sender.clone(), lease_ref.clone());
-        self.throttle(message);
-        let ticket = match self.shared_channels.subscribe(message_type, account, || self.write_now(message)) {
-            Ok(ticket) => ticket,
-            Err(e) => {
-                self.shared_channels.remove(&lease_ref);
-                return Err(e);
+        if unsubscribe.is_none() {
+            self.throttle(message);
+        }
+        let write = |live: bool| {
+            if let Some(unsubscribe) = unsubscribe {
+                return self.write_account_request(session, message, live.then_some(unsubscribe));
             }
+            self.write_in_session(session, message, None)
         };
+        let ticket = self
+            .shared_channels
+            .subscribe(message_type, account, sender.clone(), lease.downgrade(), write)?;
 
         // The lease is the drop signal's identity: `Signal::Shared` removes
         // exactly this registration.
@@ -967,29 +1182,82 @@ impl<S: Stream> TcpMessageBus<S> {
 
         Ok(subscription)
     }
+
+    fn write_account_request(&self, session: u64, message: &[u8], unsubscribe: Option<&[u8]>) -> Result<(), Error> {
+        let _session = self.session_for_write()?;
+        self.ensure_write_generation(session)?;
+        let permit = self.throttle_account_request()?;
+        if let Some(unsubscribe) = unsubscribe {
+            self.write_account_frame(session, unsubscribe, permit)?;
+            let result = self
+                .throttle_account_request()
+                .and_then(|permit| self.write_account_frame(session, message, permit));
+            if result.is_err() {
+                self.connection.socket.sever();
+            }
+            return result;
+        }
+        self.write_account_frame(session, message, permit)
+    }
+
+    fn write_account_frame(&self, generation: u64, message: &[u8], permit: Instant) -> Result<(), Error> {
+        let _writer = lock(&self.outbound_writer);
+        self.ensure_write_generation(generation)?;
+        self.connection.write_message(message, None)?;
+        if let Some(limiter) = self.rate_limiter.get() {
+            limiter.observe_account_write(permit, Instant::now());
+        }
+        Ok(())
+    }
+
+    fn throttle_account_request(&self) -> Result<Instant, Error> {
+        let now = Instant::now();
+        let mut permit = now;
+        if let Some(limiter) = self.rate_limiter.get() {
+            let wait = limiter.reserve(now, false);
+            permit += wait;
+            self.connection_state.wait_until(permit)?;
+        }
+        self.ensure_connected().map(|()| permit)
+    }
 }
 
 impl<S: Stream> MessageBus for TcpMessageBus<S> {
-    fn send_request_capped(&self, request_id: RequestId, message: &[u8], bound: Option<BufferBound>) -> Result<InternalSubscription, Error> {
-        self.open_request(request_id, message, bound)
+    fn send_request_capped(
+        &self,
+        request_id: RequestId,
+        message: &[u8],
+        bound: Option<BufferBound>,
+        deadline: Option<Instant>,
+    ) -> Result<InternalSubscription, Error> {
+        self.open_request(request_id, message, bound, deadline)
     }
 
     fn send_order_request(&self, order_id: OrderId, message: &[u8]) -> Result<InternalSubscription, Error> {
-        // See `open_request`.
-        let session = self.session_generation();
         self.ensure_connected()?;
+        self.throttle(message);
+        let _session = self.session_for_write()?;
+        let _writer = lock(&self.outbound_writer);
+        let session = self.session_generation();
 
         let (sender, receiver) = channel::unbounded();
         let lease = Lease::new();
         let lease_ref = lease.downgrade();
 
-        self.orders.insert(order_id, sender.clone(), lease_ref.clone());
-        debug!("Registered order subscription for order_id={}", order_id);
-
-        // See `send_request`: a failed write takes its registration with it.
-        if let Err(e) = self.write_message(message) {
-            self.orders.remove_if_same(order_id, &lease_ref);
-            return Err(e);
+        let write = self.order_writes.begin(
+            order_id,
+            || self.ensure_connected(),
+            |sent, id, frames| {
+                if sent {
+                    self.orders.insert(id, sender.clone(), lease_ref.clone());
+                    self.orders.supersede_earlier(&id, &lease_ref);
+                }
+                self.drain_order_write(id, frames, false);
+            },
+        )?;
+        self.connection.write_message(message, None)?;
+        if !write.commit() {
+            return Err(self.ended_reason(Error::ConnectionReset));
         }
 
         let subscription = SubscriptionBuilder::new()
@@ -1045,21 +1313,30 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
     }
 
     fn send_shared_request(&self, message_type: OutgoingMessages, message: &[u8]) -> Result<InternalSubscription, Error> {
-        self.send_shared(message_type, None, message)
+        self.send_shared(message_type, None, message, None)
     }
 
-    fn send_account_updates_request(&self, account: &AccountId, message: &[u8]) -> Result<InternalSubscription, Error> {
-        self.send_shared(OutgoingMessages::RequestAccountData, Some(account), message)
+    fn send_account_updates_request(&self, account: &AccountId, message: &[u8], unsubscribe: &[u8]) -> Result<InternalSubscription, Error> {
+        self.send_shared(OutgoingMessages::RequestAccountData, Some(account), message, Some(unsubscribe))
     }
 
     fn cancel_shared_subscription(&self, ticket: SharedTicket, message: Option<&[u8]>) -> Result<(), Error> {
-        // Throttled before the lock: some cancels (account updates) are
-        // requests with an off flag and do wait.
-        if let Some(message) = message {
-            self.throttle(message);
-        }
-        self.shared_channels
-            .unsubscribe(ticket, || message.map_or(Ok(()), |message| self.write_now(message)))
+        self.shared_channels.unsubscribe(ticket, message.is_some(), || {
+            let Some(message) = message else {
+                return Ok(());
+            };
+            if ticket.message_type == OutgoingMessages::RequestAccountData {
+                let permit = self.throttle_account_request()?;
+                self.write_now(message, None)?;
+                if let Some(limiter) = self.rate_limiter.get() {
+                    limiter.observe_account_write(permit, Instant::now());
+                }
+                return Ok(());
+            } else {
+                self.throttle(message);
+            }
+            self.write_now(message, None)
+        })
     }
 
     fn notice_subscribe(&self) -> NoticeStream {
@@ -1082,6 +1359,10 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
     fn session_generation(&self) -> u64 {
         self.session_generation.load(Ordering::Acquire)
     }
+
+    fn farm_watch(&self) -> &FarmWatch {
+        &self.connection.notice_broadcaster.farms
+    }
 }
 
 #[derive(Debug)]
@@ -1091,11 +1372,24 @@ struct Entry<V> {
     lease: LeaseRef,
     /// The unread-item cap of a route opened with a `send_request_capped` bound.
     bound: Option<BoundState>,
+    commission: Option<Vec<u8>>,
+    /// Another entry was registered under this entry's key after it and its
+    /// request was written, so an error frame on the key may answer that later
+    /// request: it reaches this entry as
+    /// [`RoutedItem::for_earlier_subscription`], also once the later entry is
+    /// gone.
+    superseded: bool,
 }
 
 impl<V> Entry<V> {
     fn new(sender: Sender<V>, lease: LeaseRef) -> Self {
-        Self { sender, lease, bound: None }
+        Self {
+            sender,
+            lease,
+            bound: None,
+            commission: None,
+            superseded: false,
+        }
     }
 
     fn closed(&self) -> bool {
@@ -1133,9 +1427,12 @@ impl Entry<RoutedItem> {
     }
 }
 
+/// Routes keyed by request id, order id, or execution id. A key can hold
+/// several entries: every subscription opened on one order id (`place_order`,
+/// a modify, `cancel_order`) receives that order's frames.
 #[derive(Debug)]
 struct SenderHash<K, V> {
-    senders: RwLock<HashMap<K, Entry<V>>>,
+    senders: RwLock<HashMap<K, Vec<Entry<V>>>>,
 }
 
 impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K, V> {
@@ -1145,11 +1442,11 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         }
     }
 
-    fn read(&self) -> RwLockReadGuard<'_, HashMap<K, Entry<V>>> {
+    fn read(&self) -> RwLockReadGuard<'_, HashMap<K, Vec<Entry<V>>>> {
         read_lock(&self.senders)
     }
 
-    fn write(&self) -> RwLockWriteGuard<'_, HashMap<K, Entry<V>>> {
+    fn write(&self) -> RwLockWriteGuard<'_, HashMap<K, Vec<Entry<V>>>> {
         write_lock(&self.senders)
     }
 
@@ -1163,12 +1460,12 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         self.with_entry(&id, |entry| entry.lease.clone())
     }
 
-    /// Run `f` on `id`'s entry while holding the read lock, so no removal can
-    /// land between the lookup and `f`.
+    /// Run `f` on the newest of `id`'s entries while holding the read lock, so
+    /// no removal can land between the lookup and `f`.
     #[cfg(test)]
     fn with_entry<R>(&self, id: &K, f: impl FnOnce(&Entry<V>) -> R) -> Option<R> {
         let senders = self.read();
-        senders.get(id).map(f)
+        senders.get(id).and_then(|entries| entries.last()).map(f)
     }
 
     pub fn insert(&self, id: K, sender: Sender<V>, lease: LeaseRef) {
@@ -1184,29 +1481,70 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         self.insert_entry(id, entry);
     }
 
+    /// Register `entry` under `id` beside the entries already there. An entry
+    /// with the same lease is replaced, so one subscription never holds two
+    /// entries under a key and never receives a frame twice.
     fn insert_entry(&self, id: K, entry: Entry<V>) {
-        self.write().insert(id, entry);
+        let mut senders = self.write();
+        let registered = senders.entry(id).or_default();
+        registered.retain(|other| !other.lease.is(&entry.lease));
+        registered.push(entry);
     }
 
-    /// Remove the entry for `id` only if it holds `lease`. Returns whether an
-    /// entry was removed. Used by signal cleanup so a stale signal cannot
-    /// remove a newer registration under the same key.
-    pub fn remove_if_same(&self, id: K, lease: &LeaseRef) -> bool {
-        match self.write().entry(id) {
-            hash_map::Entry::Occupied(registered) if registered.get().lease.is(lease) => {
-                registered.remove();
-                true
-            }
-            _ => false,
+    fn insert_alias(&self, id: K, source: &Entry<V>) {
+        let mut senders = self.write();
+        let registered = senders.entry(id).or_default();
+        if !registered.iter().any(|entry| entry.lease.is(&source.lease)) {
+            registered.push(source.alias());
         }
+    }
+
+    /// Mark the entries registered under `id` before the one holding `lease`
+    /// as superseded, once that entry's request is written. Until then they
+    /// already receive [`RoutedItem::for_earlier_subscription`] as earlier
+    /// entries; the mark keeps it so after the newer entry is gone. A request
+    /// whose write fails marks nothing.
+    pub fn supersede_earlier(&self, id: &K, lease: &LeaseRef) {
+        let mut senders = self.write();
+        let Some(registered) = senders.get_mut(id) else {
+            return;
+        };
+        let Some(position) = registered.iter().position(|entry| entry.lease.is(lease)) else {
+            return;
+        };
+        for entry in &mut registered[..position] {
+            entry.superseded = true;
+        }
+    }
+
+    /// Remove `id`'s entry that holds `lease`, and `id` once none is left.
+    /// Returns whether an entry was removed. Used by signal cleanup so a
+    /// stale signal cannot remove another registration under the same key.
+    pub fn remove_if_same(&self, id: K, lease: &LeaseRef) -> bool {
+        let mut senders = self.write();
+        let hash_map::Entry::Occupied(mut registered) = senders.entry(id) else {
+            return false;
+        };
+        let before = registered.get().len();
+        registered.get_mut().retain(|entry| !entry.lease.is(lease));
+        let removed = registered.get().len() < before;
+        if registered.get().is_empty() {
+            registered.remove();
+        }
+        removed
     }
 
     /// Remove every entry holding `lease`. Returns how many were removed.
     pub fn remove_all_same(&self, lease: &LeaseRef) -> usize {
         let mut senders = self.write();
-        let before = senders.len();
-        senders.retain(|_, registered| !registered.lease.is(lease));
-        before - senders.len()
+        let mut removed = 0;
+        senders.retain(|_, registered| {
+            let before = registered.len();
+            registered.retain(|entry| !entry.lease.is(lease));
+            removed += before - registered.len();
+            !registered.is_empty()
+        });
+        removed
     }
 
     pub fn contains(&self, id: &K) -> bool {
@@ -1226,13 +1564,31 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
 }
 
 impl<K: std::hash::Hash + Eq + std::fmt::Debug> SenderHash<K, RoutedItem> {
-    /// Deliver `item` to `id`'s route; hands it back when nothing is
+    fn leases(&self, id: &K) -> Vec<LeaseRef> {
+        self.read().get(id).into_iter().flatten().map(|entry| entry.lease.clone()).collect()
+    }
+
+    fn deliver_selected(&self, id: &K, item: &RoutedItem, selected: impl Fn(&LeaseRef) -> bool) -> (bool, bool) {
+        let (mut delivered, mut skipped) = (false, false);
+        let senders = self.read();
+        for entry in senders.get(id).into_iter().flatten().filter(|entry| entry.lease.is_live()) {
+            if selected(&entry.lease) {
+                entry.deliver(id, item.clone());
+                delivered = true;
+            } else {
+                skipped = true;
+            }
+        }
+        (delivered, skipped)
+    }
+
+    /// Deliver `item` to each of `id`'s routes; hands it back when nothing is
     /// registered under `id`.
     pub fn deliver(&self, id: &K, item: RoutedItem) -> Result<(), RoutedItem> {
         self.deliver_then(id, item, |_| {})
     }
 
-    /// Deliver `item` to `id`'s route, then alias that route under `alias`
+    /// Deliver `item` to each of `id`'s routes, then alias each under `alias`
     /// in `aliases` while still holding `id`'s read lock, so a concurrent
     /// cleanup either removes the registration first (no alias is stored) or
     /// prunes the alias after it. Lock order: `self` (read), then `aliases`
@@ -1247,20 +1603,50 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug> SenderHash<K, RoutedItem> {
     ) -> Result<(), RoutedItem> {
         self.deliver_then(id, item, |entry| {
             if let Some(alias) = alias {
-                aliases.insert_entry(alias.clone(), entry.alias());
+                aliases.insert_alias(alias.clone(), entry);
             }
         })
     }
 
-    /// Deliver `item` to `id`'s route and run `then` on it, both under the
-    /// read lock.
-    fn deliver_then(&self, id: &K, item: RoutedItem, then: impl FnOnce(&Entry<RoutedItem>)) -> Result<(), RoutedItem> {
+    fn deliver_commission(&self, id: &K, payload: &[u8], message: &ResponseMessage) -> bool {
+        let mut senders = self.write();
+        let Some(entries) = senders.get_mut(id) else {
+            return false;
+        };
+        let mut eligible = false;
+        for entry in entries.iter_mut().filter(|entry| entry.lease.is_live()) {
+            eligible = true;
+            if record_commission(&mut entry.commission, payload) {
+                entry.deliver(id, message.clone().into());
+            }
+        }
+        eligible
+    }
+
+    fn end_commission_aliases<A: std::hash::Hash + Eq + std::fmt::Debug>(&self, id: &K, aliases: &SenderHash<A, RoutedItem>) {
+        if let Some(entries) = self.read().get(id) {
+            for entry in entries {
+                aliases.remove_all_same(&entry.lease);
+            }
+        }
+    }
+
+    /// Deliver `item` to each of `id`'s routes and run `then` on each, all
+    /// under the read lock. Superseded entries, every one but the newest and
+    /// the newest too once a later entry was removed, receive
+    /// [`RoutedItem::for_earlier_subscription`].
+    fn deliver_then(&self, id: &K, item: RoutedItem, then: impl Fn(&Entry<RoutedItem>)) -> Result<(), RoutedItem> {
         let senders = self.read();
-        let Some(entry) = senders.get(id) else {
+        let Some((newest, earlier)) = senders.get(id).and_then(|registered| registered.split_last()) else {
             return Err(item);
         };
-        entry.deliver(id, item);
-        then(entry);
+        for entry in earlier {
+            entry.deliver(id, item.for_earlier_subscription());
+            then(entry);
+        }
+        let item = if newest.superseded { item.for_earlier_subscription() } else { item };
+        newest.deliver(id, item);
+        then(newest);
         Ok(())
     }
 
@@ -1274,7 +1660,7 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug> SenderHash<K, RoutedItem> {
         F: Fn() -> RoutedItem,
     {
         let mut senders = self.write();
-        for entry in senders.values().filter(|entry| !entry.closed()) {
+        for entry in senders.values().flatten().filter(|entry| !entry.closed()) {
             let _ = entry.sender.send(message_fn());
         }
         senders.clear();
@@ -1499,8 +1885,11 @@ impl Io for TcpSocket {
         read_message(&mut *reader, &self.tap).map_err(|err| self.closed_or(err))
     }
 
-    fn write_all(&self, buf: &[u8]) -> Result<(), Error> {
+    fn write_all(&self, buf: &[u8], deadline: Option<Instant>) -> Result<(), Error> {
         let mut writer = lock(&self.writer);
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            return Err(Error::Timeout);
+        }
         writer.write_all(buf).map_err(|err| self.closed_or(err.into()))
     }
 
@@ -1520,7 +1909,7 @@ impl Io for TcpSocket {
 
 pub(crate) trait Io {
     fn read_message(&self) -> Result<Vec<u8>, Error>;
-    fn write_all(&self, buf: &[u8]) -> Result<(), Error>;
+    fn write_all(&self, buf: &[u8], deadline: Option<Instant>) -> Result<(), Error>;
     /// Release the physical stream, even while owners still hold it: pending
     /// and later reads and writes fail with [`Error::Shutdown`], and
     /// `reconnect` refuses. Idempotent. Twin of `AsyncIo::close`.
