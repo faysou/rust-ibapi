@@ -748,7 +748,7 @@ impl<T: StreamDecoder<T>> Subscription<T> {
         let collected = self.collect_with(bound, stop, |deadline| {
             Ok::<_, std::convert::Infallible>(match deadline {
                 None => self.next(),
-                Some(deadline) => self.next_before(deadline),
+                Some(deadline) => self.next_timeout(deadline.saturating_duration_since(Instant::now())),
             })
         });
         match collected {
