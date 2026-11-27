@@ -12,7 +12,7 @@ pub(crate) use io::read_framed_message;
 /// The stream traits, for test fixtures that stand in for a socket.
 #[cfg(test)]
 pub(crate) use io::{AsyncIo, AsyncReconnect};
-pub(crate) use io::{AsyncSocket, AsyncStream, Connector, WriteAdmission};
+pub(crate) use io::{AsyncSocket, AsyncStream, CancelWrite, Connector, WriteAdmission};
 use registry::{Route, SenderHash, SharedChannels, SharedReplySkip};
 pub(crate) use shutdown::ShutdownSignal;
 

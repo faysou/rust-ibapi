@@ -2005,6 +2005,53 @@ async fn account_updates_dropped_while_first_byte_is_pending_sends_nothing() {
     assert_eq!(bus.shared_channels.unanswered(IncomingMessages::AccountDownloadEnd), 1);
 }
 
+#[tokio::test]
+async fn account_summary_cancel_before_1101_replacement_first_byte_sends_nothing() {
+    use crate::accounts::{types::AccountGroup, AccountSummaryTags};
+    use crate::common::test_utils::helpers::TEST_REQ_ID_FIRST;
+    use crate::testdata::builders::accounts::{cancel_account_summary, request_account_summary};
+    use crate::testdata::builders::RequestEncoder;
+    use futures::FutureExt;
+
+    let writer = StagedFrameWriter::default();
+    let bus = staged_writer_bus(&writer).await;
+    let client = crate::Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    let group = AccountGroup("All".to_string());
+    let tags = &[AccountSummaryTags::NET_LIQUIDATION];
+    let mut snapshots = client
+        .account_summary_snapshots_resubscribing(&group, tags, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let cancel = cancel_account_summary().request_id(TEST_REQ_ID_FIRST).encode_request();
+    // Let the old cancel finish, then stall the replacement before its first byte.
+    writer.state.lock().unwrap().remaining = Some(encode_raw_length(&cancel).len());
+    bus.farm_watch().observe(&helpers::test_notice(1101, "account data lost"));
+    {
+        let mut waiting = std::pin::pin!(snapshots.next());
+        assert!(waiting.as_mut().now_or_never().is_none());
+        tokio::time::timeout(TICK, writer.write_pending.notified()).await.unwrap();
+    }
+    snapshots.cancel().await;
+    assert!(matches!(snapshots.next().await, Some(Err(Error::Cancelled))));
+    assert!(snapshots.next().await.is_none());
+    writer.state.lock().unwrap().remaining = None;
+    writer.resume.wake();
+    let _fresh = client.account_summary(&group, tags).await.unwrap();
+
+    let request = |request_id| {
+        request_account_summary()
+            .request_id(request_id)
+            .group("All")
+            .tags(tags.iter().copied())
+            .encode_request()
+    };
+    let state = writer.state.lock().unwrap();
+    assert_eq!(
+        frame_payloads(&state.accepted),
+        [request(TEST_REQ_ID_FIRST), cancel, request(TEST_REQ_ID_FIRST + 2)]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn positions_cancel_during_account_pacing_does_not_wait_for_the_clock() {
     use futures::FutureExt;

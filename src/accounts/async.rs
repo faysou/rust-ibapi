@@ -14,7 +14,7 @@ use crate::common::request_helpers::{self, empty_on_end_of_stream, expect_proto}
 use crate::messages::{resubscribed_notice, Notice, OutgoingMessages};
 use crate::subscriptions::Subscription;
 use crate::transport::farm_watch::FarmMark;
-use crate::transport::r#async::WriteAdmission;
+use crate::transport::r#async::{CancelWrite, WriteAdmission};
 use crate::{Client, Error};
 
 use super::common::snapshots::SnapshotBuilder;
@@ -232,18 +232,19 @@ impl Client {
     /// }
     /// ```
     pub async fn account_summary(&self, group: &AccountGroup, tags: &[&str]) -> Result<Subscription<AccountSummaryResult>, Error> {
-        self.account_summary_send(group, tags)?.await
+        self.account_summary_send(group, tags, None)?.await
     }
 
     fn account_summary_send(
         &self,
         group: &AccountGroup,
         tags: &[&str],
+        admission: Option<WriteAdmission>,
     ) -> Result<impl std::future::Future<Output = Result<Subscription<AccountSummaryResult>, Error>> + Send + 'static, Error> {
         let request_id = self.mint_request_id();
         let request = encoders::encode_request_account_summary(request_id.raw(), group, tags)?;
         let builder = SubscriptionBuilder::new_with_components(self.decoder_context(), Arc::clone(&self.message_bus));
-        Ok(builder.send_with_request_id_capped(request_id, request, None, None))
+        Ok(builder.send_with_request_id_capped(request_id, request, None, admission))
     }
 
     /// Subscribe to account summary updates as complete snapshots.
@@ -854,7 +855,12 @@ pub struct AccountSummarySnapshotsResubscribing<C> {
     /// The connection dropped and the next [`next`](Self::next) waits for the reopened request.
     reconnecting: bool,
     cancelled: Arc<AtomicBool>,
-    reopen: Mutex<Option<JoinHandle<Result<OpenedSummary, Error>>>>,
+    reopen: Mutex<Option<SummaryReopen>>,
+}
+
+struct SummaryReopen {
+    task: JoinHandle<Result<OpenedSummary, Error>>,
+    _admission: CancelWrite,
 }
 
 struct OpenedSummary {
@@ -933,8 +939,9 @@ impl<C: Deref<Target = Client>> AccountSummarySnapshotsResubscribing<C> {
 
     /// Cancels the underlying subscription. The next call to [`next`](Self::next) returns
     /// `Err(Error::Cancelled)`, then any rows not yet emitted, then `None`.
-    /// Cancelling while waiting for a reconnect ends the stream. If a reopen send is already
-    /// in progress, it finishes in the background and cancels its subscription.
+    /// Cancelling while waiting for a reconnect ends the stream. An unopened replacement is
+    /// abandoned before its first byte. If its write has already started, it finishes in the
+    /// background and cancels its subscription.
     pub async fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
         if let Some(snapshots) = &self.snapshots {
@@ -1010,7 +1017,8 @@ impl<C: Deref<Target = Client>> AccountSummarySnapshotsResubscribing<C> {
                     return e;
                 }
                 let tags: Vec<&str> = self.tags.iter().map(String::as_str).collect();
-                let request = match self.client.account_summary_send(&self.group, &tags) {
+                let (admission, cancel) = WriteAdmission::without_deadline();
+                let request = match self.client.account_summary_send(&self.group, &tags, Some(admission)) {
                     Ok(request) => request,
                     Err(e) => {
                         self.reconnecting = false;
@@ -1023,7 +1031,7 @@ impl<C: Deref<Target = Client>> AccountSummarySnapshotsResubscribing<C> {
                 let invalidated = self.invalidated.take();
                 // The write may have reached TWS while its flush is still pending. If the
                 // wrapper is dropped, finish that send so dropping its output can cancel it.
-                *reopen = Some(self.client.message_bus.runtime_handle().spawn(async move {
+                let task = self.client.message_bus.runtime_handle().spawn(async move {
                     if let Some(invalidated) = invalidated {
                         invalidated.cancel().await;
                     }
@@ -1035,9 +1043,10 @@ impl<C: Deref<Target = Client>> AccountSummarySnapshotsResubscribing<C> {
                         snapshots: AccountSummarySnapshots::new(subscription, quiet),
                         mark,
                     })
-                }));
+                });
+                *reopen = Some(SummaryReopen { task, _admission: cancel });
             }
-            let result = reopen.as_mut().unwrap().await;
+            let result = (&mut reopen.as_mut().unwrap().task).await;
             *reopen = None;
             let result = match result {
                 Ok(result) => result,
