@@ -854,7 +854,12 @@ pub struct AccountSummarySnapshotsResubscribing<C> {
     /// The connection dropped and the next [`next`](Self::next) waits for the reopened request.
     reconnecting: bool,
     cancelled: Arc<AtomicBool>,
-    reopen: Mutex<Option<JoinHandle<Result<(AccountSummarySnapshots, FarmMark), Error>>>>,
+    reopen: Mutex<Option<JoinHandle<Result<OpenedSummary, Error>>>>,
+}
+
+struct OpenedSummary {
+    snapshots: AccountSummarySnapshots,
+    mark: FarmMark,
 }
 
 impl<C> std::fmt::Debug for AccountSummarySnapshotsResubscribing<C> {
@@ -1026,9 +1031,10 @@ impl<C: Deref<Target = Client>> AccountSummarySnapshotsResubscribing<C> {
                         return Err(Error::Cancelled);
                     }
                     let mark = message_bus.farm_watch().mark();
-                    request
-                        .await
-                        .map(|subscription| (AccountSummarySnapshots::new(subscription, quiet), mark))
+                    request.await.map(|subscription| OpenedSummary {
+                        snapshots: AccountSummarySnapshots::new(subscription, quiet),
+                        mark,
+                    })
                 }));
             }
             let result = reopen.as_mut().unwrap().await;
@@ -1039,7 +1045,7 @@ impl<C: Deref<Target = Client>> AccountSummarySnapshotsResubscribing<C> {
                 Err(_) => Err(Error::Shutdown),
             };
             match result {
-                Ok((snapshots, mark)) => {
+                Ok(OpenedSummary { snapshots, mark }) => {
                     self.snapshots = Some(snapshots);
                     self.mark = mark;
                     self.reconnecting = false;
