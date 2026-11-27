@@ -1280,6 +1280,11 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                 e = admission.stopped() => Err(e),
                 result = limiter.acquire_before(deadline) => result,
             },
+            (Some((admission, None)), Some(_)) => tokio::select! {
+                biased;
+                e = admission.stopped() => Err(e),
+                () = self.throttle(&message) => Ok(()),
+            },
             _ => {
                 self.throttle(&message).await;
                 Ok(())

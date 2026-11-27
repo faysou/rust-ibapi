@@ -2053,6 +2053,46 @@ async fn account_summary_cancel_before_1101_replacement_first_byte_sends_nothing
 }
 
 #[tokio::test(start_paused = true)]
+async fn account_summary_cancel_releases_1101_replacement_waiting_for_pacing() {
+    use crate::accounts::{types::AccountGroup, AccountSummaryTags};
+    use crate::common::test_utils::helpers::TEST_REQ_ID_FIRST;
+    use crate::testdata::builders::accounts::{cancel_account_summary, request_account_summary};
+    use crate::testdata::builders::RequestEncoder;
+
+    let (stream, bus) = make_bus();
+    let client = crate::Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    let group = AccountGroup("All".to_string());
+    let tags = &[AccountSummaryTags::NET_LIQUIDATION];
+    let mut snapshots = client
+        .account_summary_snapshots_resubscribing(&group, tags, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let limiter = RateLimiter::per_second(1);
+    assert_eq!(limiter.reserve(std::time::Instant::now(), false), Duration::ZERO);
+    bus.set_rate_limiter(limiter);
+    let replacement = RequestId::nth(1);
+    bus.farm_watch().observe(&helpers::test_notice(1101, "account data lost"));
+    tokio::select! {
+        result = tokio::time::timeout(TICK, wait_for_async("the replacement route", || bus.requests.contains(&replacement))) => result.unwrap(),
+        item = snapshots.next() => panic!("replacement should be rate limited, got {item:?}"),
+    }
+    snapshots.cancel().await;
+    tokio::time::timeout(
+        TICK,
+        wait_for_async("the abandoned replacement route to close", || !bus.requests.contains(&replacement)),
+    )
+    .await
+    .unwrap();
+    let request = request_account_summary()
+        .request_id(TEST_REQ_ID_FIRST)
+        .group("All")
+        .tags(tags.iter().copied())
+        .encode_request();
+    let cancel = cancel_account_summary().request_id(TEST_REQ_ID_FIRST).encode_request();
+    assert_eq!(frame_payloads(&stream.captured()), [request, cancel]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn positions_cancel_during_account_pacing_does_not_wait_for_the_clock() {
     use futures::FutureExt;
 
