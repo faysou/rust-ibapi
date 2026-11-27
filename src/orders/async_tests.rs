@@ -9,14 +9,15 @@ use crate::contracts::{Contract, SecurityIdType, SecurityType};
 use crate::contracts::{Currency, Exchange, OptionRight, Symbol};
 use crate::messages::IncomingMessages;
 use crate::orders::builder::{BracketPrices, TrailBy};
+use crate::orders::common::test_tables::{assert_linked_order_requests, linked_orders, LINKED_ORDER_IDS};
 use crate::orders::{OcaType, OrderStatusKind, OrderType, TimeInForce};
 use crate::proto;
 use crate::stubs::MessageBusStub;
 use crate::subscriptions::SubscriptionItem;
 use crate::testdata::builders::orders::{
-    cancel_order_request, commission_and_fees_report, completed_order, completed_orders_end, completed_orders_request, execution_data,
-    execution_data_end, executions_request, global_cancel_request, next_valid_id, next_valid_order_id_request, open_order, open_order_end,
-    open_orders_request, order_bound, order_status, place_order_request,
+    auto_open_orders_request, cancel_order_request, commission_and_fees_report, completed_order, completed_orders_end, completed_orders_request,
+    execution_data, execution_data_end, executions_request, global_cancel_request, next_valid_id, next_valid_order_id_request, open_order,
+    open_order_end, open_orders_request, order_bound, order_status, place_order_request,
 };
 use crate::testdata::builders::ResponseProtoEncoder;
 use crate::{server_versions, Client};
@@ -297,6 +298,23 @@ async fn open_orders() {
 }
 
 #[tokio::test]
+async fn auto_open_orders() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
+        IncomingMessages::OpenOrder,
+        open_order().order_id(7).encode_proto(),
+    )]));
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+
+    let mut subscription = client.auto_open_orders(AutoBind::Yes).await.expect("auto_open_orders");
+
+    assert_request(&message_bus, 0, &auto_open_orders_request().auto_bind(true));
+    match subscription.next().await {
+        Some(Ok(SubscriptionItem::Data(Orders::OrderData(order)))) => assert_eq!(order.order.order_id, 7),
+        other => panic!("expected the bound order, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn completed_orders() {
     let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
         proto_response(
@@ -407,6 +425,203 @@ async fn executions() {
         0,
         &executions_request().request_id(TEST_REQ_ID_FIRST).filter(ExecutionFilter::default()),
     );
+}
+
+fn executions_reply_rows() -> Vec<crate::messages::ResponseMessage> {
+    let request_id = crate::common::test_utils::helpers::TEST_REQ_ID_FIRST;
+    vec![
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data().request_id(request_id).execution_id("e1").encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report().execution_id("e1").commission_and_fees(1.25).encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data().request_id(request_id).execution_id("e2").encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data()
+                .request_id(request_id)
+                .execution_id("x1")
+                .option_exercise_type(1)
+                .encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report().execution_id("r9").commission_and_fees(0.5).encode_proto(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn executions_pair_to_fills() {
+    let mut responses = executions_reply_rows();
+    responses.push(proto_response(IncomingMessages::ExecutionDataEnd, execution_data_end().encode_proto()));
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+
+    let mut subscription = client.executions(ExecutionFilter::default()).await.expect("executions");
+    let rows = subscription
+        .collect_to_end_within(Duration::from_secs(5))
+        .await
+        .expect("reply read to its end");
+    let (fills, unpaired) = crate::orders::FillMatcher::new().pair_executions(rows);
+
+    let fills: Vec<(&str, Option<f64>)> = fills
+        .iter()
+        .map(|fill| {
+            (
+                fill.execution.execution.execution_id.as_str(),
+                fill.commission.as_ref().map(|report| report.commission_and_fees),
+            )
+        })
+        .collect();
+    let unpaired_executions: Vec<&str> = unpaired.executions.iter().map(|data| data.execution.execution_id.as_str()).collect();
+    let unpaired_reports: Vec<&str> = unpaired.reports.iter().map(|report| report.execution_id.as_str()).collect();
+    assert_eq!(fills, vec![("e1", Some(1.25)), ("x1", None)]);
+    assert_eq!(unpaired_executions, vec!["e2"]);
+    assert_eq!(unpaired_reports, vec!["r9"]);
+}
+
+fn replayed_fill_stream() -> Vec<crate::messages::ResponseMessage> {
+    let execution = |execution_id: &str| {
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data().execution_id(execution_id).encode_proto(),
+        )
+    };
+    let report = |execution_id: &str| {
+        proto_response(
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report()
+                .execution_id(execution_id)
+                .commission_and_fees(1.25)
+                .encode_proto(),
+        )
+    };
+    vec![
+        execution("e1"),
+        report("e1"),
+        execution("e1"),
+        report("e1"),
+        execution("e2"),
+        report("e2"),
+        report("e2"),
+        execution("e2"),
+    ]
+}
+
+#[tokio::test]
+async fn order_update_stream_replayed_fills_pair_once() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(replayed_fill_stream()));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+    let mut stream = client.order_update_stream().await.expect("order update stream");
+    let mut matcher = crate::orders::FillMatcher::new();
+
+    let mut fills = Vec::new();
+    let mut duplicates = 0;
+    for _ in 0..8 {
+        match stream.next().await {
+            Some(Ok(SubscriptionItem::Data(OrderUpdate::ExecutionData(execution)))) => fills.extend(matcher.push_execution(execution)),
+            Some(Ok(SubscriptionItem::Data(OrderUpdate::CommissionAndFeesReport(report)))) => match matcher.push_report(report) {
+                crate::orders::ReportMatch::Paired(fill) => fills.push(fill),
+                crate::orders::ReportMatch::Duplicate(_) => duplicates += 1,
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let leftovers = matcher.take_expired(Duration::ZERO);
+
+    let fill_ids: Vec<&str> = fills.iter().map(|fill| fill.execution.execution.execution_id.as_str()).collect();
+    assert_eq!(fill_ids, vec!["e1", "e2"]);
+    assert_eq!(duplicates, 2);
+    assert!(leftovers.executions.is_empty() && leftovers.reports.is_empty(), "{leftovers:?}");
+}
+
+#[tokio::test]
+async fn executions_pair_combo_fills() {
+    let request_id = crate::common::test_utils::helpers::TEST_REQ_ID_FIRST;
+    let perm_id = 1290491156;
+    let execution = |execution_id: &str, security_type: &str, contract_id: i32| {
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data()
+                .request_id(request_id)
+                .execution_id(execution_id)
+                .security_type(security_type)
+                .contract_id(contract_id)
+                .perm_id(perm_id)
+                .shares(1.0)
+                .encode_proto(),
+        )
+    };
+    let report = |execution_id: &str, commission_and_fees: f64| {
+        proto_response(
+            IncomingMessages::CommissionsAndFeesReport,
+            commission_and_fees_report()
+                .execution_id(execution_id)
+                .commission_and_fees(commission_and_fees)
+                .encode_proto(),
+        )
+    };
+    let responses = vec![
+        execution("0000e1a7.6b0717ad.01.01", "BAG", 16472979),
+        execution("0000e1a7.6b0717ad.02.01", "FUT", 649180684),
+        execution("0000e1a7.6b0717ad.03.01", "FUT", 515416632),
+        report("0000e1a7.6b0717ad.02.01", 2.16),
+        report("0000e1a7.6b0717ad.03.01", 2.17),
+        proto_response(IncomingMessages::ExecutionDataEnd, execution_data_end().encode_proto()),
+    ];
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+
+    let mut subscription = client.executions(ExecutionFilter::default()).await.expect("executions");
+    let rows = subscription
+        .collect_to_end_within(Duration::from_secs(5))
+        .await
+        .expect("reply read to its end");
+    let (fills, unpaired) = crate::orders::FillMatcher::new().pair_executions(rows);
+
+    assert_eq!(fills.len(), 1, "{fills:?}");
+    let combo = &fills[0];
+    let legs: Vec<(&str, i32, Option<f64>)> = combo
+        .legs
+        .iter()
+        .map(|leg| {
+            (
+                leg.execution.execution.execution_id.as_str(),
+                leg.execution.contract.contract_id,
+                leg.commission.as_ref().map(|report| report.commission_and_fees),
+            )
+        })
+        .collect();
+    assert_eq!(combo.execution.execution.execution_id, "0000e1a7.6b0717ad.01.01");
+    assert_eq!(combo.execution.contract.security_type, Some(SecurityType::Spread));
+    assert!(combo.commission.is_none());
+    assert_eq!(
+        legs,
+        vec![
+            ("0000e1a7.6b0717ad.02.01", 649180684, Some(2.16)),
+            ("0000e1a7.6b0717ad.03.01", 515416632, Some(2.17)),
+        ]
+    );
+    assert!(unpaired.executions.is_empty() && unpaired.reports.is_empty() && unpaired.fills.is_empty());
+}
+
+#[tokio::test]
+async fn executions_without_end_marker_is_an_error_not_fills() {
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(executions_reply_rows()));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+
+    let mut subscription = client.executions(ExecutionFilter::default()).await.expect("executions");
+    let result = subscription.collect_to_end_within(Duration::from_secs(5)).await;
+
+    assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "got {result:?}");
 }
 
 #[tokio::test]
@@ -668,7 +883,7 @@ async fn order_update_stream_survives_unknown_condition() {
         other => panic!("expected OpenOrder, got {other:?}"),
     }
     match stream.next().await {
-        Some(Ok(SubscriptionItem::Data(OrderUpdate::OpenOrder(o)))) => assert_eq!(o.order_id, 2),
+        Some(Ok(SubscriptionItem::Data(OrderUpdate::OpenOrder(o)))) => assert_eq!(o.order.order_id, 2),
         other => panic!("stream did not survive the unknown condition, got {other:?}"),
     }
 }
@@ -779,7 +994,7 @@ async fn order_update_stream_survives_unknown_security_id_type() {
         other => panic!("expected OpenOrder with Unknown security_id_type, got {other:?}"),
     }
     match stream.next().await {
-        Some(Ok(SubscriptionItem::Data(OrderUpdate::OpenOrder(o)))) => assert_eq!(o.order_id, 2),
+        Some(Ok(SubscriptionItem::Data(OrderUpdate::OpenOrder(o)))) => assert_eq!(o.order.order_id, 2),
         other => panic!("stream did not survive the unknown security_id_type, got {other:?}"),
     }
 }
@@ -979,6 +1194,114 @@ async fn analyze_reports_end_of_stream_when_no_order_arrives() {
     assert!(matches!(result, Err(Error::UnexpectedEndOfStream)), "got {result:?}");
 }
 
+// Async twin of `analyze_waits_past_the_warning_only_frame`.
+#[tokio::test]
+async fn analyze_waits_past_the_warning_only_frame() {
+    let (client, _bus) = create_test_client_with_ordered_proto_responses(vec![
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .commission_and_fees(0.0)
+                .warning_text("If your order is not immediately executable")
+                .encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .initial_margin_before(257638.32)
+                .commission_and_fees(1.00003)
+                .encode_proto(),
+        ),
+    ]);
+    client.id_manager().raise_order_id(OrderId::from(9090));
+    let contract = Contract::stock("AAPL").build();
+
+    let state = client
+        .order(&contract)
+        .buy(100)
+        .limit(50.0)
+        .analyze()
+        .await
+        .expect("analyze should succeed");
+
+    assert_eq!(state.initial_margin_before, Some(257638.32));
+    assert_eq!(state.commission_and_fees, Some(1.00003));
+    assert_eq!(state.warning_text, "If your order is not immediately executable");
+}
+
+// Async twin of `analyze_surfaces_the_rejection_after_an_over_margin_frame`.
+#[tokio::test]
+async fn analyze_surfaces_the_rejection_after_an_over_margin_frame() {
+    let (client, _bus) = create_test_client_with_ordered_proto_responses(vec![
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .initial_margin_before(257664.09)
+                .suggested_size("4000")
+                .encode_proto(),
+        ),
+        proto_error_response(9090, 201, "Order rejected - reason:YOUR ORDER IS NOT ACCEPTED."),
+    ]);
+    client.id_manager().raise_order_id(OrderId::from(9090));
+    let contract = Contract::stock("AAPL").build();
+
+    let err = client
+        .order(&contract)
+        .buy(10_000_000)
+        .limit(1.0)
+        .analyze()
+        .await
+        .expect_err("an over-margin what-if order must surface the rejection");
+
+    assert_tws_error_message(err, 201, "YOUR ORDER IS NOT ACCEPTED");
+}
+
+// Async twin of `analyze_order_sends_a_what_if_copy_under_the_given_order_id`.
+#[tokio::test]
+async fn analyze_order_sends_a_what_if_copy_under_the_given_order_id() {
+    let (client, bus) = create_test_client_with_ordered_proto_responses(vec![
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .commission_and_fees(0.0)
+                .warning_text("If your order is not immediately executable")
+                .encode_proto(),
+        ),
+        proto_response(
+            IncomingMessages::OpenOrder,
+            open_order()
+                .order_id(9090)
+                .status(OrderStatusKind::PreSubmitted)
+                .initial_margin_before(257638.32)
+                .commission_and_fees(1.00003)
+                .encode_proto(),
+        ),
+    ]);
+    let contract = Contract::stock("AAPL").build();
+    let mut order = order_builder::limit_order(Action::Buy, 10.0, 100.0);
+    order.order_id = 77;
+
+    let state = client.analyze_order(9090, &contract, &order).await.expect("analyze_order should succeed");
+
+    let request: crate::proto::PlaceOrderRequest = decode_request_proto(&bus, 0);
+    assert_eq!(request.order_id, Some(9090));
+    assert_eq!(request.order.expect("request carries an order").what_if, Some(true));
+    assert_eq!(state.initial_margin_before, Some(257638.32));
+    assert_eq!(state.commission_and_fees, Some(1.00003));
+    assert_eq!(state.warning_text, "If your order is not immediately executable");
+    assert!(!order.what_if, "the caller's order keeps what_if unset");
+    assert_eq!(order.order_id, 77);
+    assert_eq!(client.next_order_id(), 9091, "a later order cannot reuse the what-if's id");
+}
+
 // The `submit` family, against `Client::stubbed` rather than a mock client that
 // carried its own copy of each method. The shadows dated from before the
 // builder had a real seam to test against; #735 moved `analyze` off its shadow
@@ -1079,6 +1402,81 @@ async fn submit_all_reserves_three_ids_and_wires_the_bracket() {
     assert_eq!(orders[1].lmt_price, Some(55.0));
     assert_eq!(orders[2].order_type.as_deref(), Some("STP"));
     assert_eq!(orders[2].aux_price, Some(45.0));
+}
+
+#[tokio::test]
+async fn submit_linked_orders_preserves_ids_and_transmits_only_the_last_order() {
+    let (client, bus) = create_test_client();
+    client.submit_linked_orders(linked_orders()).await.unwrap();
+
+    assert_linked_order_requests(&bus, 3);
+    assert_eq!(client.next_order_id(), 9410);
+}
+
+#[tokio::test]
+async fn submit_linked_orders_checks_every_order_before_sending() {
+    let (client, bus) = create_test_client();
+    let empty = client.submit_linked_orders(Vec::new()).await.unwrap_err();
+    assert!(matches!(empty, Error::InvalidArgument(message) if message == "submit_linked_orders needs at least one order"));
+
+    for (id, reason) in [
+        (0, "0 is the unset order id"),
+        (LINKED_ORDER_IDS[0], "each linked order needs a distinct order id"),
+    ] {
+        let mut orders = linked_orders();
+        orders[2].1.order_id = id;
+        let e = client.submit_linked_orders(orders).await.unwrap_err();
+        assert!(
+            matches!(e, Error::Validation(ValidationError::InvalidField { field: "Order::order_id", value, reason: actual })
+            if value == id.to_string() && actual == reason),
+            "{id}"
+        );
+    }
+
+    let mut orders = linked_orders();
+    orders[2].1.order_id = REQUEST_ID_FLOOR;
+    let e = client.submit_linked_orders(orders).await.unwrap_err();
+    assert!(matches!(e, Error::OrderIdInRequestRange { order_id } if order_id == REQUEST_ID_FLOOR));
+    assert_eq!(request_message_count(&bus), 0);
+}
+
+#[tokio::test]
+async fn submit_linked_orders_reports_ambiguous_writes_without_sending_cancels() {
+    for writes in 0..LINKED_ORDER_IDS.len() {
+        let bus = Arc::new(MessageBusStub::default().with_sends_failing_after(writes));
+        let client = Client::stubbed(bus.clone(), server_versions::SIZE_RULES);
+        let e = client.submit_linked_orders(linked_orders()).await.unwrap_err();
+        let Error::OrdersPartiallySent { sent, not_sent, source } = e else {
+            panic!("expected a partial send, received {e:?}");
+        };
+        let (expected_sent, expected_not_sent) = LINKED_ORDER_IDS.split_at(writes + 1);
+        assert_eq!(sent, expected_sent);
+        assert_eq!(not_sent, expected_not_sent);
+        assert!(matches!(*source, Error::ConnectionReset));
+        assert_linked_order_requests(&bus, writes + 1);
+    }
+}
+
+#[tokio::test]
+async fn submit_linked_orders_returns_refused_first_send_bare() {
+    let bus = Arc::new(MessageBusStub::default().with_refused_sends());
+    let client = Client::stubbed(bus.clone(), server_versions::SIZE_RULES);
+    let e = client.submit_linked_orders(linked_orders()).await.unwrap_err();
+
+    assert!(matches!(e, Error::Reconnecting));
+    assert!(e.is_unsent());
+    assert_eq!(request_message_count(&bus), 0);
+}
+
+#[tokio::test]
+async fn dropping_submit_linked_orders_leaves_the_attempted_write_for_the_caller() {
+    let bus = Arc::new(MessageBusStub::default().with_sends_stalling_after(0));
+    let client = Client::stubbed(bus.clone(), server_versions::SIZE_RULES);
+    let mut submitting = Box::pin(client.submit_linked_orders(linked_orders()));
+    assert!(futures::poll!(&mut submitting).is_pending());
+    drop(submitting);
+
+    assert_linked_order_requests(&bus, 1);
 }
 
 #[tokio::test]
@@ -1409,6 +1807,7 @@ async fn order_entry_points_reject_request_range_ids() {
     rejected(client.cancel_order(floor).await.map(|_| ()), "cancel_order");
     rejected(client.order_status_stream(floor).await.map(|_| ()), "order_status_stream");
     rejected(client.wait_for_fill(floor, std::time::Duration::ZERO).await.map(|_| ()), "wait_for_fill");
+    rejected(client.find_order(floor, std::time::Duration::ZERO).await.map(|_| ()), "find_order");
 
     client.id_manager().raise_order_id(OrderId::from(floor));
     rejected(
@@ -1533,6 +1932,90 @@ async fn wait_for_fill_fails_on_connection_reset() {
 }
 
 #[tokio::test]
+async fn find_order_reports_each_outcome() {
+    for case in crate::orders::common::test_tables::lookup_cases() {
+        let message_bus = Arc::new(MessageBusStub::with_responses_per_request(case.replies));
+        let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+
+        let result = match case.perm_id {
+            Some(perm_id) => client.find_order_by_perm_id(perm_id, case.within).await,
+            None => client.find_order(13, case.within).await,
+        };
+
+        case.expected.check(case.name, result);
+        assert_eq!(request_message_count(&message_bus), case.requests, "{}", case.name);
+        assert_request(&message_bus, 0, &open_orders_request());
+        for index in 1..case.requests {
+            assert_request(&message_bus, index, &completed_orders_request().api_only(false));
+        }
+    }
+}
+
+#[tokio::test]
+async fn find_order_with_order_id_zero() {
+    for case in crate::orders::common::test_tables::lookup_cases_with_order_id_zero() {
+        let message_bus = Arc::new(MessageBusStub::with_responses_per_request(case.replies));
+        let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES).with_client_id(0);
+
+        let result = match case.perm_id {
+            Some(perm_id) => client.find_order_by_perm_id(perm_id, case.within).await,
+            None => client.find_order(0, case.within).await,
+        };
+
+        case.expected.check(case.name, result);
+        assert_eq!(request_message_count(&message_bus), case.requests, "{}", case.name);
+        assert_request(&message_bus, 0, &open_orders_request());
+        if case.requests == 2 {
+            assert_request(&message_bus, 1, &completed_orders_request().api_only(false));
+        }
+    }
+}
+
+/// A perm id of 0 or below would match records that carry none, so it is
+/// refused before anything is sent.
+#[tokio::test]
+async fn find_order_by_perm_id_rejects_a_perm_id_below_one() {
+    let (client, message_bus) = create_test_client();
+
+    for perm_id in [0, -1] {
+        let result = client.find_order_by_perm_id(perm_id, Duration::ZERO).await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(Error::Validation(crate::builder::ValidationError::InvalidField { field: "perm_id", value, reason }))
+                    if value == &perm_id.to_string() && reason == "permanent order ID must be positive"
+            ),
+            "{perm_id}: {result:?}"
+        );
+    }
+    assert_eq!(request_message_count(&message_bus), 0, "nothing reaches the wire");
+}
+
+/// The bound is a deadline from the call: completed orders are re-read on a
+/// fixed interval until it passes, then the answer is `NotFound`.
+#[tokio::test]
+async fn find_order_rechecks_completed_orders_until_the_bound() {
+    let open = proto_response(IncomingMessages::OpenOrderEnd, open_order_end().encode_proto());
+    let none = proto_response(IncomingMessages::CompletedOrdersEnd, completed_orders_end().encode_proto());
+    let message_bus = Arc::new(MessageBusStub::with_responses_per_request(
+        std::iter::once(vec![open]).chain(std::iter::repeat_n(vec![none], 20)).collect(),
+    ));
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+
+    let started = std::time::Instant::now();
+    let result = client.find_order(13, Duration::from_millis(250)).await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(result, OrderLookup::NotFound);
+    assert!(elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(2), "{elapsed:?}");
+    // Completed orders read at 0, 100, 200 and 250 ms; a late wake-up on a
+    // busy machine can merge the last two.
+    let completed_reads = request_message_count(&message_bus) - 1;
+    assert!((3..=4).contains(&completed_reads), "{completed_reads} completed-orders reads");
+}
+
+#[tokio::test]
 async fn order_status_stream_yields_statuses_and_writes_nothing() {
     let (client, message_bus) = create_test_client_with_ordered_proto_responses(vec![
         order_status_response(order_status().status(OrderStatusKind::Submitted).filled(40.0).remaining(60.0)),
@@ -1591,6 +2074,95 @@ async fn next_valid_order_id_then_submit_order_does_not_reissue_the_id() {
     client.submit_order(order_id, &contract, &order).await.expect("submit_order");
 
     assert_eq!(client.next_order_id(), order_id + 1);
+}
+
+// TWS sends no end marker for a what-if order: a warning-only frame, or a frame with a suggested
+// size, with nothing after it must time out instead of waiting for good.
+#[tokio::test]
+async fn analyze_order_times_out_when_the_state_never_comes() {
+    let warning_only = proto_response(
+        IncomingMessages::OpenOrder,
+        open_order()
+            .order_id(9090)
+            .status(OrderStatusKind::PreSubmitted)
+            .commission_and_fees(0.0)
+            .warning_text("If your order is not immediately executable")
+            .encode_proto(),
+    );
+    let over_margin = proto_response(
+        IncomingMessages::OpenOrder,
+        open_order()
+            .order_id(9090)
+            .status(OrderStatusKind::PreSubmitted)
+            .initial_margin_before(257664.09)
+            .suggested_size("4000")
+            .encode_proto(),
+    );
+    let contract = Contract::stock("AAPL").build();
+    let order = order_builder::limit_order(Action::Buy, 10.0, 100.0);
+
+    for (name, frame) in [("warning only", warning_only), ("over margin without 201", over_margin)] {
+        let bus = Arc::new(MessageBusStub::with_ordered_responses(vec![frame]).keeping_channels_open());
+        let client = Client::stubbed(bus, server_versions::SIZE_RULES).with_one_shot_timeout(Duration::from_millis(50));
+
+        let result = client.analyze_order(9090, &contract, &order).await;
+
+        assert!(matches!(result, Err(Error::Timeout)), "{name}: {result:?}");
+    }
+}
+
+#[tokio::test]
+async fn executions_filter_by_utc_time_and_read_utc_execution_time() {
+    use time::macros::datetime;
+
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![
+        proto_response(
+            IncomingMessages::ExecutionData,
+            execution_data().request_id(TEST_REQ_ID_FIRST).time("20261111-02:37:49Z").encode_proto(),
+        ),
+        proto_response(IncomingMessages::ExecutionDataEnd, execution_data_end().encode_proto()),
+    ]));
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+
+    let filter = ExecutionFilter {
+        time: Some(datetime!(2026-11-10 20:30:00 -6)),
+        ..ExecutionFilter::default()
+    };
+    let mut subscription = client.executions(filter).await.expect("failed to get executions");
+    let execution = match subscription.next().await {
+        Some(Ok(SubscriptionItem::Data(Executions::ExecutionData(data)))) => data.execution,
+        other => panic!("Expected Executions::ExecutionData, got {other:?}"),
+    };
+
+    assert_eq!(execution.time_utc(), Some(datetime!(2026-11-11 02:37:49 UTC)));
+    let expected_filter = ExecutionFilter {
+        time: Some(datetime!(2026-11-11 02:30:00 UTC)),
+        ..ExecutionFilter::default()
+    };
+    assert_request(
+        &message_bus,
+        0,
+        &executions_request().request_id(TEST_REQ_ID_FIRST).filter(expected_filter),
+    );
+}
+
+#[tokio::test]
+async fn analyze_order_accepts_an_unrepresentable_timeout() {
+    let (client, _bus) = create_test_client_with_ordered_proto_responses(vec![proto_response(
+        IncomingMessages::OpenOrder,
+        open_order()
+            .order_id(9090)
+            .status(OrderStatusKind::PreSubmitted)
+            .initial_margin_before(1234.5)
+            .encode_proto(),
+    )]);
+    let client = client.with_one_shot_timeout(Duration::MAX);
+    let contract = Contract::stock("AAPL").build();
+    let order = order_builder::limit_order(Action::Buy, 10.0, 100.0);
+
+    let state = client.analyze_order(9090, &contract, &order).await.unwrap();
+
+    assert_eq!(state.initial_margin_before, Some(1234.5));
 }
 
 /// `Error::is_unsent` is `true` only when the failing order call wrote nothing. The converse

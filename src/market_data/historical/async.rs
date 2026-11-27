@@ -1,11 +1,5 @@
-use std::collections::VecDeque;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::ops::ControlFlow;
 
-use futures::Stream;
-use log::error;
 use time::OffsetDateTime;
 
 use crate::client::ids::RequestId;
@@ -13,18 +7,14 @@ use crate::client::ClientRequestBuilders;
 use crate::common::request_helpers::{self, empty_on_end_of_stream};
 use crate::common::retry::retry_on_connection_reset;
 use crate::contracts::Contract;
-use crate::protocol::{check_version, Features};
-use crate::subscriptions::common::SubscriptionItem;
-use crate::subscriptions::log_cancel_error;
 use crate::subscriptions::r#async::Subscription;
-use crate::transport::{AsyncInternalSubscription, AsyncMessageBus};
 use crate::{Client, Error};
 
-use super::common::tick::{classify, TickAction};
+use super::common::tick_pages::{PagedTick, TickPages, PAGE_SIZE};
 use super::common::{self, encoders};
 use super::{
-    BarRequest, BarSize, Duration, HeadTimestampRequest, HistogramEntry, HistogramRequest, HistoricalData, HistoricalDataFrame, Schedule,
-    ScheduleRequest, TickDecoder, WhatToShow,
+    BarRequest, BarSize, Duration, HeadTimestampRequest, HistogramEntry, HistogramRequest, HistoricalData, HistoricalDataFrame, PagingStop, Schedule,
+    ScheduleRequest, TickDecoder, TickFrame, TicksBetween, TicksBetweenError, WhatToShow,
 };
 use crate::market_data::TradingHours;
 
@@ -169,7 +159,8 @@ impl Client {
     /// [`HistoricalTicksBuilder::last`](super::HistoricalTicksBuilder::last) /
     /// `.mid_point()` / `.bid_ask(IgnoreSize)`. Use
     /// [`HistoricalTicksBuilder::starting`](super::HistoricalTicksBuilder::starting) /
-    /// `.ending()` to anchor the query (at least one is required per IBKR).
+    /// `.ending()` to anchor the query (at least one is required per IBKR). The
+    /// terminal sends the request and returns the complete reply as a `Vec`.
     ///
     /// # Arguments
     /// * `contract` - [Contract] object that is subject of query
@@ -188,14 +179,14 @@ impl Client {
     ///     let contract = Contract::stock("TSLA").build();
     ///
     ///     // Trade ticks anchored at a start date:
-    ///     let mut trades = client
+    ///     let trades = client
     ///         .historical_ticks(&contract, 100)
     ///         .starting(datetime!(2023-04-15 0:00 UTC))
     ///         .last()
     ///         .await
     ///         .expect("historical ticks request failed");
     ///
-    ///     while let Some(tick) = trades.next().await {
+    ///     for tick in &trades {
     ///         println!("{tick:?}");
     ///     }
     ///
@@ -212,33 +203,66 @@ impl Client {
         super::HistoricalTicksBuilder::new(self, contract, number_of_ticks)
     }
 
-    /// Cancels an in-flight historical ticks request.
+    /// Page historical ticks in an inclusive-start, exclusive-end range.
     ///
-    /// # Arguments
-    /// * `request_id` - The request ID of the historical ticks subscription to cancel.
+    /// Each request asks for 1,000 ticks. See [`HistoricalTicksBetweenBuilder`](super::HistoricalTicksBetweenBuilder)
+    /// for tick types, limits, and partial results.
+    ///
     /// # Examples
     ///
     /// ```no_run
     /// use ibapi::Client;
     /// use ibapi::contracts::Contract;
+    /// use time::macros::datetime;
     ///
     /// #[tokio::main]
-    /// async fn main() {
-    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
-    ///
-    ///     let contract = Contract::stock("MSFT").build();
-    ///     let subscription = client.historical_ticks(&contract, 100).last().await.expect("request failed");
-    ///
-    ///     // Holding the subscription, `subscription.cancel().await` (or dropping it) does the same.
-    ///     client.cancel_historical_ticks(subscription.request_id()).await.expect("cancel failed");
+    /// async fn main() -> Result<(), ibapi::Error> {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await?;
+    ///     let contract = Contract::stock("AAPL").build();
+    ///     let start = datetime!(2026-11-13 14:30 UTC);
+    ///     let end = datetime!(2026-11-13 14:35 UTC);
+    ///     let trades = client.historical_ticks_between(&contract, start, end).last().await?;
+    ///     println!("{} trades", trades.ticks.len());
+    ///     Ok(())
     /// }
     /// ```
-    pub async fn cancel_historical_ticks(&self, request_id: i32) -> Result<(), Error> {
-        check_version(self.server_version(), Features::CANCEL_CONTRACT_DATA)?;
+    pub fn historical_ticks_between<'a>(
+        &'a self,
+        contract: &'a Contract,
+        start: OffsetDateTime,
+        end: OffsetDateTime,
+    ) -> super::HistoricalTicksBetweenBuilder<'a, Self> {
+        super::HistoricalTicksBetweenBuilder::new(self, contract, Some(start), end, None)
+    }
 
-        let message = encoders::encode_cancel_historical_ticks(request_id)?;
-        self.send_message(message).await?;
-        Ok(())
+    /// Page backward before `end` until at least `limit` ticks are collected or TWS has no older ticks.
+    ///
+    /// The result may exceed `limit` to retain a whole second. A zero limit sends no requests.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::Client;
+    /// use ibapi::contracts::Contract;
+    /// use time::macros::datetime;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), ibapi::Error> {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await?;
+    ///     let contract = Contract::stock("AAPL").build();
+    ///     let end = datetime!(2026-11-13 14:35 UTC);
+    ///     let trades = client.historical_ticks_latest(&contract, 100, end).last().await?;
+    ///     println!("{} trades", trades.ticks.len());
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn historical_ticks_latest<'a>(
+        &'a self,
+        contract: &'a Contract,
+        limit: usize,
+        end: OffsetDateTime,
+    ) -> super::HistoricalTicksBetweenBuilder<'a, Self> {
+        super::HistoricalTicksBetweenBuilder::new(self, contract, None, end, Some(limit))
     }
 
     /// Requests data histogram of specified contract.
@@ -348,7 +372,7 @@ pub(crate) async fn historical_data_subscription(
 // seam between the typed builder and the wire encoder. Internal, so the param
 // budget doesn't apply; the allow is for clippy's 8-arg lint.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn historical_ticks<T: TickDecoder<T>>(
+pub(crate) async fn historical_ticks<T: TickDecoder<T> + Send + 'static>(
     client: &Client,
     contract: &Contract,
     start: Option<OffsetDateTime>,
@@ -357,22 +381,85 @@ pub(crate) async fn historical_ticks<T: TickDecoder<T>>(
     what_to_show: WhatToShow,
     trading_hours: TradingHours,
     ignore_size: bool,
-) -> Result<TickSubscription<T>, Error> {
-    let builder = client.request();
-    let request = encoders::encode_request_historical_ticks(
-        builder.request_id(),
-        contract,
-        start,
-        end,
-        number_of_ticks,
-        what_to_show,
-        trading_hours.use_rth(),
-        ignore_size,
-    )?;
-    let request_id = builder.request_id();
-    let subscription = builder.send_raw(request).await?;
+) -> Result<Vec<T>, Error> {
+    let deadline = request_helpers::one_shot_deadline(client);
 
-    Ok(TickSubscription::new(subscription, request_id, Arc::clone(&client.message_bus)))
+    retry_on_connection_reset(client, deadline, || async move {
+        request_helpers::check_deadline(deadline)?;
+        let builder = client.request();
+        let request = encoders::encode_request_historical_ticks(
+            builder.request_id(),
+            contract,
+            start,
+            end,
+            number_of_ticks,
+            what_to_show,
+            trading_hours.use_rth(),
+            ignore_size,
+        )?;
+
+        // Dropping the subscription before the `done` frame, on any error
+        // below or with the future, sends TWS's cancel; after it, nothing is
+        // sent.
+        let mut subscription = request_helpers::send_with_deadline(client, deadline, |admission| {
+            Ok(builder.send_capped_before::<TickFrame<T>>(request, None, admission))
+        })
+        .await?;
+
+        let mut ticks = Vec::new();
+        loop {
+            let frame = request_helpers::next_frame(&mut subscription, deadline).await?;
+            ticks.extend(frame.ticks);
+            if frame.done {
+                return Ok(ticks);
+            }
+        }
+    })
+    .await
+}
+
+// Pages `historical_ticks` backward from `end`, back to `start` or until `limit` ticks; see
+// `TickPages` for the rules. Same builder-to-encoder seam as `historical_ticks`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn historical_ticks_between<T: TickDecoder<T> + PagedTick + Send + 'static>(
+    client: &Client,
+    contract: &Contract,
+    start: Option<OffsetDateTime>,
+    end: OffsetDateTime,
+    limit: Option<usize>,
+    what_to_show: WhatToShow,
+    trading_hours: TradingHours,
+    ignore_size: bool,
+) -> Result<TicksBetween<T>, TicksBetweenError<T>> {
+    let mut pages = TickPages::new(start, end, limit)?;
+
+    loop {
+        if pages.limit_reached() {
+            return Ok(pages.finish(PagingStop::LimitReached));
+        }
+
+        // Each page is one request, so `one_shot_timeout` bounds each page on its own
+        let page = historical_ticks::<T>(
+            client,
+            contract,
+            None,
+            Some(pages.request_end()),
+            PAGE_SIZE,
+            what_to_show,
+            trading_hours,
+            ignore_size,
+        )
+        .await;
+
+        match page {
+            Ok(page) => {
+                if let ControlFlow::Break(stop) = pages.push(page) {
+                    return Ok(pages.finish(stop));
+                }
+            }
+            Err(error) => return Err(pages.fail(error)),
+        }
+    }
 }
 
 pub(crate) async fn historical_schedule(
@@ -395,156 +482,6 @@ pub(crate) async fn historical_schedule(
         )
     })
     .await
-}
-
-// === TickSubscription and related types ===
-
-/// Async subscription handle that decodes historical tick batches as they arrive.
-///
-/// `TickSubscription<T>` is a [`Stream`] of `Result<SubscriptionItem<T>, Error>`,
-/// the same shape as the async [`Subscription`](crate::subscriptions::Subscription):
-///
-/// * `Some(Ok(SubscriptionItem::Data(tick)))` — a decoded tick.
-/// * `Some(Ok(SubscriptionItem::Notice(n)))` — a non-fatal IB notice bound to
-///   this request; the stream stays open.
-/// * `Some(Err(e))` — terminal error (decode or transport); the stream is over.
-/// * `None` — the stream has ended.
-///
-/// Bring [`StreamExt`](futures::StreamExt) into scope for `.next().await`, and
-/// [`SubscriptionItemStreamExt`](crate::subscriptions::SubscriptionItemStreamExt)
-/// for `.filter_data()` when you only want ticks. Both are in
-/// [`ibapi::prelude`](crate::prelude).
-#[must_use = "TickSubscription must be polled (.next().await or .filter_data()) to receive ticks; dropping it cancels the request"]
-pub struct TickSubscription<T: TickDecoder<T>> {
-    done: bool,
-    stream_ended: bool,
-    messages: AsyncInternalSubscription,
-    buffer: VecDeque<T>,
-    request_id: i32,
-    message_bus: Arc<dyn AsyncMessageBus>,
-    cancelled: AtomicBool,
-}
-
-impl<T: TickDecoder<T>> TickSubscription<T> {
-    fn new(messages: AsyncInternalSubscription, request_id: i32, message_bus: Arc<dyn AsyncMessageBus>) -> Self {
-        Self {
-            done: false,
-            stream_ended: false,
-            messages,
-            buffer: VecDeque::new(),
-            request_id,
-            message_bus,
-            cancelled: AtomicBool::new(false),
-        }
-    }
-
-    /// The request ID TWS knows this request by, for [`Client::cancel_historical_ticks`](crate::Client::cancel_historical_ticks)
-    /// from code that does not hold the subscription, or to match it in logs.
-    pub fn request_id(&self) -> i32 {
-        self.request_id
-    }
-
-    /// Cancel the historical-ticks request. After completion nothing is written.
-    /// Also fired automatically on `Drop` for unfinished subscriptions; explicit calls are idempotent.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use ibapi::prelude::*;
-    ///
-    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// let client = Client::connect("127.0.0.1:4002", 100).await?;
-    /// let contract = Contract::stock("MSFT").build();
-    /// let subscription = client.historical_ticks(&contract, 100).last().await?;
-    /// subscription.cancel().await;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn cancel(&self) {
-        // After the last batch TWS has finished the request: nothing to write.
-        if self.done || self.cancelled.swap(true, Ordering::Relaxed) {
-            return;
-        }
-
-        match encoders::encode_cancel_historical_ticks(self.request_id) {
-            Ok(message) => {
-                // The registration is released at drop, by liveness: removing
-                // it here by key could take out a newer request under the id.
-                if let Err(e) = self.message_bus.send_message(message).await {
-                    log_cancel_error("historical ticks subscription", &e);
-                }
-            }
-            Err(e) => error!("error encoding cancel historical ticks: {e}"),
-        }
-    }
-}
-
-impl<T: TickDecoder<T> + Unpin> Stream for TickSubscription<T> {
-    type Item = Result<SubscriptionItem<T>, Error>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // `T: Unpin` (all tick types are plain data) makes `TickSubscription<T>`
-        // Unpin — the only `T`-bearing field is `VecDeque<T>` — so we can project
-        // to `&mut Self`. Every other field (BroadcastStream, bool, Arc) is Unpin.
-        let this = self.get_mut();
-
-        loop {
-            if let Some(tick) = this.buffer.pop_front() {
-                return Poll::Ready(Some(Ok(SubscriptionItem::Data(tick))));
-            }
-
-            // `done` (decoder's last-batch flag) and `stream_ended` (terminal
-            // error) are distinct reasons the stream is over;
-            // either ends it once the buffer is drained.
-            if this.done || this.stream_ended {
-                return Poll::Ready(None);
-            }
-
-            // `cancel()` ends the stream locally, reporting it once.
-            if this.cancelled.load(Ordering::Relaxed) {
-                this.stream_ended = true;
-                return Poll::Ready(Some(Err(Error::Cancelled)));
-            }
-
-            // Lag is converted to an in-band gap notice inside
-            // `poll_next_routed` (#779); the TickAction::Notice arm delivers it.
-            let routed = match this.messages.poll_next_routed(cx) {
-                Poll::Ready(Some(item)) => item,
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
-            };
-
-            match classify::<T>(routed) {
-                TickAction::Batch(ticks, done) => {
-                    this.buffer.extend(ticks);
-                    this.done = done;
-                }
-                TickAction::Skip => {}
-                TickAction::Notice(notice) => return Poll::Ready(Some(Ok(SubscriptionItem::Notice(notice)))),
-                TickAction::Error(e) => {
-                    this.stream_ended = true;
-                    return Poll::Ready(Some(Err(e)));
-                }
-            }
-        }
-    }
-}
-
-impl<T: TickDecoder<T>> Drop for TickSubscription<T> {
-    fn drop(&mut self) {
-        if self.done || self.cancelled.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        let request_id = self.request_id;
-        let message_bus = self.message_bus.clone();
-        if let Ok(message) = encoders::encode_cancel_historical_ticks(request_id) {
-            self.message_bus.runtime_handle().spawn(async move {
-                if let Err(e) = message_bus.send_message(message).await {
-                    log_cancel_error("historical ticks subscription", &e);
-                }
-            });
-        }
-    }
 }
 
 #[cfg(test)]

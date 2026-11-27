@@ -10,7 +10,7 @@ triggers:
   - adding an Order field that carries another order's id
 symbols: [REQUEST_ID_FLOOR, RequestId, OrderId, WireId, WireId::classify, OrderId::checked, verify_and_reserve_order_ids, prepare_place_order, prepare_place_orders, carried_order_ids, Client::mint_request_id]
 related: [proto-aware-accessors, id-parameters]
-precedents: ["#789", "#1069", "#1231", "#1335"]
+precedents: ["#789", "#1069", "#1231", "#1283", "#1335"]
 ---
 
 An error frame carries one integer for both requests and orders, so the two id domains must
@@ -21,8 +21,7 @@ which table happens to hold the number.
 **Minting a request id** → `Client::mint_request_id()` (or a `RequestBuilder`), which yields a
 `RequestId`. Pass `request_id.raw()` to the encoder and the `RequestId` to the bus. Request ids
 are crate-minted only; callers read a live request's id from `Subscription::request_id()`,
-`TickSubscription::request_id()`, `ContractDetailsBuilder::request_id()` or
-`OptionChainBuilder::request_id()`.
+`ContractDetailsBuilder::request_id()` or `OptionChainBuilder::request_id()`.
 
 **Accepting an order id from a caller** → take `impl Into<OrderId>` (`orders::OrderId`, public;
 `i32` converts), then check at the entry point. Anything that places an order goes through
@@ -67,6 +66,9 @@ only on user demand. The general form, for every id newtype, is [id parameters](
 - #1231 — the generator ignored caller-chosen ids, so `next_valid_order_id()` then
   `submit_order(id, ..)` let the next builder `submit` reuse `id`. Checking and reserving merged
   into one entry point over one carried-id list; `next_valid_order_id` reserves what it returns.
+- #1283 — an `ExecutionData` reply to `executions()` went to the order route whenever one was open
+  for its order id, so the order-id field outranked the request-id field. The request-id field
+  now decides: a request-range id routes to that request only, -1 to the order route.
 - #1335 — OCA and bracket submits checked one order, sent it, then checked the next, so an id
   check failing on a later order left the earlier ones live. `prepare_place_order` (check, reserve
   and encode) is now the shared entry point, and `prepare_place_orders` prepares a whole batch

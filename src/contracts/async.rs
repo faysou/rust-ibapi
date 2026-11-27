@@ -1,5 +1,7 @@
 //! Asynchronous implementation of contract management functionality
 
+use std::future::Future;
+
 use super::common::stream_decoders::{ImpliedVolatilityRequest, OptionPriceRequest};
 use super::common::{decoders, encoders};
 use super::*;
@@ -10,6 +12,7 @@ use crate::contracts::ContractId;
 use crate::messages::OutgoingMessages;
 use crate::protocol::{check_version, Features};
 use crate::subscriptions::Subscription;
+use crate::transport::r#async::WriteAdmission;
 use crate::{Client, Error};
 
 impl Client {
@@ -20,12 +23,27 @@ impl Client {
     /// Collects every row before returning. To read rows as they arrive, stop reading early, or know the
     /// request id up front, use [Client::contract_details_stream].
     ///
-    /// Waits for TWS's end marker with no time bound. For a bound, use
+    /// A configured [`one_shot_timeout`](crate::ClientBuilder::one_shot_timeout) sets one deadline
+    /// for sending the request and reading the whole reply. With no timeout, the call waits
+    /// without a time limit.
+    /// During a TWS stall, contract-details requests went unanswered, with no error, until TWS
+    /// was restarted (#1299). The request is not resent after a reconnect: a dropped connection
+    /// ends the call with [`Error::ConnectionReset`]. For a bound on one call, use
     /// [`contract_details_stream`](Self::contract_details_stream) and
     /// [`collect_to_end_within`](crate::subscriptions::Subscription::collect_to_end_within).
     ///
+    /// # Errors
+    /// [`Error::Timeout`] if the deadline expires before the end marker. On server version 215
+    /// or later, the client sends a cancel for an open subscription. If the deadline expires
+    /// or the caller drops the future after a write starts, the client finishes the frame in
+    /// the background before cancelling.
+    ///
     /// # Arguments
     /// * `contract` - The [Contract] used as sample to query the available contracts.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`], without sending, for a [`SecurityType::Spread`]
+    /// (BAG) contract: TWS has no contract details for one and answers code 321.
     ///
     /// # Examples
     ///
@@ -46,7 +64,13 @@ impl Client {
     /// }
     /// ```
     pub async fn contract_details(&self, contract: &Contract) -> Result<Vec<ContractDetails>, Error> {
-        self.contract_details_stream(contract).subscribe().await?.collect_to_end().await
+        let deadline = request_helpers::one_shot_deadline(self);
+        let request = self.contract_details_stream(contract);
+        let mut subscription = request_helpers::send_with_deadline(self, deadline, |admission| request.subscribe_before(admission)).await?;
+        match deadline {
+            Some(deadline) => subscription.collect_to_end_before(deadline).await,
+            None => subscription.collect_to_end().await,
+        }
     }
 
     /// Build a contract-details request whose subscription yields one
@@ -62,6 +86,9 @@ impl Client {
     ///
     /// # Arguments
     /// * `contract` - The [Contract] used as sample to query the available contracts.
+    ///
+    /// A [`SecurityType::Spread`] (BAG) contract makes
+    /// `subscribe` return [`Error::InvalidArgument`] without sending.
     ///
     /// # Examples
     ///
@@ -135,6 +162,12 @@ impl Client {
     /// Requests details about a given market rule.
     ///
     /// The market rule for an instrument on a particular exchange provides details about how the minimum price increment changes with price.
+    ///
+    /// The band edges and increments are in the contract's currency. For a contract whose
+    /// [`price_magnifier`](crate::contracts::ContractDetails::price_magnifier) is above 1, such as
+    /// an LSE stock quoted and ordered in pence, multiply them by the magnifier before comparing
+    /// them with an order or market data price (live: 2026-11-24, server 223;
+    /// `docs/wire-facts/contracts.md#tick-size-bands-of-tse-sehk-and-lse-stocks`).
     ///
     /// # Arguments
     /// * `market_rule_id` - The market rule ID to query
@@ -296,11 +329,17 @@ impl Client {
     ///
     /// Terminal: [`OptionChainBuilder::subscribe`]. Optional narrowing via [`OptionChainBuilder::exchange`].
     ///
+    /// A chain lists expiries and strikes, not contracts, and most of their combinations are
+    /// not listed. To get the contracts, pass
+    /// [`Contract::options_on`](crate::contracts::Contract::options_on) to `contract_details`,
+    /// which returns every listed contract matching the query in one reply.
+    ///
     /// # Arguments
     /// * `symbol` - Symbol of the underlying.
     /// * `security_type` - Security type of the underlying, e.g. `SecurityType::Stock`.
-    /// * `contract_id` - Contract id of the underlying. Required; TWS rejects `0` with
-    ///   code 321 "Invalid contract id".
+    /// * `contract_id` - Contract id of the underlying. Required: `subscribe` returns
+    ///   [`Error::Validation`] for `0` without sending, which TWS would reject with code 321
+    ///   "Invalid contract id".
     ///
     /// # Examples
     ///
@@ -336,14 +375,15 @@ impl Client {
 
 /// Send a contract-details request with a pre-allocated id. Reached through
 /// [`ContractDetailsBuilder::subscribe`].
-pub(in crate::contracts) async fn contract_details_stream(
+pub(in crate::contracts) fn contract_details_stream(
     client: &Client,
     contract: &Contract,
     request_id: RequestId,
     buffer_limit: Option<usize>,
-) -> Result<Subscription<ContractDetails>, Error> {
+    admission: Option<WriteAdmission>,
+) -> Result<impl Future<Output = Result<Subscription<ContractDetails>, Error>> + Send + 'static, Error> {
     let packet = encoders::encode_request_contract_data(request_id.raw(), contract)?;
-    client.request_with_id(request_id).send_capped(packet, buffer_limit).await
+    Ok(client.request_with_id(request_id).send_capped_before(packet, buffer_limit, admission))
 }
 
 /// Request an underlying's option chain. Reached through

@@ -33,6 +33,7 @@
 
 // Common implementation modules
 pub(crate) mod common;
+pub use common::lookup::{OrderEvidence, OrderEvidenceMatch, OrderKey, OrderRows};
 
 /// Fluent builder APIs for constructing orders.
 pub mod builder;
@@ -40,6 +41,7 @@ pub mod builder;
 /// Order condition types for conditional orders.
 pub mod conditions;
 mod exercise_options_builder;
+mod fills;
 mod order_type;
 
 /// Convenience re-export for low-level order builder helpers.
@@ -51,6 +53,7 @@ pub use crate::client::ids::OrderId;
 pub use builder::order_builder::{AttachedOrdersBuilder, BracketOrderBuilder, ClientBound, Detached, OrderBuilder};
 pub use builder::types::{AttachedOrderIds, BracketOrderIds};
 pub use exercise_options_builder::ExerciseOptionsBuilder;
+pub use fills::{Fill, FillMatcher, ReportMatch, Unpaired};
 pub use order_type::OrderType;
 
 // Re-export condition types and builders
@@ -63,8 +66,11 @@ use std::convert::From;
 use std::fmt::Debug;
 
 use serde::{Deserialize, Serialize};
+use time::format_description::FormatItem;
+use time::macros::format_description;
+use time::{OffsetDateTime, PrimitiveDateTime};
 
-use crate::contracts::Contract;
+use crate::contracts::{Contract, SecurityType};
 
 // Public types - always available regardless of feature flags
 
@@ -129,6 +135,12 @@ pub struct Order {
     /// Intended for institutional customers only, although all customers may use it to identify the API client that sent the order when multiple API clients are running.
     pub order_ref: String,
     /// Specifies whether the order will be transmitted by TWS. If set to false, the order will be created at TWS but will not be sent.
+    ///
+    /// A held order sends no frames and is not listed by `all_open_orders`. A later unrelated
+    /// order does not release it; a transmitted child that names it as
+    /// [`parent_id`](Self::parent_id) does. Re-sending the held order with `transmit` true was
+    /// not probed (live: 2026-11-25, server 223;
+    /// `docs/wire-facts/orders.md#transmit-absent-means-held`).
     pub transmit: bool,
     /// If set to true, the order is de-activated (inactive). Since TWS 10.48, `reqOpenOrders`
     /// returns de-activated orders; this flag distinguishes them from active orders.
@@ -154,6 +166,10 @@ pub struct Order {
     /// Requires TWS/Gateway server version 216 (`ADDITIONAL_ORDER_PARAMS_1`) or later.
     pub ignore_open_auction: bool,
     /// The order ID of the parent order, used for bracket and auto trailing stop orders.
+    ///
+    /// TWS cuts a child's [`total_quantity`](Self::total_quantity) to the parent's without an error:
+    /// a child of 5,000,000 on a parent of 1 was echoed as 1 (live: 2026-11-25, server 223;
+    /// `docs/wire-facts/orders.md#bracket-child-quantity-follows-the-parent`).
     pub parent_id: i32,
     /// Order ID for a stop-loss that TWS attaches to this order from its order presets.
     ///
@@ -466,7 +482,12 @@ pub struct Order {
     /// paper). See
     /// `docs/wire-facts/orders.md#ext_operator-and-manual_order_indicator-on-orders-and-cancels`.
     pub ext_operator: String,
-    /// The native cash quantity.
+    /// The order's size in the quote currency (USD for EUR.USD) instead of
+    /// [`total_quantity`](Self::total_quantity), which may then be `0`. TWS echoes its estimate of
+    /// the quantity, and a filled order reports `Filled` with the unfilled rest of that estimate in
+    /// `remaining`. TWS accepts it for forex and lets a crypto market buy through; it refuses
+    /// it for stocks, options, futures and other crypto orders with error 10244 (live:
+    /// 2026-11-24, paper). See `docs/wire-facts/orders.md#cash-quantity`.
     pub cash_qty: Option<f64>,
     /// Identifies a person as the responsible party for investment decisions within the firm. Orders covered by MiFID 2 (Markets in Financial Instruments Directive 2) must include either Mifid2DecisionMaker or Mifid2DecisionAlgo field (but not both). Requires TWS 969+.
     pub mifid2_decision_maker: String,
@@ -762,6 +783,64 @@ impl Order {
             _ => false,
         }
     }
+
+    /// The trail of a trailing stop or trailing stop limit order, read from the fields that
+    /// [`OrderBuilder::trailing_stop`] and [`OrderBuilder::trailing_stop_limit`] set: the inverse
+    /// of their [`TrailBy`](builder::TrailBy).
+    ///
+    /// `None` for any other order type, and for a trailing order with neither a
+    /// [`trailing_percent`](Self::trailing_percent) nor an [`aux_price`](Self::aux_price). The
+    /// order type decides: TWS echoes a `trail_stop_price` on some plain limit orders too.
+    /// Read from an order TWS sends back, `stop_price` is the stop as TWS trails it, which moves
+    /// with the market (live: 2026-11-23, paper EUR.USD; see
+    /// `docs/wire-facts/orders.md#trailing-order-echo`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::orders::builder::TrailBy;
+    /// use ibapi::orders::{Order, Trailing};
+    ///
+    /// let order = Order::builder().sell(100).trailing_stop_limit(TrailBy::Percent(1.5), 148.0, 0.5).build()?;
+    /// assert_eq!(
+    ///     order.trailing(),
+    ///     Some(Trailing { trail: TrailBy::Percent(1.5), stop_price: Some(148.0), limit_offset: Some(0.5) })
+    /// );
+    ///
+    /// let limit = Order::builder().buy(100).limit(150.0).build()?;
+    /// assert_eq!(limit.trailing(), None);
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    pub fn trailing(&self) -> Option<Trailing> {
+        let limit_offset = match self.order_type {
+            Some(OrderType::TrailingStop) => None,
+            Some(OrderType::TrailingStopLimit) => self.limit_price_offset,
+            _ => return None,
+        };
+        let trail = match (self.trailing_percent, self.aux_price) {
+            (Some(percent), _) => builder::TrailBy::Percent(percent),
+            (None, Some(amount)) => builder::TrailBy::Amount(amount),
+            (None, None) => return None,
+        };
+        Some(Trailing {
+            trail,
+            stop_price: self.trail_stop_price,
+            limit_offset,
+        })
+    }
+}
+
+/// The trail of a trailing order, from [`Order::trailing`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Trailing {
+    /// How far the stop trails the market: [`Order::aux_price`] as an amount, or
+    /// [`Order::trailing_percent`] as a percentage.
+    pub trail: builder::TrailBy,
+    /// The stop price, [`Order::trail_stop_price`].
+    pub stop_price: Option<f64>,
+    /// For a trailing stop limit, the limit price's offset from the stop,
+    /// [`Order::limit_price_offset`]; `None` for a trailing stop.
+    pub limit_offset: Option<f64>,
 }
 
 /// Identifies the side.
@@ -954,6 +1033,11 @@ pub enum TimeInForce {
     Auction,
     /// Good until Crossing (GTX).
     GoodTillCrossing,
+    /// Minutes: the order is cancelled after a few minutes if it has not filled. IB uses it for
+    /// cryptocurrency limit orders on PAXOS, which it cancels after 5 minutes; a crypto BUY order
+    /// must be `Minutes` or [`ImmediateOrCancel`](Self::ImmediateOrCancel). The wire text is
+    /// `Minutes`.
+    Minutes,
     /// Time-in-force string not modeled by this version of the API. Carries the
     /// raw wire value so callers can log, store, or act on it, rather than
     /// having an unrecognized value silently decode as [`Day`](Self::Day).
@@ -978,6 +1062,7 @@ impl TimeInForce {
             TimeInForce::DayTillCanceled => "DTC",
             TimeInForce::Auction => "AUC",
             TimeInForce::GoodTillCrossing => "GTX",
+            TimeInForce::Minutes => "Minutes",
             TimeInForce::Unknown(raw) => raw,
         }
     }
@@ -993,6 +1078,7 @@ impl TimeInForce {
             "DTC" => Some(TimeInForce::DayTillCanceled),
             "AUC" => Some(TimeInForce::Auction),
             "GTX" => Some(TimeInForce::GoodTillCrossing),
+            "Minutes" => Some(TimeInForce::Minutes),
             _ => None,
         }
     }
@@ -1291,14 +1377,59 @@ pub struct SoftDollarTier {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct OrderData {
-    /// The order's unique id
-    pub order_id: i32,
     /// The order's Contract.
     pub contract: Contract,
-    /// The currently active order
+    /// The order. Its `order_id` is per API client: pair it with `order.client_id` to
+    /// identify an order across clients. A completed order can carry `order_id` `0`;
+    /// `order.perm_id` identifies it.
     pub order: Order,
     /// The order's OrderState
     pub order_state: OrderState,
+}
+
+impl OrderData {
+    /// The [`OrderStatus`] of a completed-order record, as `completed_orders` returns it.
+    ///
+    /// A completed order's `order.total_quantity` is the quantity left unfilled, not the
+    /// size ordered, so it is `remaining` as is: `0` once filled, `400` for a 1000-share
+    /// order cancelled after 600 filled. The size ordered is `filled + remaining`. The
+    /// record has no fill prices, so `average_fill_price` and `last_fill_price` are
+    /// `None`. Use it on completed records only: an open order's status arrives as its
+    /// own [`Orders::OrderStatus`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::orders::{Order, OrderData, OrderState, OrderStatusKind};
+    ///
+    /// // 1000 shares ordered, cancelled after 600 filled.
+    /// let data = OrderData {
+    ///     order: Order { total_quantity: 400.0, filled_quantity: 600.0, ..Default::default() },
+    ///     order_state: OrderState { status: OrderStatusKind::Cancelled, ..Default::default() },
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let status = data.completed_order_status();
+    /// assert_eq!(status.status, OrderStatusKind::Cancelled);
+    /// assert_eq!((status.filled, status.remaining), (600.0, 400.0));
+    /// assert_eq!(status.filled + status.remaining, 1000.0);
+    /// ```
+    pub fn completed_order_status(&self) -> OrderStatus {
+        let order = &self.order;
+        OrderStatus {
+            order_id: order.order_id,
+            status: self.order_state.status.clone(),
+            filled: order.filled_quantity,
+            remaining: order.total_quantity,
+            average_fill_price: None,
+            perm_id: order.perm_id,
+            parent_id: order.parent_id,
+            last_fill_price: None,
+            client_id: order.client_id,
+            why_held: String::new(),
+            market_cap_price: None,
+        }
+    }
 }
 
 /// Provides an active order's current state.
@@ -1363,10 +1494,33 @@ pub struct OrderState {
     pub warning_text: String,
     /// Timestamp when the order completed, passed through unparsed. Rendered like
     /// [`Execution::time`], except the UTC format has no trailing `Z` (`yyyymmdd-HH:MM:SS`).
+    /// [`completed_time_utc`](Self::completed_time_utc) returns that form as an instant.
     pub completed_time: String,
     /// Free-form descriptive status sent at completion (e.g. `"Cancelled by Trader"`,
     /// `"Filled Size: 1"`). For the canonical lifecycle state, use [`status`](Self::status).
     pub completed_status: String,
+}
+
+impl OrderState {
+    /// [`completed_time`](Self::completed_time) as an instant, when TWS sent the UTC rendering
+    /// `yyyymmdd-HH:MM:SS` (gateway setting "UTC format"). `None` for the zone-named renderings,
+    /// which this crate does not resolve, and for an empty field.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::orders::OrderState;
+    /// use time::macros::datetime;
+    ///
+    /// let state = OrderState {
+    ///     completed_time: "20261111-02:17:28".to_string(),
+    ///     ..OrderState::default()
+    /// };
+    /// assert_eq!(state.completed_time_utc(), Some(datetime!(2026-11-11 02:17:28 UTC)));
+    /// ```
+    pub fn completed_time_utc(&self) -> Option<OffsetDateTime> {
+        parse_utc_date_time(&self.completed_time)
+    }
 }
 
 /// Allocation of an order across accounts.
@@ -1441,40 +1595,36 @@ impl_wire_enum!(OrderOpenClose, fallback Unknown);
 /// adjacent. Both arrive on the same streams
 /// ([`executions`](crate::Client::executions),
 /// [`place_order`](crate::Client::place_order), and
-/// [`order_update_stream`](crate::Client::order_update_stream)); index
-/// commissions by `execution_id` rather than by position in the stream.
+/// [`order_update_stream`](crate::Client::order_update_stream)).
+///
+/// [`FillMatcher`] does the join on a stream, in either arrival order, and
+/// [`FillMatcher::pair_executions`] on a whole `executions` reply. Both yield a [`Fill`]. TWS sends no
+/// report for some executions; see [`FillMatcher::expects_report`].
 ///
 /// # Examples
 ///
 /// ```
-/// use ibapi::orders::{CommissionAndFeesReport, Execution};
-/// use std::collections::HashMap;
+/// use ibapi::orders::{CommissionAndFeesReport, Execution, ExecutionData, FillMatcher};
 ///
-/// // The execution arrives first: index it by execution_id.
-/// let mut executions: HashMap<String, Execution> = HashMap::new();
-/// let execution = Execution {
-///     execution_id: "0000e1a7.0001.01".to_string(),
-///     shares: 100.0,
+/// let mut matcher = FillMatcher::new();
+/// let execution = ExecutionData {
+///     execution: Execution { execution_id: "0000e1a7.0001.01".to_string(), shares: 100.0, ..Default::default() },
 ///     ..Default::default()
 /// };
-/// executions.insert(execution.execution_id.clone(), execution);
+/// assert!(matcher.push_execution(execution).is_none());
 ///
-/// // The commission follows: join it to its execution by execution_id.
 /// let report = CommissionAndFeesReport {
 ///     execution_id: "0000e1a7.0001.01".to_string(),
 ///     commission_and_fees: 1.25,
 ///     ..Default::default()
 /// };
-/// if let Some(execution) = executions.remove(&report.execution_id) {
-///     println!("{} shares, commissions and fees {}", execution.shares, report.commission_and_fees);
-/// }
+/// println!("{:?}", matcher.push_report(report));
 /// ```
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, Default)]
 pub struct CommissionAndFeesReport {
-    /// The [`Execution::execution_id`] this commission belongs to. Use it to
-    /// join the commission to its execution deterministically (see the
-    /// type-level docs).
+    /// The [`Execution::execution_id`] this commission belongs to; [`FillMatcher`]
+    /// joins on it (see the type-level docs).
     pub execution_id: String,
     /// The commissions and fees charged for the execution.
     pub commission_and_fees: f64,
@@ -1567,7 +1717,8 @@ pub struct Execution {
     /// The execution's server time, passed through unparsed. The gateway setting "Send
     /// instrument-specific attributes for dual-mode API client in" picks the rendering:
     /// `yyyymmdd HH:MM:SS <zone>` in the instrument's or operator's zone
-    /// (`20261110 20:17:28 US/Central`), or `yyyymmdd-HH:MM:SSZ` under UTC format.
+    /// (`20261110 20:17:28 US/Central`), or `yyyymmdd-HH:MM:SSZ` under UTC format, which
+    /// [`time_utc`](Self::time_utc) returns as an instant.
     pub time: String,
     /// The account to which the order was allocated.
     pub account_number: String,
@@ -1611,6 +1762,43 @@ pub struct Execution {
     pub option_exercise_type: OptionExerciseType,
 }
 
+impl Execution {
+    /// [`time`](Self::time) as an instant, when TWS sent the UTC rendering `yyyymmdd-HH:MM:SSZ`
+    /// (gateway setting "UTC format"). `None` for the zone-named renderings, which this crate
+    /// does not resolve, and for an empty field.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::orders::Execution;
+    /// use time::macros::datetime;
+    ///
+    /// let utc = Execution {
+    ///     time: "20261111-02:17:28Z".to_string(),
+    ///     ..Execution::default()
+    /// };
+    /// let zoned = Execution {
+    ///     time: "20261110 20:17:28 US/Central".to_string(),
+    ///     ..Execution::default()
+    /// };
+    /// assert_eq!(utc.time_utc(), Some(datetime!(2026-11-11 02:17:28 UTC)));
+    /// assert_eq!(zoned.time_utc(), None);
+    /// ```
+    pub fn time_utc(&self) -> Option<OffsetDateTime> {
+        parse_utc_date_time(&self.time)
+    }
+}
+
+/// The gateway's UTC rendering, `yyyymmdd-HH:MM:SS`: `Execution::time` adds a trailing `Z`,
+/// `OrderState::completed_time` does not.
+const UTC_DATE_TIME: &[FormatItem<'static>] = format_description!("[year][month][day]-[hour]:[minute]:[second]");
+
+/// `text` in [`UTC_DATE_TIME`], with or without a trailing `Z`, as an instant.
+fn parse_utc_date_time(text: &str) -> Option<OffsetDateTime> {
+    let text = text.strip_suffix('Z').unwrap_or(text);
+    PrimitiveDateTime::parse(text, UTC_DATE_TIME).ok().map(PrimitiveDateTime::assume_utc)
+}
+
 /// Contains execution information including the request ID, contract, and execution details.
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, Default)]
@@ -1621,6 +1809,40 @@ pub struct ExecutionData {
     pub contract: Contract,
     /// The execution details.
     pub execution: Execution,
+}
+
+impl ExecutionData {
+    /// Whether TWS sends a [`CommissionAndFeesReport`] for this execution.
+    ///
+    /// `false` for an option exercise ([`OptionExerciseType::Exercise`]): TWS sent no report
+    /// for either execution of an exercise, within 40 s or from `executions` later the same day
+    /// (live 2026-11-13, paper TWS, server 223). `false` for a combo's own execution (contract
+    /// security type [`SecurityType::Spread`]): TWS reports the
+    /// commissions on the leg executions only (live 2026-11-23, ES calendars on CME, paper
+    /// TWS, server 223). `true` for every other execution, including lapses, assignments and
+    /// the other exercise types, which have not been checked.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::{Contract, SecurityType};
+    /// use ibapi::orders::{Execution, ExecutionData, OptionExerciseType};
+    ///
+    /// let exercise = ExecutionData {
+    ///     execution: Execution { option_exercise_type: OptionExerciseType::Exercise, ..Default::default() },
+    ///     ..Default::default()
+    /// };
+    /// let combo = ExecutionData {
+    ///     contract: Contract { security_type: Some(SecurityType::Spread), ..Default::default() },
+    ///     ..Default::default()
+    /// };
+    /// assert!(!exercise.expects_commission_report());
+    /// assert!(!combo.expects_commission_report());
+    /// assert!(ExecutionData::default().expects_commission_report());
+    /// ```
+    pub fn expects_commission_report(&self) -> bool {
+        self.execution.option_exercise_type != OptionExerciseType::Exercise && self.contract.security_type != Some(SecurityType::Spread)
+    }
 }
 
 /// Responses from placing an order.
@@ -1694,7 +1916,10 @@ pub struct OrderStatus {
     pub last_fill_price: Option<f64>,
     /// API client which submitted the order.
     pub client_id: i32,
-    /// This field is used to identify an order held when TWS is trying to locate shares for a short sell. The value used to indicate this is 'locate'.
+    /// Why TWS holds the order, or empty. IB documents `locate` for a short sale waiting for shares
+    /// to borrow. A simulated trailing stop waiting for its trigger reports `trigger` with status
+    /// `PreSubmitted` (live: 2026-11-23, paper EUR.USD TRAIL; see
+    /// `docs/wire-facts/orders.md#why_held-values`).
     pub why_held: String,
     /// If an order has been capped, this indicates the current capped price. Requires TWS 967+ and API v973.04+. Python API specifically requires API v973.06+. `None` when IBKR did not send a value.
     pub market_cap_price: Option<f64>,
@@ -1762,6 +1987,39 @@ pub enum OrderOutcome {
     /// reports with an [`Inactive`](OrderStatusKind::Inactive) status, such as
     /// 201 for insufficient margin, is [`Ended`](Self::Ended).
     Rejected(crate::Notice),
+}
+
+/// What TWS reports about one order, as `Client::find_order` and
+/// `Client::find_order_by_perm_id` return it.
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
+pub enum OrderLookup {
+    /// This client's open orders list the order, with a status that is not
+    /// [terminal](OrderStatusKind::is_terminal). Carries the last open-order
+    /// record and the last status they listed for it; at least one is set.
+    Working {
+        /// The open-order record.
+        order: Option<OrderData>,
+        /// The order's status.
+        status: Option<OrderStatus>,
+    },
+    /// Completed orders list the order. `status` is
+    /// [`order.completed_order_status()`](OrderData::completed_order_status):
+    /// its `status` is [`Filled`](OrderStatusKind::Filled) for a filled order
+    /// and [`Cancelled`](OrderStatusKind::Cancelled) for one cancelled or
+    /// rejected (a rejection with error 201 is listed as `Cancelled`, filled
+    /// `0`); `filled` and `remaining` give the fill. TWS's reason is in
+    /// `order.order_state.completed_status`, such as `"Cancelled by Trader"`
+    /// or `"Rejected by System:"` followed by the rejection text.
+    Finished {
+        /// The completed-order record.
+        order: OrderData,
+        /// The order's final status, built from `order`.
+        status: OrderStatus,
+    },
+    /// Neither this client's open orders nor completed orders listed the order.
+    NotFound,
 }
 
 /// Enumerates possible results from cancelling an order.
@@ -1944,6 +2202,11 @@ pub struct ExecutionFilter {
     /// `time` filters within the days the filter covers and never extends them: with
     /// [`last_n_days`](Self::last_n_days) at 0 that is today only, so a `time` on an earlier
     /// day returns nothing unless `last_n_days` reaches back to it.
+    ///
+    /// TWS accepts a `time` from 1978-01-01 00:00 UTC on; an earlier one, such as
+    /// `OffsetDateTime::UNIX_EPOCH`, draws error 10314. To ask for every execution in the window,
+    /// leave `time` at `None` (live: 2026-11-25, server 223;
+    /// `docs/wire-facts/orders.md#executions-last_n_days-and-specific_dates`).
     pub time: Option<time::OffsetDateTime>,
     /// The instrument's symbol
     pub symbol: String,
@@ -1967,7 +2230,7 @@ pub struct ExecutionFilter {
 
 /// Enumerates possible results from querying an [Execution].
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Executions {
     /// Execution data payload.
@@ -1994,4 +2257,5 @@ mod sync;
 mod r#async;
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
 mod tests;

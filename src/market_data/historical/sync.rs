@@ -1,8 +1,5 @@
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::ops::ControlFlow;
 
-use log::error;
 use time::OffsetDateTime;
 
 use crate::client::blocking::ClientRequestBuilders;
@@ -10,18 +7,14 @@ use crate::client::ids::RequestId;
 use crate::common::request_helpers::{self, empty_on_end_of_stream};
 use crate::common::retry::blocking::retry_on_connection_reset;
 use crate::contracts::Contract;
-use crate::protocol::{check_version, Features};
-use crate::subscriptions::common::{RoutedItem, SubscriptionItem};
-use crate::subscriptions::log_cancel_error;
-use crate::subscriptions::sync::{FilterData, Subscription, SubscriptionItemIterExt};
-use crate::transport::{InternalSubscription, MessageBus};
+use crate::subscriptions::sync::Subscription;
 use crate::{client::sync::Client, Error};
 
-use super::common::tick::{classify, TickAction};
+use super::common::tick_pages::{PagedTick, TickPages, PAGE_SIZE};
 use super::common::{self, encoders};
 use super::{
-    BarRequest, BarSize, Duration, HeadTimestampRequest, HistogramEntry, HistogramRequest, HistoricalData, HistoricalDataFrame, Schedule,
-    ScheduleRequest, TickDecoder, WhatToShow,
+    BarRequest, BarSize, Duration, HeadTimestampRequest, HistogramEntry, HistogramRequest, HistoricalData, HistoricalDataFrame, PagingStop, Schedule,
+    ScheduleRequest, TickDecoder, TickFrame, TicksBetween, TicksBetweenError, WhatToShow,
 };
 use crate::market_data::TradingHours;
 
@@ -149,7 +142,8 @@ impl Client {
     /// [`HistoricalTicksBuilder::last`](super::HistoricalTicksBuilder::last) /
     /// `.mid_point()` / `.bid_ask(IgnoreSize)`. Use
     /// [`HistoricalTicksBuilder::starting`](super::HistoricalTicksBuilder::starting) /
-    /// `.ending()` to anchor the query (at least one is required per IBKR).
+    /// `.ending()` to anchor the query (at least one is required per IBKR). The
+    /// terminal sends the request and returns the complete reply as a `Vec`.
     ///
     /// # Arguments
     /// * `contract` - [Contract] object that is subject of query
@@ -191,30 +185,64 @@ impl Client {
         super::HistoricalTicksBuilder::new(self, contract, number_of_ticks)
     }
 
-    /// Cancels an in-flight historical ticks request.
+    /// Page historical ticks in an inclusive-start, exclusive-end range.
     ///
-    /// # Arguments
-    /// * `request_id` - The request ID of the historical ticks subscription to cancel.
+    /// Each request asks for 1,000 ticks. See [`HistoricalTicksBetweenBuilder`](super::HistoricalTicksBetweenBuilder)
+    /// for tick types, limits, and partial results.
+    ///
     /// # Examples
     ///
     /// ```no_run
     /// use ibapi::client::blocking::Client;
     /// use ibapi::contracts::Contract;
+    /// use time::macros::datetime;
     ///
-    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
-    ///
-    /// let contract = Contract::stock("MSFT").build();
-    /// let subscription = client.historical_ticks(&contract, 100).last().expect("request failed");
-    ///
-    /// // Holding the subscription, `subscription.cancel()` (or dropping it) does the same.
-    /// client.cancel_historical_ticks(subscription.request_id()).expect("cancel failed");
+    /// fn main() -> Result<(), ibapi::Error> {
+    ///     let client = Client::connect("127.0.0.1:4002", 100)?;
+    ///     let contract = Contract::stock("AAPL").build();
+    ///     let start = datetime!(2026-11-13 14:30 UTC);
+    ///     let end = datetime!(2026-11-13 14:35 UTC);
+    ///     let trades = client.historical_ticks_between(&contract, start, end).last()?;
+    ///     println!("{} trades", trades.ticks.len());
+    ///     Ok(())
+    /// }
     /// ```
-    pub fn cancel_historical_ticks(&self, request_id: i32) -> Result<(), Error> {
-        check_version(self.server_version(), Features::CANCEL_CONTRACT_DATA)?;
+    pub fn historical_ticks_between<'a>(
+        &'a self,
+        contract: &'a Contract,
+        start: OffsetDateTime,
+        end: OffsetDateTime,
+    ) -> super::HistoricalTicksBetweenBuilder<'a, Self> {
+        super::HistoricalTicksBetweenBuilder::new(self, contract, Some(start), end, None)
+    }
 
-        let message = encoders::encode_cancel_historical_ticks(request_id)?;
-        self.send_message(message)?;
-        Ok(())
+    /// Page backward before `end` until at least `limit` ticks are collected or TWS has no older ticks.
+    ///
+    /// The result may exceed `limit` to retain a whole second. A zero limit sends no requests.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::client::blocking::Client;
+    /// use ibapi::contracts::Contract;
+    /// use time::macros::datetime;
+    ///
+    /// fn main() -> Result<(), ibapi::Error> {
+    ///     let client = Client::connect("127.0.0.1:4002", 100)?;
+    ///     let contract = Contract::stock("AAPL").build();
+    ///     let end = datetime!(2026-11-13 14:35 UTC);
+    ///     let trades = client.historical_ticks_latest(&contract, 100, end).last()?;
+    ///     println!("{} trades", trades.ticks.len());
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn historical_ticks_latest<'a>(
+        &'a self,
+        contract: &'a Contract,
+        limit: usize,
+        end: OffsetDateTime,
+    ) -> super::HistoricalTicksBetweenBuilder<'a, Self> {
+        super::HistoricalTicksBetweenBuilder::new(self, contract, None, end, Some(limit))
     }
 
     /// Requests data histogram of specified contract.
@@ -326,22 +354,79 @@ pub(crate) fn historical_ticks<T: TickDecoder<T>>(
     what_to_show: WhatToShow,
     trading_hours: TradingHours,
     ignore_size: bool,
-) -> Result<TickSubscription<T>, Error> {
-    let builder = client.request();
-    let request = encoders::encode_request_historical_ticks(
-        builder.request_id(),
-        contract,
-        start,
-        end,
-        number_of_ticks,
-        what_to_show,
-        trading_hours.use_rth(),
-        ignore_size,
-    )?;
-    let request_id = builder.request_id();
-    let subscription = builder.send_raw(request)?;
+) -> Result<Vec<T>, Error> {
+    let deadline = request_helpers::blocking::one_shot_deadline(client);
 
-    Ok(TickSubscription::new(subscription, request_id, Arc::clone(&client.message_bus)))
+    retry_on_connection_reset(client, deadline, || {
+        request_helpers::blocking::check_deadline(deadline)?;
+        let builder = client.request();
+        let request = encoders::encode_request_historical_ticks(
+            builder.request_id(),
+            contract,
+            start,
+            end,
+            number_of_ticks,
+            what_to_show,
+            trading_hours.use_rth(),
+            ignore_size,
+        )?;
+
+        // Dropping the subscription before the `done` frame, on any error
+        // below, sends TWS's cancel; after it, nothing is sent.
+        let subscription = builder.send_capped_before::<TickFrame<T>>(request, None, deadline)?;
+
+        let mut ticks = Vec::new();
+        loop {
+            let frame = request_helpers::blocking::next_frame(&subscription, deadline)?;
+            ticks.extend(frame.ticks);
+            if frame.done {
+                return Ok(ticks);
+            }
+        }
+    })
+}
+
+// Pages `historical_ticks` backward from `end`, back to `start` or until `limit` ticks; see
+// `TickPages` for the rules. Same builder-to-encoder seam as `historical_ticks`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn historical_ticks_between<T: TickDecoder<T> + PagedTick>(
+    client: &Client,
+    contract: &Contract,
+    start: Option<OffsetDateTime>,
+    end: OffsetDateTime,
+    limit: Option<usize>,
+    what_to_show: WhatToShow,
+    trading_hours: TradingHours,
+    ignore_size: bool,
+) -> Result<TicksBetween<T>, TicksBetweenError<T>> {
+    let mut pages = TickPages::new(start, end, limit)?;
+
+    loop {
+        if pages.limit_reached() {
+            return Ok(pages.finish(PagingStop::LimitReached));
+        }
+
+        // Each page is one request, so `one_shot_timeout` bounds each page on its own
+        let page = historical_ticks::<T>(
+            client,
+            contract,
+            None,
+            Some(pages.request_end()),
+            PAGE_SIZE,
+            what_to_show,
+            trading_hours,
+            ignore_size,
+        );
+
+        match page {
+            Ok(page) => {
+                if let ControlFlow::Break(stop) = pages.push(page) {
+                    return Ok(pages.finish(stop));
+                }
+            }
+            Err(error) => return Err(pages.fail(error)),
+        }
+    }
 }
 
 pub(crate) fn historical_schedule(
@@ -363,414 +448,6 @@ pub(crate) fn historical_schedule(
             false,
         )
     })
-}
-
-// TickSubscription and related types
-
-/// Shared subscription handle that decodes historical tick batches as they arrive.
-///
-/// Each [`next`](Self::next), [`try_next`](Self::try_next), or
-/// [`next_timeout`](Self::next_timeout) returns
-/// `Option<Result<SubscriptionItem<T>, Error>>`, the same shape as
-/// [`Subscription`](crate::subscriptions::Subscription):
-///
-/// * `None` — the stream has ended.
-/// * `Some(Ok(SubscriptionItem::Data(tick)))` — a decoded tick.
-/// * `Some(Ok(SubscriptionItem::Notice(n)))` — a non-fatal IB notice bound to
-///   this request; the stream stays open.
-/// * `Some(Err(e))` — terminal error (decode or transport); subsequent calls
-///   return `None`.
-///
-/// When you only care about ticks, use [`iter_data`](Self::iter_data) (or
-/// [`next_data`](Self::next_data)), which filter notices and yield
-/// `Result<T, Error>`.
-#[must_use = "TickSubscription must be polled (.next() or .iter_data()) to receive ticks; dropping it cancels the request"]
-pub struct TickSubscription<T: TickDecoder<T>> {
-    done: AtomicBool,
-    stream_ended: AtomicBool,
-    messages: InternalSubscription,
-    buffer: Mutex<VecDeque<T>>,
-    request_id: i32,
-    message_bus: Arc<dyn MessageBus>,
-    cancelled: AtomicBool,
-}
-
-impl<T: TickDecoder<T>> TickSubscription<T> {
-    fn new(messages: InternalSubscription, request_id: i32, message_bus: Arc<dyn MessageBus>) -> Self {
-        Self {
-            done: false.into(),
-            stream_ended: AtomicBool::new(false),
-            messages,
-            buffer: Mutex::new(VecDeque::new()),
-            request_id,
-            message_bus,
-            cancelled: AtomicBool::new(false),
-        }
-    }
-
-    /// The request ID TWS knows this request by, for [`Client::cancel_historical_ticks`](crate::client::blocking::Client::cancel_historical_ticks)
-    /// from code that does not hold the subscription, or to match it in logs.
-    pub fn request_id(&self) -> i32 {
-        self.request_id
-    }
-
-    /// Whether the stream has terminated and every later `next`, `try_next` or
-    /// `next_timeout` returns `None`: the last batch was read and its ticks
-    /// drained, or a terminal error or `Err(Error::Cancelled)` after
-    /// [`cancel`](Self::cancel) was returned. Distinguishes between the `None`
-    /// that [`try_next`](Self::try_next) and
-    /// [`next_timeout`](Self::next_timeout) return at the end and the one they
-    /// return while nothing has arrived yet.
-    pub fn is_terminated(&self) -> bool {
-        (self.done.load(Ordering::Relaxed) || self.stream_ended.load(Ordering::Relaxed)) && self.buffer.lock().unwrap().is_empty()
-    }
-
-    /// Cancel the historical-ticks request. After completion nothing is written.
-    /// Also fired automatically on `Drop` for unfinished subscriptions; explicit calls are idempotent.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use ibapi::client::blocking::Client;
-    /// use ibapi::contracts::Contract;
-    ///
-    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
-    /// let contract = Contract::stock("MSFT").build();
-    /// let subscription = client.historical_ticks(&contract, 100).last().expect("request failed");
-    /// subscription.cancel();
-    /// ```
-    pub fn cancel(&self) {
-        if self.cancelled.swap(true, Ordering::Relaxed) {
-            return;
-        }
-
-        // After the last batch TWS has finished the request: nothing to
-        // write, but the registration still goes.
-        if !self.done.load(Ordering::Relaxed) {
-            match encoders::encode_cancel_historical_ticks(self.request_id) {
-                Ok(message) => {
-                    if let Err(e) = self.message_bus.send_message(&message) {
-                        log_cancel_error("historical ticks subscription", &e);
-                    }
-                }
-                Err(e) => error!("error encoding cancel historical ticks: {e}"),
-            }
-        }
-        self.messages.cancel();
-    }
-
-    /// Blocking iterator yielding `Result<SubscriptionItem<T>, Error>` — both
-    /// `Data` and `Notice` arms surface to the caller. Use
-    /// [`iter_data`](Self::iter_data) when you only want ticks.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use ibapi::client::blocking::Client;
-    /// use ibapi::contracts::Contract;
-    /// use ibapi::subscriptions::SubscriptionItem;
-    ///
-    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
-    /// let contract = Contract::stock("MSFT").build();
-    /// let subscription = client.historical_ticks(&contract, 100).last().expect("request failed");
-    /// for item in subscription.iter() {
-    ///     match item {
-    ///         Ok(SubscriptionItem::Data(tick))   => println!("tick: {tick:?}"),
-    ///         Ok(SubscriptionItem::Notice(note)) => eprintln!("notice: {note}"),
-    ///         Err(e)                             => { eprintln!("error: {e}"); break; }
-    ///     }
-    /// }
-    /// ```
-    pub fn iter(&self) -> TickSubscriptionIter<'_, T> {
-        TickSubscriptionIter { subscription: self }
-    }
-
-    /// Non-blocking iterator. Same `SubscriptionItem<T>` shape as [`iter`](Self::iter);
-    /// see [`try_iter_data`](Self::try_iter_data) for the data-only variant.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use ibapi::client::blocking::Client;
-    /// use ibapi::contracts::Contract;
-    ///
-    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
-    /// let contract = Contract::stock("MSFT").build();
-    /// let subscription = client.historical_ticks(&contract, 100).last().expect("request failed");
-    /// for tick in subscription.try_iter_data() {
-    ///     println!("tick: {:?}", tick.expect("decode error"));
-    /// }
-    /// ```
-    pub fn try_iter(&self) -> TickSubscriptionTryIter<'_, T> {
-        TickSubscriptionTryIter { subscription: self }
-    }
-
-    /// Iterator that waits up to `duration` for each item. Same `SubscriptionItem<T>`
-    /// shape as [`iter`](Self::iter); see [`timeout_iter_data`](Self::timeout_iter_data)
-    /// for the data-only variant.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::time::Duration;
-    /// use ibapi::client::blocking::Client;
-    /// use ibapi::contracts::Contract;
-    ///
-    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
-    /// let contract = Contract::stock("MSFT").build();
-    /// let subscription = client.historical_ticks(&contract, 100).last().expect("request failed");
-    /// for tick in subscription.timeout_iter_data(Duration::from_secs(5)) {
-    ///     println!("tick: {:?}", tick.expect("decode error"));
-    /// }
-    /// ```
-    pub fn timeout_iter(&self, duration: std::time::Duration) -> TickSubscriptionTimeoutIter<'_, T> {
-        TickSubscriptionTimeoutIter {
-            subscription: self,
-            timeout: duration,
-        }
-    }
-
-    /// Blocking data iterator that filters notices and yields `Result<T, Error>`.
-    /// Notices are logged at `warn!` level.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use ibapi::client::blocking::Client;
-    /// use ibapi::contracts::Contract;
-    ///
-    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
-    /// let contract = Contract::stock("MSFT").build();
-    /// let subscription = client.historical_ticks(&contract, 100).last().expect("request failed");
-    /// for tick in subscription.iter_data() {
-    ///     println!("tick: {:?}", tick.expect("decode error"));
-    /// }
-    /// ```
-    pub fn iter_data(&self) -> FilterData<TickSubscriptionIter<'_, T>> {
-        self.iter().filter_data()
-    }
-
-    /// Non-blocking data iterator (notices filtered).
-    pub fn try_iter_data(&self) -> FilterData<TickSubscriptionTryIter<'_, T>> {
-        self.try_iter().filter_data()
-    }
-
-    /// Timeout-bounded data iterator (notices filtered).
-    pub fn timeout_iter_data(&self, duration: std::time::Duration) -> FilterData<TickSubscriptionTimeoutIter<'_, T>> {
-        self.timeout_iter(duration).filter_data()
-    }
-
-    /// Block until the next item is available.
-    ///
-    /// Returns the `SubscriptionItem<T>` envelope; use [`next_data`](Self::next_data)
-    /// when you only want ticks.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use ibapi::client::blocking::Client;
-    /// use ibapi::contracts::Contract;
-    /// use ibapi::subscriptions::SubscriptionItem;
-    ///
-    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
-    /// let contract = Contract::stock("MSFT").build();
-    /// let subscription = client.historical_ticks(&contract, 100).last().expect("request failed");
-    /// while let Some(item) = subscription.next() {
-    ///     match item {
-    ///         Ok(SubscriptionItem::Data(tick))   => println!("tick: {tick:?}"),
-    ///         Ok(SubscriptionItem::Notice(note)) => eprintln!("notice: {note}"),
-    ///         Err(e)                             => { eprintln!("error: {e}"); break; }
-    ///     }
-    /// }
-    /// ```
-    pub fn next(&self) -> Option<Result<SubscriptionItem<T>, Error>> {
-        self.next_helper(|| self.messages.next_routed())
-    }
-
-    /// Attempt to fetch the next item without blocking.
-    ///
-    /// Same `SubscriptionItem<T>` shape as [`next`](Self::next). `None` means
-    /// either that nothing is queued right now or that the stream ended;
-    /// [`is_terminated`](Self::is_terminated) distinguishes between the two.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use ibapi::client::blocking::Client;
-    /// use ibapi::contracts::Contract;
-    ///
-    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
-    /// let contract = Contract::stock("MSFT").build();
-    /// let subscription = client.historical_ticks(&contract, 100).last().expect("request failed");
-    /// if let Some(Ok(item)) = subscription.try_next() {
-    ///     println!("item: {item:?}");
-    /// }
-    /// ```
-    pub fn try_next(&self) -> Option<Result<SubscriptionItem<T>, Error>> {
-        self.next_helper(|| self.messages.try_next_routed())
-    }
-
-    /// Wait up to `duration` for the next item to arrive.
-    ///
-    /// Same `SubscriptionItem<T>` shape as [`next`](Self::next). `None` means
-    /// either that `duration` passed or that the stream ended;
-    /// [`is_terminated`](Self::is_terminated) distinguishes between the two.
-    /// Terminal errors come as `Some(Err(_))`.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::time::Duration;
-    /// use ibapi::client::blocking::Client;
-    /// use ibapi::contracts::Contract;
-    ///
-    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
-    /// let contract = Contract::stock("MSFT").build();
-    /// let subscription = client.historical_ticks(&contract, 100).last().expect("request failed");
-    /// if let Some(Ok(item)) = subscription.next_timeout(Duration::from_secs(5)) {
-    ///     println!("item: {item:?}");
-    /// }
-    /// ```
-    pub fn next_timeout(&self, duration: std::time::Duration) -> Option<Result<SubscriptionItem<T>, Error>> {
-        self.next_helper(|| self.messages.next_timeout_routed(duration))
-    }
-
-    /// Convenience: blocking `next` that filters out notices and yields just a tick.
-    /// Equivalent to `iter_data().next()`. Filtered notices are logged at `warn!`.
-    /// Use [`next`](Self::next) instead if you want to observe `Notice` items.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use ibapi::client::blocking::Client;
-    /// use ibapi::contracts::Contract;
-    ///
-    /// let client = Client::connect("127.0.0.1:4002", 100).expect("connection failed");
-    /// let contract = Contract::stock("MSFT").build();
-    /// let subscription = client.historical_ticks(&contract, 100).last().expect("request failed");
-    /// while let Some(tick) = subscription.next_data() {
-    ///     println!("tick: {:?}", tick.expect("decode error"));
-    /// }
-    /// ```
-    pub fn next_data(&self) -> Option<Result<T, Error>> {
-        self.iter_data().next()
-    }
-
-    fn next_helper<F>(&self, next_routed: F) -> Option<Result<SubscriptionItem<T>, Error>>
-    where
-        F: Fn() -> Option<RoutedItem>,
-    {
-        loop {
-            if let Some(tick) = self.next_buffered() {
-                return Some(Ok(SubscriptionItem::Data(tick)));
-            }
-
-            // `done` (decoder said this was the last batch) and `stream_ended`
-            // (terminal error) are distinct: the former is graceful
-            // completion, the latter is termination. Either ends the stream once
-            // the buffer is drained.
-            if self.done.load(Ordering::Relaxed) || self.stream_ended.load(Ordering::Relaxed) {
-                return None;
-            }
-
-            let item = next_routed()?;
-
-            match classify::<T>(item) {
-                TickAction::Batch(ticks, done) => {
-                    self.buffer.lock().unwrap().extend(ticks);
-                    self.done.store(done, Ordering::Relaxed);
-                }
-                TickAction::Skip => {}
-                TickAction::Notice(notice) => return Some(Ok(SubscriptionItem::Notice(notice))),
-                TickAction::Error(e) => {
-                    self.stream_ended.store(true, Ordering::Relaxed);
-                    return Some(Err(e));
-                }
-            }
-        }
-    }
-
-    fn next_buffered(&self) -> Option<T> {
-        let mut buffer = self.buffer.lock().unwrap();
-        buffer.pop_front()
-    }
-}
-
-impl<T: TickDecoder<T>> Drop for TickSubscription<T> {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
-/// A blocking iterator over `Result<SubscriptionItem<T>, Error>`.
-pub struct TickSubscriptionIter<'a, T: TickDecoder<T>> {
-    subscription: &'a TickSubscription<T>,
-}
-
-impl<T: TickDecoder<T>> Iterator for TickSubscriptionIter<'_, T> {
-    type Item = Result<SubscriptionItem<T>, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.subscription.next()
-    }
-}
-
-impl<'a, T: TickDecoder<T>> IntoIterator for &'a TickSubscription<T> {
-    type Item = Result<SubscriptionItem<T>, Error>;
-    type IntoIter = TickSubscriptionIter<'a, T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-/// An owned blocking iterator over `Result<SubscriptionItem<T>, Error>`.
-pub struct TickSubscriptionOwnedIter<T: TickDecoder<T>> {
-    subscription: TickSubscription<T>,
-}
-
-impl<T: TickDecoder<T>> Iterator for TickSubscriptionOwnedIter<T> {
-    type Item = Result<SubscriptionItem<T>, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.subscription.next()
-    }
-}
-
-impl<T: TickDecoder<T>> IntoIterator for TickSubscription<T> {
-    type Item = Result<SubscriptionItem<T>, Error>;
-    type IntoIter = TickSubscriptionOwnedIter<T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        TickSubscriptionOwnedIter { subscription: self }
-    }
-}
-
-/// A non-blocking iterator over `Result<SubscriptionItem<T>, Error>`.
-pub struct TickSubscriptionTryIter<'a, T: TickDecoder<T>> {
-    subscription: &'a TickSubscription<T>,
-}
-
-impl<T: TickDecoder<T>> Iterator for TickSubscriptionTryIter<'_, T> {
-    type Item = Result<SubscriptionItem<T>, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.subscription.try_next()
-    }
-}
-
-/// An iterator that waits for the specified timeout duration for each item.
-pub struct TickSubscriptionTimeoutIter<'a, T: TickDecoder<T>> {
-    subscription: &'a TickSubscription<T>,
-    timeout: std::time::Duration,
-}
-
-impl<T: TickDecoder<T>> Iterator for TickSubscriptionTimeoutIter<'_, T> {
-    type Item = Result<SubscriptionItem<T>, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.subscription.next_timeout(self.timeout)
-    }
 }
 
 #[cfg(test)]

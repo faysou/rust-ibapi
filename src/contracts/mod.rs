@@ -4,6 +4,7 @@
 //! including stocks, options, futures, and complex securities. It includes contract
 //! creation helpers, validation, and conversion utilities.
 
+use std::collections::BTreeSet;
 use std::convert::From;
 use std::fmt::Debug;
 use std::string::ToString;
@@ -12,6 +13,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use tick_types::TickType;
 
+use crate::builder::ValidationError;
 use crate::orders::ShortSaleSlot;
 use crate::Error;
 use crate::ToField;
@@ -155,7 +157,9 @@ impl_wire_enum!(SecurityType, fallback Other);
 /// `Contract::bond_cusip`, `Contract::bond_isin`, `Contract::spread`) or the
 /// field-minimal [`ContractBuilder::new`] — they set the correct field types and
 /// sensible defaults for you. A bare struct literal with `..Default::default()` also
-/// works when you need full control over individual fields.
+/// works when you need full control over individual fields. It defaults to exchange `SMART`,
+/// no security type, and an empty currency. The stock, option and futures builders default
+/// to USD. [`ContractBuilder::new`] leaves the exchange empty.
 ///
 /// # Examples
 ///
@@ -182,7 +186,9 @@ pub struct Contract {
     /// The option's strike price. For a contract whose
     /// [`price_magnifier`](ContractDetails::price_magnifier) is above 1, TWS expects it in the
     /// market-data sub-unit (`450` cents for a corn option struck at $4.50) but reports it in
-    /// contract details in the currency unit (`4.5`).
+    /// contract details in the currency unit (`4.5`). `0.0` is not sent. `f64::MAX`, the Python
+    /// client's unset value, is sent, and TWS reads it as unset in contract details (live:
+    /// 2026-11-23, paper).
     pub strike: f64,
     /// Option type (only meaningful when `security_type == Some(SecurityType::Option)`).
     /// `None` on non-option contracts. Wire values are `"C"` (Call) and `"P"` (Put).
@@ -193,7 +199,12 @@ pub struct Contract {
     pub exchange: Exchange,
     /// The underlying's currency.
     pub currency: Currency,
-    /// The contract's symbol within its primary exchange For options, this will be the OCC symbol.
+    /// The contract's symbol within its primary exchange. For US options, this is the OCC symbol.
+    ///
+    /// Other exchanges use their own layouts: `HSI25600L6` on HKFE (class, strike, month and right
+    /// letter, one-digit year), `K200992L6.KS` on KSE, `TCH DEC26 640 C` for a SEHK stock option,
+    /// a 9-digit exchange code on OSE.JPN. Read the strike, right and expiry from their fields
+    /// rather than parsing this (live: 2026-11-24, server 223; `docs/wire-facts/contracts.md#local-symbols-of-hkfe-ose-and-kse-options`).
     pub local_symbol: String,
     /// The contract's primary exchange.
     /// For smart routed contracts, used to define contract in case of ambiguity.
@@ -235,7 +246,7 @@ impl Default for Contract {
             right: None,
             multiplier: String::new(),
             exchange: Exchange::default(), // "SMART"
-            currency: Currency::default(),
+            currency: Currency::default(), // Empty: TWS resolves it
             local_symbol: String::new(),
             primary_exchange: Exchange::from(""), // Empty, not "SMART"
             trading_class: String::new(),
@@ -345,6 +356,71 @@ impl Contract {
     /// ```
     pub fn continuous_futures(symbol: impl Into<Symbol>) -> ContinuousFuturesBuilder<Symbol> {
         ContinuousFuturesBuilder::new(symbol)
+    }
+
+    /// Creates a query contract that lists the option contracts of `underlying` through
+    /// `contract_details`.
+    ///
+    /// Supply the underlying's symbol and currency, as returned by `contract_details`. For
+    /// futures options, also supply its exchange and set `security_type` to
+    /// `Some(SecurityType::Future)` or `Some(SecurityType::ContinuousFuture)`. Other values,
+    /// including an unset `security_type`, select an option query on `SMART`. The query omits
+    /// the strike. You can filter by right, trading class, or expiry. TWS returns every
+    /// matching listed contract in one reply.
+    ///
+    /// The `SMART` default was probed for US underlyings only (AAPL, SPX). For an underlying
+    /// listed outside the US, set the option exchange with
+    /// [`on_exchange`](OptionsQueryBuilder::on_exchange): VOD's options were listed on `ICEEU`,
+    /// and whether `SMART` lists them was not probed.
+    ///
+    /// Use this to get the contracts. `option_chain` (`reqSecDefOptParams`) returns, per
+    /// exchange and trading class, a list of expiries and a list of strikes, and most of their
+    /// combinations are not listed: AAPL's chain on one exchange spans 24 expiries and 133
+    /// strikes (6,384 calls and puts) while 3,546 AAPL options exist, and the same chain comes
+    /// once for each of 22 exchanges. Requesting each combination costs one request per
+    /// candidate and an error 200 for each missing one. `option_chain` stays the cheap way to
+    /// see which expiries and strikes exist: it answers in milliseconds.
+    ///
+    /// What TWS returns (live 2026-11-24, paper TWS, server 223):
+    ///
+    /// - Futures options of several futures come back for one date or month: ES December 2026
+    ///   options belong to ESZ6 and ESH7, so keep the rows whose
+    ///   [`under_contract_id`](ContractDetails::under_contract_id) is the future's.
+    /// - TWS filters expiries by one date ([`expiring`](OptionsQueryBuilder::expiring)) or one
+    ///   month ([`expiring_in`](OptionsQueryBuilder::expiring_in)) only; filter a range of
+    ///   expiries or strikes from the rows. Strikes in the rows are in currency units, while
+    ///   `option_chain` strikes of a magnified product are in its sub-unit (ZC: `3.6` against
+    ///   `360`; see [`price_magnifier`](ContractDetails::price_magnifier)).
+    /// - Without an expiry the reply takes 40 to 75 seconds for a large underlying (AAPL 3,546
+    ///   rows, SPX 33,502, ES 25,847), and its rows can all come at the end: AAPL on CBOE sent
+    ///   its first row at 61 s of 62, while AAPL on SMART started at 2.7 s of 49. One month took
+    ///   0.7 to 21 seconds (SPX December, 13,156 rows) and one date at most 5. Asking per month
+    ///   bounds each reply.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::{Contract, ContractDetails, ContractMonth};
+    ///
+    /// // AAPL as contract_details returns it.
+    /// let mut aapl = Contract::stock("AAPL").build();
+    /// aapl.contract_id = 265598;
+    ///
+    /// let query = Contract::options_on(&aapl).expiring_in(ContractMonth::new(2026, 12)?).calls().build();
+    /// // let rows = client.contract_details(&query).await?;
+    ///
+    /// // The contracts of this underlying with strikes in [250, 300].
+    /// fn near_the_money(rows: &[ContractDetails], underlying_id: i32) -> Vec<&ContractDetails> {
+    ///     rows.iter()
+    ///         .filter(|row| row.under_contract_id == underlying_id)
+    ///         .filter(|row| (250.0..=300.0).contains(&row.contract.strike))
+    ///         .collect()
+    /// }
+    /// assert!(near_the_money(&[], aapl.contract_id).is_empty());
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    pub fn options_on(underlying: &Contract) -> OptionsQueryBuilder {
+        OptionsQueryBuilder::new(underlying)
     }
 
     /// Creates a forex contract builder.
@@ -476,6 +552,143 @@ impl Contract {
     /// ```
     pub fn spread(symbol: impl Into<Symbol>) -> SpreadBuilder {
         SpreadBuilder::new(symbol)
+    }
+
+    /// Creates a combo (BAG) contract from its leg contracts, each with a signed ratio: positive
+    /// buys the leg, negative sells it.
+    ///
+    /// Each leg needs its `contract_id`, as [`contract_details`](crate::client::Client::contract_details)
+    /// returns it. The combo follows what TWS accepts
+    /// (`docs/wire-facts/orders.md#combo-bag-shape-and-identity`, live 2026-11-23):
+    ///
+    /// - **Symbol**: the legs' symbol. Legs on several underlyings get their symbols sorted and
+    ///   joined with a comma (`"AAPL,MSFT"`), the form TWS echoes. TWS rejects a symbol that
+    ///   doesn't match the legs with 478.
+    /// - **Currency**: the first leg's. TWS rejects a SMART combo without one with 321.
+    /// - **Exchange**: `SMART`, with each leg routed to its contract's exchange. A futures combo
+    ///   on SMART needs that leg exchange (200 without it). To route the combo to the legs'
+    ///   exchange instead, set `exchange` on the result (`"CME"` for an ES calendar); combos
+    ///   with a stock leg take only SMART (10125).
+    /// - **Legs**: the ratio's magnitude, with the action from its sign: `Buy` or `Sell`. For a
+    ///   [`SellShort`](LegAction::SellShort) leg, use [`spread`](Self::spread) and set the
+    ///   short-sale fields on the built leg. The general spread builder leaves ratio checks
+    ///   to the caller for compatibility with existing spread construction.
+    ///
+    /// The result's `contract_id` stays 0. TWS echoes one placeholder id per combo exchange for
+    /// every combo (the same id for every SMART combo, whatever the underlying), so the legs
+    /// identify a combo, not that id. Order echoes list the legs sorted by contract id, so
+    /// compare legs in that order. TWS serves no contract details for a BAG (321).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Validation`]: [`InvalidCombination`](ValidationError::InvalidCombination) when
+    /// there are fewer than two distinct legs (by `contract_id`) or the ratios share a common
+    /// factor, and [`InvalidField`](ValidationError::InvalidField) when a leg has no
+    /// `contract_id`, a ratio is zero or out of range, or all leg symbols are empty. The
+    /// empty-symbol error names `Contract::symbol`.
+    ///
+    /// TWS sends no reply within 20 to 40 s for a BAG with one leg at ratio 1 or the same
+    /// leg twice. It rejects 2:2 with 321 "Invalid leg ratio". Send 1:1 and double the order
+    /// quantity.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::{Contract, LegAction};
+    ///
+    /// // Leg contracts as `contract_details` returns them.
+    /// let long_call = Contract { contract_id: 101, symbol: "AAPL".into(), exchange: "SMART".into(), ..Default::default() };
+    /// let short_call = Contract { contract_id: 102, symbol: "AAPL".into(), exchange: "SMART".into(), ..Default::default() };
+    ///
+    /// let vertical = Contract::spread_from_legs([(&long_call, 1), (&short_call, -1)])?;
+    /// assert_eq!(vertical.symbol.as_str(), "AAPL");
+    /// assert_eq!(vertical.combo_legs[1].action, LegAction::Sell);
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    ///
+    /// To use a third-party locate for a short stock leg, set the slot and designated location
+    /// after building the spread:
+    ///
+    /// ```
+    /// use ibapi::contracts::{Contract, LegAction};
+    /// use ibapi::orders::ShortSaleSlot;
+    ///
+    /// let (stock_id, call_id) = (265598, 102); // Use the IDs from contract_details.
+    /// let locate = "EXAMPLE"; // Use the designated location for your locate.
+    /// let mut spread = Contract::spread("AAPL")
+    ///     .add_leg(stock_id, LegAction::SellShort)
+    ///     .ratio(100)
+    ///     .done()
+    ///     .add_leg(call_id, LegAction::Buy)
+    ///     .done()
+    ///     .build()?;
+    /// let short_leg = &mut spread.combo_legs[0];
+    /// short_leg.short_sale_slot = ShortSaleSlot::ThirdParty;
+    /// short_leg.designated_location = locate.into();
+    /// # assert_eq!(short_leg.action, LegAction::SellShort);
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    pub fn spread_from_legs<'a>(legs: impl IntoIterator<Item = (&'a Contract, i32)>) -> Result<Contract, Error> {
+        let mut symbols = BTreeSet::new();
+        let mut common_factor = 0;
+        let mut distinct = BTreeSet::new();
+        let mut checked = Vec::new();
+        for (contract, ratio) in legs {
+            if contract.contract_id == 0 {
+                return Err(Error::Validation(ValidationError::InvalidField {
+                    field: "Contract::contract_id",
+                    value: contract.symbol.to_string(),
+                    reason: "a spread leg needs its contract id, as contract_details returns it".into(),
+                }));
+            }
+            let size = ratio.checked_abs().filter(|size| *size > 0).ok_or_else(|| {
+                Error::Validation(ValidationError::InvalidField {
+                    field: "ComboLeg::ratio",
+                    value: ratio.to_string(),
+                    reason: format!("leg {} needs a nonzero ratio", contract.contract_id),
+                })
+            })?;
+            common_factor = gcd(common_factor, size);
+            distinct.insert(contract.contract_id);
+            if !contract.symbol.as_str().is_empty() {
+                symbols.insert(contract.symbol.as_str());
+            }
+
+            let action = if ratio > 0 { LegAction::Buy } else { LegAction::Sell };
+            checked.push((contract, action, size));
+        }
+        if distinct.len() < 2 {
+            return Err(Error::Validation(ValidationError::InvalidCombination(
+                "spread needs at least two distinct legs; TWS does not answer a one-leg combo".into(),
+            )));
+        }
+        if common_factor > 1 {
+            return Err(Error::Validation(ValidationError::InvalidCombination(format!(
+                "spread leg ratios share the factor {common_factor}; divide them by it and scale the order quantity"
+            ))));
+        }
+
+        let configure = |leg: LegBuilder, contract: &Contract, ratio| {
+            let leg = leg.ratio(ratio);
+            if contract.exchange.as_str().is_empty() {
+                leg.done()
+            } else {
+                leg.on_exchange(contract.exchange.clone()).done()
+            }
+        };
+        let [(first, side, ratio), remaining @ ..] = checked.as_slice() else {
+            unreachable!("the validated spread has at least two legs");
+        };
+        let mut spread = Contract::spread(symbols.into_iter().collect::<Vec<_>>().join(","));
+        if !first.currency.as_str().is_empty() {
+            spread = spread.in_currency(first.currency.clone());
+        }
+        let mut spread = configure(spread.add_leg(first.contract_id, *side), first, *ratio);
+        for (contract, side, ratio) in remaining {
+            spread = configure(spread.add_leg(contract.contract_id, *side), contract, *ratio);
+        }
+
+        Ok(spread.build()?)
     }
 
     /// Creates a news contract from the specified provider code.
@@ -620,6 +833,12 @@ pub struct ContractDetails {
     /// The market name for this product.
     pub market_name: String,
     /// The minimum allowed price variation. Note that many securities vary their minimum tick size according to their price. This value will only show the smallest of the different minimum tick sizes regardless of the product's price. Full information about the minimum increment price structure can be obtained with the reqMarketRule function or the IB Contract and Security Search site.
+    ///
+    /// It is the increment of the market rule's first band, whatever the price: CTXR (rule 557:
+    /// 0.0001 below 1 USD, 0.01 from 1 USD) reports 0.0001, and ES options (rule 235: 0.05 below 5,
+    /// up to 0.5 from 100) report 0.05. To check a price, use the band for that price in the rule
+    /// from [`market_rule_id`](Self::market_rule_id) (live: 2026-11-25, server 223;
+    /// `docs/wire-facts/contracts.md#market-rule-ids-align-with-valid-exchanges`).
     pub min_tick: f64,
     /// How many market-data price units make one currency unit: `100` for a contract quoted in
     /// a sub-unit, such as CBOT corn in cents or an LSE stock in pence, otherwise `1`. TWS sent
@@ -741,6 +960,11 @@ pub struct ContractDetails {
     pub notes: String,
     /// Order's minimal size.
     ///
+    /// For TSE and SEHK stocks this is the board lot (7203 on TSEJ: 100; 5 on SEHK: 400), and
+    /// [`size_increment`](Self::size_increment) equals it. TWS rejects a smaller order with 388 and
+    /// one that is not a multiple of it with 461
+    /// (live: 2026-11-24, server 223; `docs/wire-facts/contracts.md#board-lots-min_size-and-size_increment`).
+    ///
     /// `None` when TWS reports no size rules for the contract (field absent,
     /// empty, or an "unset" sentinel); `Some(0.0)` is a real zero.
     pub min_size: Option<f64>,
@@ -811,6 +1035,11 @@ pub struct ContractDetails {
 impl ContractDetails {
     /// The market rule id for `exchange`, one of [`valid_exchanges`](Self::valid_exchanges);
     /// pass it to `market_rule` for that exchange's price increments.
+    ///
+    /// Pass the exchange the order is sent to. TWS checks an order's price against that
+    /// exchange's rule, and SMART can have its own: 7203 LMT 2000.1 was accepted on SMART (rule
+    /// 3407, 0.1 below 10,000 JPY) and refused with 110 on TSEJ (rule 1460, 0.5 above 1,000) (live:
+    /// 2026-11-25, server 223; `docs/wire-facts/contracts.md#market-rule-ids-align-with-valid-exchanges`).
     ///
     /// `None` when `exchange` is not a valid exchange, or when the two lists
     /// differ in length, so the ids can't be matched to exchanges (TWS sends
@@ -893,6 +1122,66 @@ impl ContractDetails {
     /// ```
     pub fn liquid_sessions(&self) -> Result<Vec<TradingSession>, Error> {
         parse_sessions(&self.liquid_hours)
+    }
+
+    /// The last trading day at [`last_trade_time`](Self::last_trade_time): the date of the
+    /// contract's [`last_trade_date_or_contract_month`](Contract::last_trade_date_or_contract_month)
+    /// with the time TWS sent beside it, as wall clock with no zone applied.
+    ///
+    /// `None` when TWS sent the date alone, or when the expiry is not a date. Which US equity
+    /// options come with a time is not fixed: on 2026-11-23 the standard monthlies (AAPL
+    /// `20261218`) came as the date alone and the weeklies with a time, while a contributor's
+    /// 2026-11-15 captures had the November monthly with a time and two later weeklies without.
+    /// It may depend on how near the expiry is, and change before it. The trading
+    /// sessions don't fill that gap: they cover only the coming week, and a session's close is
+    /// not the last trade time (ES's last trading day ends at 08:30 Chicago time, its session
+    /// at 16:00).
+    ///
+    /// TWS labels the time with [`time_zone_id`](Self::time_zone_id), the requested exchange's
+    /// zone, but the clock belongs to the contract. An option on a US stock or ETF gets its New
+    /// York last trade time on every exchange, so requested on CBOE or CBOE2 it comes under
+    /// `US/Central` and on PSE under `US/Pacific`, one or three hours off the label. Index,
+    /// futures and EUREX options were seen in `time_zone_id`
+    /// (`docs/wire-facts/contracts.md#last-trade-time-and-the-expiry-session`). Resolving the
+    /// zone is the caller's step.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Parse`] when `last_trade_time` is not `HH:MM:SS`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::ContractDetails;
+    /// use time::macros::datetime;
+    ///
+    /// // ESZ6 as TWS sends it: tag 4 `20261218 08:30:00 US/Central`.
+    /// let mut details = ContractDetails::default();
+    /// details.contract.last_trade_date_or_contract_month = Some("20261218".parse()?);
+    /// details.last_trade_time = "08:30:00".into();
+    /// details.time_zone_id = "US/Central".into();
+    /// assert_eq!(details.last_trade_date_time()?, Some(datetime!(2026-12-18 08:30)));
+    /// # Ok::<(), ibapi::Error>(())
+    /// ```
+    pub fn last_trade_date_time(&self) -> Result<Option<time::PrimitiveDateTime>, Error> {
+        let Some(date) = self.contract.last_trade_date_or_contract_month.as_ref().and_then(Expiry::date) else {
+            return Ok(None);
+        };
+        if self.last_trade_time.is_empty() {
+            return Ok(None);
+        }
+        let text = format!("{date} {}", self.last_trade_time);
+        time::PrimitiveDateTime::parse(&text, time::macros::format_description!("[year][month][day] [hour]:[minute]:[second]"))
+            .map(Some)
+            .map_err(|_| Error::invalid_value(self.last_trade_time.clone(), "expected last trade time HH:MM:SS"))
+    }
+}
+
+fn gcd(a: i32, b: i32) -> i32 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
     }
 }
 

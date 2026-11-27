@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::accounts::types::AccountId;
 use crate::builder::ValidationError;
+use crate::market_data::historical::{BarsBetweenError, WhatToShow};
 use crate::messages::{Notice, ResponseMessage};
 
 /// The main error type for IBAPI operations.
@@ -156,6 +157,22 @@ pub enum Error {
     #[error("UnexpectedEndOfStream")]
     UnexpectedEndOfStream,
 
+    /// TWS answered a historical-ticks request with ticks of another kind. It
+    /// does this when the contract has no ticks of the requested kind: a
+    /// `TRADES` request (`historical_ticks(..).last()`) for a forex pair, a
+    /// spot metal or an index CFD is answered with midpoint ticks. Terminal;
+    /// TWS sends nothing more for the request. Request `received` instead.
+    ///
+    /// A window with no ticks of the requested kind is not this error: TWS
+    /// answers it with an empty batch of the requested kind.
+    #[error("historical ticks requested as {requested}, but TWS answered with {received} ticks")]
+    UnexpectedTickKind {
+        /// The kind the request asked for.
+        requested: WhatToShow,
+        /// The kind TWS sent.
+        received: WhatToShow,
+    },
+
     /// The deadline passed before the request ended. Says nothing about the
     /// request at TWS, which may still be running; see
     /// `Subscription::cancel_and_drain`.
@@ -204,7 +221,8 @@ pub enum Error {
     #[error("{0}")]
     Notice(Notice),
 
-    /// Attempted to create a duplicate subscription.
+    /// Attempted to create a duplicate subscription or to reuse its shared
+    /// channel before an abandoned reply has ended.
     #[error("AlreadySubscribed")]
     AlreadySubscribed,
 
@@ -230,10 +248,10 @@ pub enum Error {
         order_id: i32,
     },
 
-    /// A multi-order submit (`submit_oca_orders`, a bracket's `submit_all`) stopped partway
-    /// because sending one order failed with `source`. Every order passed its checks before the
-    /// first was sent, so `source` is a transport error, such as [`Error::ConnectionReset`] or
-    /// [`Error::Reconnecting`].
+    /// A multi-order submit stopped partway because sending one order failed with `source`.
+    /// This covers `submit_oca_orders`, `submit_linked_orders`, and a bracket's `submit_all`.
+    /// Every order passed its checks before the first was sent, so `source` is a transport
+    /// error such as [`Error::ConnectionReset`] or [`Error::Reconnecting`].
     ///
     /// The orders in `sent` may be at TWS: the ones written before the failure, and last, the one
     /// whose write failed, which may still have arrived. A send refused before writing
@@ -260,6 +278,11 @@ pub enum Error {
     /// `Display`; [`source`](std::error::Error::source) is `None`.
     #[error("protobuf decode error: {0}")]
     ProtobufDecode(ProtobufDecodeError),
+
+    /// A request after the first in a split `historical_data(..).between(..).fetch()` of
+    /// 1-second bars failed. Carries that request's error and the bars fetched before it.
+    #[error("{0}")]
+    BarsBetween(Box<BarsBetweenError>),
 }
 
 /// A protobuf message from TWS failed to decode. Payload of
@@ -497,8 +520,8 @@ impl Error {
     ///   is, since `sent` is never empty: a submit whose first send is refused before writing
     ///   returns that refusal, not this.
     ///
-    /// The bracket builder's `submit_all` and `submit_oca_orders` check every order before
-    /// sending any, so a `true` error from them means none of their orders was sent; a send
+    /// The bracket builder's `submit_all`, `submit_oca_orders`, and `submit_linked_orders`
+    /// check every order before sending any, so a `true` error from them means none was sent. A send
     /// failing partway returns `OrdersPartiallySent`. `next_valid_order_id` returns
     /// `OrderIdInRequestRange` for an id TWS sent back, after its id request was written; that
     /// request places nothing.
@@ -542,11 +565,13 @@ impl Error {
             | Error::UnexpectedResponse(_)
             | Error::UnexpectedWireFormat(_)
             | Error::UnexpectedEndOfStream
+            | Error::UnexpectedTickKind { .. }
             | Error::Timeout
             | Error::BufferLimitExceeded { .. }
             | Error::InvalidFrame(_)
             | Error::Notice(_)
             | Error::ProtobufDecode(_)
+            | Error::BarsBetween(_)
             | Error::OrdersPartiallySent { .. } => false,
         }
     }
@@ -602,6 +627,10 @@ impl Clone for Error {
             Error::UnexpectedResponse(m) => Error::UnexpectedResponse(m.clone()),
             Error::UnexpectedWireFormat(m) => Error::UnexpectedWireFormat(m.clone()),
             Error::UnexpectedEndOfStream => Error::UnexpectedEndOfStream,
+            Error::UnexpectedTickKind { requested, received } => Error::UnexpectedTickKind {
+                requested: *requested,
+                received: *received,
+            },
             Error::Timeout => Error::Timeout,
             Error::BufferLimitExceeded { limit } => Error::BufferLimitExceeded { limit: *limit },
             Error::InvalidFrame(m) => Error::InvalidFrame(m.clone()),
@@ -613,6 +642,7 @@ impl Clone for Error {
             },
             Error::OrderIdInRequestRange { order_id } => Error::OrderIdInRequestRange { order_id: *order_id },
             Error::ProtobufDecode(e) => Error::ProtobufDecode(e.clone()),
+            Error::BarsBetween(e) => Error::BarsBetween(e.clone()),
             Error::OrdersPartiallySent { sent, not_sent, source } => Error::OrdersPartiallySent {
                 sent: sent.clone(),
                 not_sent: not_sent.clone(),

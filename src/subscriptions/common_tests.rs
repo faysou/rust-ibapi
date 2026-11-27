@@ -239,8 +239,8 @@ fn rejection_ends_request_only_for_verified_codes() {
     struct Case {
         decoder: &'static str,
         ends: fn(i32) -> bool,
-        /// Verified live to end the request at TWS; `None` = no opt-in.
-        verified: Option<i32>,
+        /// Verified live to end the request at TWS; empty = no opt-in.
+        verified: &'static [i32],
         /// Another terminal code, which must still cancel.
         other: i32,
     }
@@ -254,23 +254,23 @@ fn rejection_ends_request_only_for_verified_codes() {
     // independently of the names. `other` is the code a leak would come from
     // where one is known (10197 on market data).
     let cases = [
-        case("TickTypes", rejection_ends::<TickTypes>, Some(200), 10197),
-        case("Bar", rejection_ends::<Bar>, Some(200), 10197),
-        case("TickLast", rejection_ends::<TickLast>, Some(200), 10197),
-        case("TickBidAsk", rejection_ends::<TickBidAsk>, Some(200), 10197),
-        case("TickMidpoint", rejection_ends::<TickMidpoint>, Some(200), 10197),
-        case("MarketDepths", rejection_ends::<MarketDepths>, Some(200), 10197),
+        case("TickTypes", rejection_ends::<TickTypes>, &[200, 354, 10168, 10089], 10197),
+        case("Bar", rejection_ends::<Bar>, &[200, 354, 420, 10089], 10197),
+        case("TickLast", rejection_ends::<TickLast>, &[200, 10189, 10089], 10197),
+        case("TickBidAsk", rejection_ends::<TickBidAsk>, &[200, 10189, 10089], 10197),
+        case("TickMidpoint", rejection_ends::<TickMidpoint>, &[200, 10189, 10089], 10197),
+        case("MarketDepths", rejection_ends::<MarketDepths>, &[200, 354], 10197),
         case(
             "HistoricalDataFrame, keep_up_to_date",
             |code| rejection_ends_with::<HistoricalDataFrame>(code, &DecoderContext::default().with_keep_up_to_date(true)),
-            Some(200),
+            &[200, 321, 10182],
             162,
         ),
-        case("PnL", rejection_ends::<PnL>, Some(321), 200),
-        case("PnLSingle", rejection_ends::<PnLSingle>, Some(321), 200),
-        case("Vec<ScannerData>", rejection_ends::<Vec<ScannerData>>, Some(162), 309),
+        case("PnL", rejection_ends::<PnL>, &[321], 200),
+        case("PnLSingle", rejection_ends::<PnLSingle>, &[321], 200),
+        case("Vec<ScannerData>", rejection_ends::<Vec<ScannerData>>, &[162], 309),
         // Silent cancel live (no 366-style reply): nothing to gain, keep the safety net.
-        case("ContractDetails", rejection_ends::<ContractDetails>, None, 200),
+        case("ContractDetails", rejection_ends::<ContractDetails>, &[], 200),
     ];
     for Case {
         decoder,
@@ -279,7 +279,7 @@ fn rejection_ends_request_only_for_verified_codes() {
         other,
     } in cases
     {
-        if let Some(code) = verified {
+        for &code in verified {
             assert!(ends(code), "{decoder}: {code} is verified to end the request");
         }
         assert!(!ends(other), "{decoder}: {other} must still cancel");
@@ -305,6 +305,64 @@ fn cancel_frame_covers_each_cancel_outcome() {
     assert!(cancel_frame::<PnL>(&context, None).is_none());
     // The type has no cancel (the `StreamDecoder` default).
     assert!(cancel_frame::<OptionChain>(&context, Some(9000)).is_none());
+}
+
+#[test]
+fn for_earlier_subscription_turns_only_a_tws_error_into_a_notice() {
+    let notice = Notice {
+        request_id: Some(7),
+        code: 105,
+        message: "Order being modified does not match original order.".to_string(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    };
+
+    let from_error = RoutedItem::Error(Error::Notice(notice.clone())).for_earlier_subscription();
+    let from_notice = RoutedItem::Notice(notice.clone()).for_earlier_subscription();
+    let from_other_error = RoutedItem::Error(Error::Cancelled).for_earlier_subscription();
+    let from_response = RoutedItem::Response(ResponseMessage::from("3\0payload\0")).for_earlier_subscription();
+
+    assert!(matches!(from_error, RoutedItem::Notice(n) if n == notice));
+    assert!(matches!(from_notice, RoutedItem::Notice(n) if n == notice));
+    assert!(matches!(from_other_error, RoutedItem::Error(Error::Cancelled)));
+    assert!(matches!(from_response, RoutedItem::Response(_)));
+}
+
+/// Only the historical bar decoders read on after 10299: TWS sends their series anyway. Another
+/// terminal code still ends them, and other decoders still end on 10299.
+#[test]
+fn error_continues_request_only_for_10299_on_historical_bars() {
+    use crate::market_data::historical::HistoricalDataFrame;
+    use crate::market_data::realtime::TickTypes;
+
+    let continues = |hook: fn(&Notice, &DecoderContext) -> bool, code| hook(&Notice::synthesized(code, String::new()), &DecoderContext::default());
+    assert!(continues(HistoricalDataFrame::error_continues_request, 10299));
+    assert!(!continues(HistoricalDataFrame::error_continues_request, 162));
+    assert!(!continues(TickTypes::error_continues_request, 10299));
+}
+
+/// Only market data reads on after 10197: TWS resumes its ticks. Another terminal
+/// code still ends it, and the decoders sharing the market-data path still end on 10197.
+#[test]
+fn error_continues_request_only_for_10197_on_market_data() {
+    use crate::market_data::historical::HistoricalDataFrame;
+    use crate::market_data::realtime::{Bar, MarketDepths, TickBidAsk, TickLast, TickMidpoint, TickTypes};
+
+    type Hook = fn(&Notice, &DecoderContext) -> bool;
+    let continues = |hook: Hook, code| hook(&Notice::synthesized(code, String::new()), &DecoderContext::default());
+    assert!(continues(TickTypes::error_continues_request, 10197));
+    assert!(!continues(TickTypes::error_continues_request, 200));
+    let siblings: [(&str, Hook); 6] = [
+        ("Bar", Bar::error_continues_request),
+        ("TickLast", TickLast::error_continues_request),
+        ("TickBidAsk", TickBidAsk::error_continues_request),
+        ("TickMidpoint", TickMidpoint::error_continues_request),
+        ("MarketDepths", MarketDepths::error_continues_request),
+        ("HistoricalDataFrame", HistoricalDataFrame::error_continues_request),
+    ];
+    for (decoder, hook) in siblings {
+        assert!(!continues(hook, 10197), "{decoder} must still end on 10197");
+    }
 }
 
 /// Draining stops on a session that is down: a reset ended the request with the session, and a

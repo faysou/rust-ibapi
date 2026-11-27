@@ -11,7 +11,7 @@ triggers:
   - adding a one-shot whose request TWS can cancel
 symbols: [expect_proto, ProtoPayload, one_shot_shared, one_shot_shared_matching, ONE_SHOT_TIMEOUT, one_shot_deadline, check_deadline, next_frame, one_shot_by_request_id, one_shot_cancelling, CancellableOneShot, fold_one_shot, empty_on_end_of_stream, expect_type, retry_on_connection_reset]
 related: [proto-only-decoding, proto-aware-accessors, fixture-builders]
-precedents: ["#736", "#738", "#740", "#741", "#745", "#749", "#1107", "#1352"]
+precedents: ["#736", "#738", "#740", "#741", "#745", "#749", "#1107", "#1317", "#1352"]
 ---
 
 A one-shot request reads one frame off a **shared** channel, so it must check that the frame is
@@ -109,6 +109,8 @@ axes and callers only care about one, the other axis gets chosen for them.
   or timed-out request kept running at TWS. Live: each is answered by exactly one frame. A frame of
   another type is now skipped by the typed subscription's `RESPONSE_MESSAGE_IDS` filter rather
   than reported as `UnexpectedResponse`.
+- #1317 — `historical_ticks` became a one-shot read frame by frame through `next_frame` until
+  `is_done`; `TickSubscription` and its driver were removed.
 - #1352 — the send gate's refusal while reconnecting became `Error::Reconnecting`; the retry
   fires on it too, and reports a last refusal after an attempt that may have been written as
   `ConnectionReset`.

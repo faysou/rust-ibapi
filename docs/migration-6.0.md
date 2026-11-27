@@ -1696,3 +1696,333 @@ connection dropped still end with `ConnectionReset`. `submit_oca_orders` and `su
 `Reconnecting` when their first send is refused, and otherwise list a refused order in
 `OrdersPartiallySent::not_sent` (§53). Refusals after the reconnect gives up
 (`ConnectionFailed`) or after a shutdown (`Shutdown`) are unchanged.
+
+### 56. Order codes outside 200-399 move out of `NoticeCategory::Error`
+
+Thirteen order codes outside the order-rejection band no longer classify as `NoticeCategory::Error`.
+Each was verified against a paper account (`docs/wire-facts/orders.md`):
+
+| Codes | Category | Meaning |
+| ----- | -------- | ------- |
+| 103, 110, 461, 10244, 10311, 10317 | `OrderRejection` | TWS rejected a new order and created none |
+| 104, 105, 10067, 10147, 10148, 10241, 10242 | `OrderChangeRejection` (new) | TWS refused a cancel or modify, and the request changed nothing |
+
+`NoticeCategory` is `#[non_exhaustive]`, so a `match` compiles unchanged, but a
+`NoticeCategory::Error` arm no longer sees these codes. `is_error()` is still
+true for all of them, and they still end the `place_order` or `cancel_order` subscription that
+receives them, except 10242, which arrives with request id 0 and so reaches no order
+subscription. A wildcard arm is where the seven `OrderChangeRejection` codes now land.
+
+Check code that drops an order on `is_order_rejection()`. On a modify of a working order, TWS also
+answers with an `OrderRejection` code (201, 321), and the order goes on working with its earlier
+terms. Treat the order as gone only when no status has been seen for it. For an
+`OrderChangeRejection`, the order keeps its state; read its statuses or `open_orders` to learn it.
+
+A refused cancel or modify that arrives before any status for the order no longer starts an
+`order_status_stream`, so `wait_for_fill` does not report it as `OrderOutcome::Rejected`.
+
+### 57. `OrderData::order_id` is removed; read `order.order_id`
+
+`OrderData::order_id` duplicated `order.order_id`. For an open order both held the same id; for a
+completed order it was always `-1`, because the `CompletedOrder` message has no top-level id and
+3.0 kept `-1` from the text decoder. The field is gone, so there is one place to read the id.
+`OpenOrder` still sends a top-level id: the decoder uses it for `order.order_id` when the order
+itself leaves the id out.
+
+```rust,ignore
+// 5.x
+let id = data.order_id;          // -1 on a completed record
+if data.order_id == -1 { /* completed record */ }
+
+// 6.0
+let id = data.order.order_id;
+```
+
+The compiler flags every read of the removed field. Code that tested `order_id == -1` to tell a
+completed record from an open one must track which request a record came from instead.
+
+Order ids are per API client, so pair `order.order_id` with `order.client_id`: a second client can
+see another client's order under a low id such as `1`. A completed record can carry
+`order.order_id` `0` (cancelled orders listed with `order.client_id` `0`), so match a completed
+record on `order.perm_id`.
+
+To read a completed record's status and quantities, use `OrderData::completed_order_status()`.
+A completed order's `order.total_quantity` is the quantity left unfilled, not the size ordered.
+
+### 58. A cancel or modify no longer ends the order's earlier subscription
+
+5.x kept one subscription per order ID: `cancel_order`, or a modify through another
+`place_order` with the same ID, replaced the earlier subscription's route: on the async client
+that subscription ended at once, and on the blocking client it stopped receiving and its `next()`
+blocked. Fills that arrived after the cancel went only to `order_update_stream`. Every
+subscription on the ID now stays live and receives each of the order's frames once.
+
+- **After `cancel_order`**: the `place_order` subscription yields the `Cancelled` status, the
+  202 notice, and any fills and commission reports that follow. The `cancel_order` subscription
+  yields the same statuses and notice. Code that stopped reading the `place_order` subscription
+  because it ended, and read the outcome from the cancel, can read both from it.
+- **After a modify**: the earlier `place_order` subscription keeps yielding the order's events
+  beside the new one. Drop the subscription you no longer read.
+- **A refused modify or cancel**: TWS sends its error (105, 104, 10148, ...) on the order ID
+  without identifying the request. It ends the subscription for the most recently written
+  request. During a socket write, the error follows the newer request if the write succeeds.
+  If the write fails before sending the frame, the error follows the earlier request. When
+  the connection resets before the outcome is known, earlier subscriptions receive queued
+  order errors as notices before the connection error.
+  Every subscription opened before another one on the ID yields it as `SubscriptionItem::Notice`
+  and keeps going, also after the later subscription is dropped (`let _ = client.cancel_order(id)?;`).
+  Code that read the refusal from the `place_order` subscription as an `Err` reads it as a notice
+  there, or from the modify's or cancel's own subscription.
+- **A modify sent with `submit_order`** opens no subscription. If the `place_order` subscription
+  is the order's only one, it is the newest, and a refusal of that modify ends it with the error
+  although the order is still working, as in 5.x. Send modifies with `place_order` to keep it.
+
+### 59. `executions()` replies no longer reach order subscriptions or `order_update_stream`
+
+An `ExecutionData` frame that answers `executions()` carries that request's id; a live fill
+carries -1. 5.x delivered a reply for an order with an open `place_order` subscription to that
+subscription instead of the request, and copied every reply, with its commission reports, to
+`order_update_stream`. Execution rows and end markers now go to the request that asked on both clients.
+
+- **`order_update_stream` and `place_order`**: receive live executions. They receive commission
+  changes only for executions this client saw live. Reports have no request id, so a changed
+  report for a live execution can come from an overlapping reply. A report without an eligible
+  execution is dropped. After an unmatched-report warning or a reconnect, use `executions()`
+  to reconcile missing commissions.
+- **`executions()`**: a reply receives commission reports for the executions it lists until its
+  end marker. Overlapping replies for the same execution each receive the report, while each
+  reply suppresses repeated copies of its current report. Use `execution_id` to apply changes.
+
+### 60. `Currency::default()` is empty
+
+5.x defaulted `Currency` to `"USD"`, so a `Contract` struct literal ending in
+`..Default::default()` that never set `currency`, and `Contract::default()` itself, asked TWS
+for a USD listing. Every non-USD instrument built that way failed with error 200 "No security
+definition has been found": an HSI future or index on HKFE, the DAX index, Tencent (`700`) on
+SEHK. The default is now empty, which leaves the currency to TWS
+(`docs/wire-facts/contracts.md#an-empty-currency-lets-tws-resolve-it`).
+
+The builders are unchanged: `Contract::stock`, `Contract::call`/`put`, `Contract::option`,
+`Contract::futures`, `Contract::continuous_futures`, `Contract::crypto` and `Contract::spread`
+still default to USD, and `Contract::forex` and `Contract::index` set the currency themselves.
+
+What changes for a struct literal that leaves `currency` unset:
+
+- A contract with one listing (a future, an option, a futures option, an index, a stock on a
+  single-currency exchange) now resolves whatever its currency.
+- A stock on `SMART` listed in several currencies (AAPL, SAP, SHEL, VOD) returns every
+  listing from `contract_details`, one per currency, and market data or an order on it fails
+  with error 200 "The contract description specified for AAPL is ambiguous; you must specify
+  the currency". Set the currency, or use `Contract::stock`, which defaults to USD.
+- `Contract::news` sends an empty currency.
+
+```rust
+// 5.x: currency was "USD" without saying so
+let contract = Contract { symbol: "AAPL".into(), security_type: SecurityType::Stock, ..Default::default() };
+
+// 6.0
+let contract = Contract { symbol: "AAPL".into(), security_type: Some(SecurityType::Stock), currency: "USD".into(), ..Default::default() };
+// or
+let contract = Contract::stock("AAPL").build();
+```
+
+Code that compares a contract's currency with `Currency::default()` to mean USD now compares
+with the empty currency.
+
+### 61. Client-synthesized notices get their own categories
+
+A notice with a negative code is raised by this client, not TWS. These notices classified as
+`NoticeCategory::Error`, so `is_error()` was true and `is_informational()` false for all of them.
+They now classify ahead of every other rule, in two categories:
+
+| Category                            | Codes                                                                                               | `is_error()` |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------- | ------------ |
+| `NoticeCategory::ClientSynthesized` | `TRANSPORT_RECONNECT_CODE`, `SUBSCRIPTION_LAG_CODE`, `NOTICE_STREAM_LAG_CODE`, other negative codes | `false`      |
+| `NoticeCategory::UnhandledFrame`    | `HANDSHAKE_UNKNOWN_FRAME_CODE`, `HANDSHAKE_DECODE_FAILURE_CODE`, `UNKNOWN_MESSAGE_TYPE_CODE`        | `true`       |
+
+`UnhandledFrame` notices report a frame the client could not handle and dropped;
+`UNKNOWN_MESSAGE_TYPE_CODE` is the main sign of a desynchronized stream. They stay errors.
+`ClientSynthesized` notices report the client's own state and are informational. A stream
+delivers them as notices and goes on, but readers that assemble a complete result
+(`collect_to_end_within`, `next_batch`, and what is built on them) still fail with
+`SUBSCRIPTION_LAG_CODE` as `Err(Error::Notice)`.
+
+```rust,ignore
+// 5.x: the reconnect and lag notices reached the is_error() branch
+if notice.is_error() { /* TWS errors, plus reconnect, lag and unhandled-frame notices */ }
+
+// 6.0: the reconnect and lag notices need their own branch
+if notice.is_error() { /* TWS errors and unhandled-frame notices */ }
+if notice.category() == NoticeCategory::ClientSynthesized { /* match notice.code: reconnect, lag */ }
+```
+
+The compiler catches none of this. Code that relied on `is_error()` or `NoticeCategory::Error`
+to see the reconnect and lag notices must match their codes or `NoticeCategory::ClientSynthesized`.
+Code that matched `NoticeCategory::Error` to see unhandled frames must match
+`NoticeCategory::UnhandledFrame`. `Notice::is_client_synthesized()` is true for the same codes as
+before, any negative code. A match on `NoticeCategory` with a wildcard arm sees the new variants
+there; the enum is `#[non_exhaustive]`, so no new arm is required.
+
+### 62. `TimeInForce` gains `Minutes`
+
+IB uses the time in force `Minutes` for cryptocurrency limit orders on PAXOS: an unfilled order
+is cancelled after 5 minutes. 5.x decoded it as `TimeInForce::Unknown("Minutes")`. It is now
+`TimeInForce::Minutes`, set by `OrderBuilder::minutes()`, and it encodes back to `Minutes`.
+
+The compiler finds an exhaustive `match` on `TimeInForce` that lacks the new arm. It doesn't catch
+a comparison or match against `Unknown("Minutes")`: that code still compiles and no longer
+matches. Serialized, `TimeInForce` is the wire string, so an `Order` with it writes `"Minutes"`
+and reads back as the new variant.
+
+### 63. 10197 continues a `market_data` subscription
+
+During an internet outage TWS sends error 10197 ("No market data during competing live session")
+on a `reqMktData` request and keeps the request: its ticks resume on the same request id once the
+farms are back. 5.x ended the subscription with `Err(Error::Notice)` for 10197 and sent the
+cancel, so the caller lost a request TWS would have resumed.
+
+A `market_data` subscription now yields 10197 as `SubscriptionItem::Notice` and keeps reading.
+Dropping or cancelling it still sends `cancelMktData`, since the request is live. Tick-by-tick,
+depth, realtime bars and the other request types still end on 10197.
+
+```rust,ignore
+// 5.x: the stream ended on 10197; the caller re-requested
+match item {
+    Err(Error::Notice(n)) if n.code == 10197 => { /* re-request market data */ }
+    // ...
+}
+
+// 6.0: a notice; keep reading the same subscription
+match item {
+    Ok(SubscriptionItem::Notice(n)) if n.code == 10197 => { /* no data until the farms are back */ }
+    // ...
+}
+```
+
+The compiler catches none of this. Code that stopped or re-requested on `Err` for 10197 sees a
+notice instead; `iter_data` and `filter_data` drop it. A snapshot reads on after 10197 too, and
+no run showed whether TWS still sends its `SnapshotEnd` then; `snapshot_once` bounds the wait.
+
+### 64. `resubscribing` reopens a stream after 1101
+
+TWS sends 1101 ("connectivity restored, data lost") when its link to IB returns and it no longer
+serves the requests opened before the loss. 5.x `Client::resubscribing` did nothing on 1101:
+market data, tick-by-tick, realtime bar and depth streams stayed open with no data and no error.
+
+The wrapper now yields the 1101 as `SubscriptionItem::Notice`, writes the old request's cancel,
+and calls `open` again. 1102 ("data maintained") changes nothing.
+
+```rust,ignore
+// 5.x: watch the notice stream and re-request on 1101
+for notice in client.notice_stream().iter() {
+    if notice.code == 1101 { /* drop the subscription, open it again */ }
+}
+
+// 6.0: the wrapped stream reopens; mark the gap on its notice
+match item {
+    Ok(SubscriptionItem::Notice(n)) if n.code == 1101 => { /* gap: reset book or bar state */ }
+    // ...
+}
+```
+
+The compiler catches none of this. A caller that re-requests a wrapped stream on 1101 itself now
+opens a second request; remove that handling. Streams not wrapped in `resubscribing` still need it.
+
+No 1101 arrived in the outage runs behind these changes, so the reopen follows IB's documentation
+rather than a capture.
+
+### 65. `Quote` reads `None` for a side with no quote
+
+TWS reports a side with no quote as a price tick with size `0` and a placeholder price: `-1` for
+options and indices, `-1` times the price magnifier (`-100`) for a magnified contract, and `0`
+for combos. `Quote::apply` stored it, so `quote.bid` read `Some(-1.0)` although the field's
+`Option` says "no bid" with `None`. A bid or ask price tick with size `0` and a price of `0` or
+below now sets the side's price and size to `None`. A price above `0` with size `0`, never seen on
+the wire, is still stored as sent. The placeholder can't be filtered by price alone, since a
+calendar spread's real bid can be `-71` (with a size).
+
+```rust,ignore
+// 5.x
+let bid = quote.bid.filter(|_| quote.bid_size > Some(0.0));
+
+// 6.0
+let bid = quote.bid;               // None while TWS reports no bid
+let side = quote.bid_side();       // price and size, None whenever the size is 0
+```
+
+The compiler catches none of this. Code that read the placeholder from `Quote` to detect an empty
+side sees `None` instead. The `TickPrice` and `TickPriceSize` ticks still carry the placeholder.
+
+`last` and `last_size` keep the values TWS sends. A last-price placeholder can appear as
+`Some(-1.0)` or `Some(-100.0)` with `last_size` set to `Some(0.0)`. EUR.USD can also report
+a real positive last price with the same size, so size alone cannot identify a placeholder.
+
+### 66. Error 10089 ends the subscription
+
+5.x treated 10089 ("Requested market data requires additional subscription for API ... Delayed
+market data is available") as a data advisory (#677): a `market_data`, `realtime_bars` or
+`tick_by_tick` stream yielded it as `SubscriptionItem::Notice` and stayed open. TWS sends
+nothing after it, whatever the market data type, so the stream waited forever, and its drop sent
+a cancel TWS answered with 300 (`docs/wire-facts/market-data.md#market-data-type-and-permission-notices`).
+
+It is now the stream's terminal error, `Err(Error::Notice)` with code 10089, and no cancel is
+sent. `Notice::category()` returns `NoticeCategory::Error` for it, `is_informational()` is
+`false`, and `DATA_ADVISORY_CODES` no longer lists it. Code that waited for delayed data after
+10089 should instead set a delayed market data type (`switch_market_data_type`). For a contract
+TWS has delayed data for (MSFT and IBM in the probe), it then sends 10167, which stays an
+advisory, before the delayed ticks; for one it has none for (AAPL on the probing account), it
+still sends 10089 and the stream ends.
+
+`market_depth` also ends on 10089 now, with the same `Err(Error::Notice)`; it used to stay open
+after the notice with no rows. Its drop still writes the cancel, which TWS answers with 310: one
+AAPL `ISLAND` request was probed for depth, against 36 for the other request kinds.
+
+### 67. `historical_ticks` returns the ticks; `TickSubscription` is removed
+
+A historical ticks reply is finite: TWS sends the ticks and marks the reply complete, in one
+frame in every capture taken ([wire facts](wire-facts/market-data.md#historical-ticks-reply)).
+The builder terminals now wait for the complete reply and return it, as
+`historical_data(..).fetch()` does for bars, instead of handing back a `TickSubscription` to
+iterate.
+
+| Item (sync and async)                                                                                                                            | 5.x                              | 6.0                 |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------- | ------------------- |
+| `HistoricalTicksBuilder::last()` (5.x `trade()`, §39)                                                                                            | `TickSubscription<TickLast>`     | `Vec<TickLast>`     |
+| `HistoricalTicksBuilder::mid_point()`                                                                                                            | `TickSubscription<TickMidpoint>` | `Vec<TickMidpoint>` |
+| `HistoricalTicksBuilder::bid_ask(..)`                                                                                                            | `TickSubscription<TickBidAsk>`   | `Vec<TickBidAsk>`   |
+| `TickSubscription`, `TickSubscriptionIter`, `TickSubscriptionOwnedIter`, `TickSubscriptionTryIter`, `TickSubscriptionTimeoutIter`, `TickDecoder` | public                           | removed             |
+| `Client::cancel_historical_ticks(request_id)`                                                                                                    | public                           | removed             |
+
+```rust,ignore
+// client: ibapi::client::blocking::Client (the async terminals add `.await`), contract: Contract
+
+// 5.x
+let ticks = client.historical_ticks(&contract, 100).trade()?;
+for tick in ticks.iter_data() {
+    let tick = tick?; // a TWS rejection or a dropped connection surfaced here
+    println!("{tick:?}");
+}
+
+// 6.0
+let ticks = client.historical_ticks(&contract, 100).last()?; // ... and surfaces here now
+for tick in &ticks {
+    println!("{tick:?}");
+}
+```
+
+The compiler finds every use of the removed types and every loop that treated the result as a
+subscription. What it does not show:
+
+- **Errors move to the terminal.** A TWS rejection (`Error::Notice`), a connection that closes
+  before the reply is complete (`Error::UnexpectedEndOfStream`) and a `one_shot_timeout`
+  (`Error::Timeout`) are returned by `last()` / `mid_point()` / `bid_ask(..)`. A reply that
+  stops part-way is an error, never a shorter `Vec`.
+- **Notices are not delivered.** The informational notices TWS sends with the reply (2188) are
+  skipped, as `fetch()` skips them; they were `SubscriptionItem::Notice` items before.
+- **The request is resent after a connection reset**, as the crate's other one-shots are.
+- **There is no handle to cancel.** The blocking terminal returns when the reply is complete
+  and cannot be cancelled from another thread; a `one_shot_timeout` bounds it and cancels the
+  request at TWS. Dropping the async terminal's future before the reply is complete cancels
+  the request at TWS. The cancel is written from server 215, the version
+  `cancel_historical_ticks` required. That is why `cancel_historical_ticks` and
+  `TickSubscription::request_id()` are gone.

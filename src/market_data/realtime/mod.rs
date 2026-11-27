@@ -17,8 +17,12 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::common::error_helpers;
-use crate::contracts::OptionComputation;
-use crate::messages::{IncomingMessages, Notice, ResponseMessage, MARKET_DEPTH_RESET_CODE, NO_SECURITY_DEFINITION_CODE};
+use crate::contracts::{OptionComputation, SecurityType};
+use crate::messages::{
+    IncomingMessages, Notice, ResponseMessage, COMPETING_LIVE_SESSION_CODE, MARKET_DATA_DELAYED_NOT_ENABLED_CODE, MARKET_DATA_NOT_SUBSCRIBED_CODE,
+    MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE, MARKET_DEPTH_RESET_CODE, NO_SECURITY_DEFINITION_CODE, REALTIME_QUERY_INVALID_CODE,
+    TICK_BY_TICK_FAILED_CODE,
+};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::Error;
 
@@ -33,7 +37,7 @@ pub mod generic_tick;
 mod quote;
 pub use quote::Quote;
 
-pub use super::{TickAttributeBidAsk, TickAttributeLast, TickBidAsk, TickLast, TickMidpoint};
+pub use super::{QuoteSide, TickAttributeBidAsk, TickAttributeLast, TickBidAsk, TickLast, TickMidpoint};
 
 // Feature-specific implementations
 #[doc(hidden)]
@@ -63,9 +67,12 @@ impl StreamDecoder<TickBidAsk> for TickBidAsk {
         common::encoders::encode_cancel_tick_by_tick(request_id).map(Some)
     }
 
-    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    /// Live: after 200, 10189 or 10089 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(
+            notice.code,
+            NO_SECURITY_DEFINITION_CODE | TICK_BY_TICK_FAILED_CODE | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE
+        )
     }
 }
 
@@ -84,9 +91,12 @@ impl StreamDecoder<TickMidpoint> for TickMidpoint {
         common::encoders::encode_cancel_tick_by_tick(request_id).map(Some)
     }
 
-    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    /// Live: after 200, 10189 or 10089 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(
+            notice.code,
+            NO_SECURITY_DEFINITION_CODE | TICK_BY_TICK_FAILED_CODE | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE
+        )
     }
 }
 
@@ -106,9 +116,9 @@ pub struct Bar {
     pub close: f64,
     /// Total volume traded during the bar period.
     ///
-    /// `None` when TWS sends no volume, which it does for every bar that isn't
-    /// [`WhatToShow::Trades`]: a MIDPOINT, BID or ASK bar has no traded volume. It never
-    /// means nothing traded; a quiet TRADES bar reports `Some(0.0)`.
+    /// `None` when TWS omits volume or sends the sentinel `-1`, as observed for MIDPOINT,
+    /// BID, and ASK. BTC AGGTRADES bars can carry volume. A quiet TRADES bar reports
+    /// `Some(0.0)`.
     pub volume: Option<f64>,
     /// Volume weighted average price. `None` when [`volume`](Self::volume) is.
     pub wap: Option<f64>,
@@ -148,9 +158,12 @@ impl StreamDecoder<Bar> for Bar {
         common::encoders::encode_cancel_realtime_bars(request_id).map(Some)
     }
 
-    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    /// Live: after 200, 354, 420 or 10089 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(
+            notice.code,
+            NO_SECURITY_DEFINITION_CODE | MARKET_DATA_NOT_SUBSCRIBED_CODE | REALTIME_QUERY_INVALID_CODE | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE
+        )
     }
 }
 
@@ -169,9 +182,12 @@ impl StreamDecoder<TickLast> for TickLast {
         common::encoders::encode_cancel_tick_by_tick(request_id).map(Some)
     }
 
-    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    /// Live: after 200, 10189 or 10089 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(
+            notice.code,
+            NO_SECURITY_DEFINITION_CODE | TICK_BY_TICK_FAILED_CODE | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE
+        )
     }
 }
 
@@ -192,13 +208,45 @@ pub enum WhatToShow {
     Ask,
     /// Aggregated trade data (wire value `AGGTRADES`).
     ///
-    /// Required for crypto contracts: TWS rejects `TRADES` for crypto with
-    /// error 10299 on `reqRealTimeBars`, so crypto trade-price bars must be
-    /// requested as `AGGTRADES`.
+    /// For crypto. TWS also accepts [`Trades`](Self::Trades) for crypto on
+    /// `reqRealTimeBars` and sends the same bars, as historical bar requests do
+    /// after a 10299 notice (see [`trades_for`](Self::trades_for)). Other
+    /// security types reject it.
     AggTrades,
 }
 
 impl WhatToShow {
+    /// The `whatToShow` that requests trade-price bars for `security_type`, or `None` where TWS
+    /// has no trade data for it.
+    ///
+    /// - Crypto: [`AggTrades`](Self::AggTrades), the value historical bars expect. TWS also
+    ///   accepts `TRADES` here and sends the same bars.
+    /// - Forex pairs, commodities (`XAUUSD`) and CFDs: `None`. TWS answers `TRADES` on a forex
+    ///   pair or commodity with error 420; request [`MidPoint`](Self::MidPoint),
+    ///   [`Bid`](Self::Bid) or [`Ask`](Self::Ask) instead.
+    /// - Every other security type: [`Trades`](Self::Trades).
+    ///
+    /// Live-checked for crypto, forex and `XAUUSD`; CFDs follow the historical rule
+    /// (`docs/wire-facts/market-data.md#trade-price-whattoshow-by-security-type`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ibapi::contracts::SecurityType;
+    /// use ibapi::market_data::realtime::WhatToShow;
+    ///
+    /// assert_eq!(WhatToShow::trades_for(&SecurityType::Crypto), Some(WhatToShow::AggTrades));
+    /// assert_eq!(WhatToShow::trades_for(&SecurityType::Future), Some(WhatToShow::Trades));
+    /// assert_eq!(WhatToShow::trades_for(&SecurityType::ForexPair), None);
+    /// ```
+    pub fn trades_for(security_type: &SecurityType) -> Option<Self> {
+        match security_type {
+            SecurityType::Crypto => Some(Self::AggTrades),
+            SecurityType::ForexPair | SecurityType::Commodity | SecurityType::CFD => None,
+            _ => Some(Self::Trades),
+        }
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             Self::Trades => "TRADES",
@@ -269,6 +317,14 @@ pub struct Reroute {
 }
 
 /// How a [`MarketDepth`] / [`MarketDepthL2`] row changes the book.
+///
+/// On EUR.USD depth from IDEALPRO, rows behaved as fixed slots rather than a list that shifts:
+/// TWS inserted rows only at the end of a side, re-priced rows in place with `Update`, and almost
+/// always deleted the last row (17 of 1,327 deletes in a downstream recording hit a lower row). In
+/// that recording, shifting the rows after `position` on an insert or delete left a side unsorted
+/// after 31,049 operations, against 3,775 transient states for fixed slots. Other instruments and
+/// SMART depth were not probed (live: 2026-11-25, server 223;
+/// `docs/wire-facts/market-data.md#eurusd-depth-rows-are-fixed-positions`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DepthOperation {
     /// Insert a new row at `position`. Wire code `0`. Also the value when TWS omits the field.
@@ -276,7 +332,7 @@ pub enum DepthOperation {
     Insert,
     /// Update the row at `position`. Wire code `1`.
     Update,
-    /// Delete the row at `position`. Wire code `2`.
+    /// Delete the row at `position`. On EUR.USD depth TWS sent price and size 0. Wire code `2`.
     Delete,
     /// Operation code not modeled by this version of the API.
     Unknown(i32),
@@ -366,9 +422,9 @@ impl StreamDecoder<MarketDepths> for MarketDepths {
         common::encoders::encode_cancel_market_depth(request_id, context.map(|c| c.is_smart_depth).unwrap_or(false)).map(Some)
     }
 
-    /// Live: after 200 TWS answers the cancel with 310 (no such request).
+    /// Live: after 200 or 354 TWS answers the cancel with 310 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(notice.code, NO_SECURITY_DEFINITION_CODE | MARKET_DATA_NOT_SUBSCRIBED_CODE)
     }
 
     /// Live: a rerouted depth request holds no depth slot (309 never fires).
@@ -453,9 +509,23 @@ impl StreamDecoder<TickTypes> for TickTypes {
         common::encoders::encode_cancel_market_data(request_id).map(Some)
     }
 
-    /// Live: after 200 TWS answers the cancel with 300 (no such request).
+    /// Live: after 200, 354, 10168 or 10089 TWS answers the cancel with 300 (no such request).
     fn rejection_ends_request(notice: &Notice, _context: &DecoderContext) -> bool {
-        notice.code == NO_SECURITY_DEFINITION_CODE
+        matches!(
+            notice.code,
+            NO_SECURITY_DEFINITION_CODE
+                | MARKET_DATA_NOT_SUBSCRIBED_CODE
+                | MARKET_DATA_DELAYED_NOT_ENABLED_CODE
+                | MARKET_DATA_SUBSCRIPTION_REQUIRED_CODE
+        )
+    }
+
+    /// Live: after 10197 during an internet outage TWS resumed ticks on the
+    /// same request once its farms were back. Not probed on a snapshot: one
+    /// that draws 10197 reads on, waiting for a `SnapshotEnd` TWS may never
+    /// send, so bound it (`snapshot_once`).
+    fn error_continues_request(notice: &Notice, _context: &DecoderContext) -> bool {
+        notice.code == COMPETING_LIVE_SESSION_CODE
     }
 
     fn is_snapshot_end(&self, _context: &DecoderContext) -> bool {
@@ -482,7 +552,7 @@ pub struct TickPrice {
 
 /// Attributes associated with price ticks.
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[derive(Debug, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct TickAttribute {
     /// Indicates if the order can be automatically executed.
     pub can_auto_execute: bool,

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         LazyLock, Mutex, RwLock,
@@ -28,16 +28,25 @@ use {
         AsyncMessageBus,
     },
     async_trait::async_trait,
-    tokio::sync::broadcast,
+    tokio::sync::{broadcast, oneshot},
 };
 
 #[cfg(feature = "async")]
-const TEST_BROADCAST_CAPACITY: usize = 1024;
+pub(crate) const TEST_BROADCAST_CAPACITY: usize = 1024;
+
+#[cfg(feature = "async")]
+struct RequestSendStall {
+    accepted: oneshot::Sender<()>,
+    flushed: oneshot::Receiver<()>,
+}
 
 pub(crate) struct MessageBusStub {
     pub request_messages: RwLock<Vec<Vec<u8>>>,
     /// Pre-built responses, served in order.
     pub ordered_responses: Vec<ResponseMessage>,
+    /// Responses for each request in turn, served before `ordered_responses`. See
+    /// [`MessageBusStub::with_responses_per_request`].
+    request_responses: Mutex<VecDeque<Vec<ResponseMessage>>>,
     /// The `limit` of each bounded `send_request_capped` call, in order. The stub
     /// doesn't enforce it; overflow is tested on the real buses.
     pub buffer_limits: RwLock<Vec<usize>>,
@@ -47,6 +56,9 @@ pub(crate) struct MessageBusStub {
     /// Requests still to be answered with [`Error::ConnectionReset`] before the
     /// configured responses are served. See [`MessageBusStub::with_connection_resets`].
     connection_resets: AtomicUsize,
+    fail_request_send: AtomicBool,
+    #[cfg(feature = "async")]
+    request_send_stall: Mutex<Option<RequestSendStall>>,
     /// What `session_generation` reports; see [`MessageBusStub::start_new_session`].
     session_generation: AtomicU64,
     /// The runtime the stub was built on, if any; sync-only tests build it
@@ -71,10 +83,17 @@ pub(crate) struct MessageBusStub {
     reconnect_fails: bool,
     /// What `send_message` does after recording the message. See [`MessageBusStub::with_failing_sends`].
     send_mode: SendMode,
+    /// `send_message` calls so far, for [`SendMode::FailAfter`].
+    sends: AtomicUsize,
     #[cfg(feature = "sync")]
     open_sync_senders: Mutex<Vec<channel::Sender<RoutedItem>>>,
     #[cfg(feature = "async")]
     open_async_senders: Mutex<Vec<broadcast::Sender<RoutedItem>>>,
+    /// Never fed: the stub delivers no global notices, so no farm is broken.
+    #[cfg(feature = "sync")]
+    sync_farms: crate::transport::farm_watch::sync_impl::FarmWatch,
+    #[cfg(feature = "async")]
+    async_farms: crate::transport::farm_watch::async_impl::FarmWatch,
 }
 
 /// What `send_message` does after recording the message.
@@ -85,14 +104,35 @@ enum SendMode {
     FailAfter(usize),
     /// Fail with `Reconnecting` without recording the message.
     Refuse,
+    /// Succeed this many times, then park after recording each subsequent message.
     #[cfg(feature = "async")]
-    Stall,
+    StallAfter(usize),
 }
 
 // Separate tracking for order update subscriptions to maintain backward compatibility
 static ORDER_UPDATE_SUBSCRIPTION_TRACKER: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 impl MessageBusStub {
+    #[cfg(feature = "async")]
+    pub(crate) fn stall_next_request_send(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (accepted, acceptance) = oneshot::channel();
+        let (flush, flushed) = oneshot::channel();
+        *self.request_send_stall.lock().unwrap() = Some(RequestSendStall { accepted, flushed });
+        (acceptance, flush)
+    }
+
+    pub(crate) fn fail_next_request_send(&self) {
+        self.fail_request_send.store(true, Ordering::Relaxed);
+    }
+
+    fn check_request_send(&self, message: &[u8]) -> Result<(), Error> {
+        if self.fail_request_send.swap(false, Ordering::Relaxed) {
+            self.request_messages.write().unwrap().push(message.to_vec());
+            return Err(Error::ConnectionReset);
+        }
+        Ok(())
+    }
+
     /// Simulate a reconnect's reset: subscriptions made before it now belong
     /// to an earlier session.
     pub(crate) fn start_new_session(&self) {
@@ -105,10 +145,14 @@ impl Default for MessageBusStub {
         Self {
             request_messages: RwLock::new(vec![]),
             ordered_responses: vec![],
+            request_responses: Mutex::default(),
             buffer_limits: RwLock::new(vec![]),
             #[cfg(feature = "async")]
             executions_requests: RwLock::new(vec![]),
             connection_resets: AtomicUsize::new(0),
+            fail_request_send: AtomicBool::new(false),
+            #[cfg(feature = "async")]
+            request_send_stall: Mutex::default(),
             session_generation: AtomicU64::new(0),
             #[cfg(feature = "async")]
             runtime: tokio::runtime::Handle::try_current().ok(),
@@ -120,10 +164,15 @@ impl Default for MessageBusStub {
             reconnect_delay: Duration::ZERO,
             reconnect_fails: false,
             send_mode: SendMode::Succeed,
+            sends: AtomicUsize::new(0),
             #[cfg(feature = "sync")]
             open_sync_senders: Mutex::default(),
             #[cfg(feature = "async")]
             open_async_senders: Mutex::default(),
+            #[cfg(feature = "sync")]
+            sync_farms: Default::default(),
+            #[cfg(feature = "async")]
+            async_farms: Default::default(),
         }
     }
 }
@@ -152,6 +201,14 @@ impl MessageBusStub {
         stub
     }
 
+    /// Answer the first requests with their own responses, one entry per request in order; later
+    /// requests get none. For a request API that pages over several requests.
+    pub fn with_responses_per_request(responses: Vec<Vec<ResponseMessage>>) -> Self {
+        let stub = Self::default();
+        *stub.request_responses.lock().unwrap() = responses.into();
+        stub
+    }
+
     /// Answer the first `count` requests with [`Error::ConnectionReset`] before
     /// serving the configured responses.
     ///
@@ -177,6 +234,19 @@ impl MessageBusStub {
         self
     }
 
+    /// Deliver `item` to every subscription kept open by
+    /// [`Self::keeping_channels_open`], as a frame arriving after the scripted ones.
+    pub(crate) fn send_to_open_subscriptions(&self, item: RoutedItem) {
+        #[cfg(feature = "sync")]
+        for sender in self.open_sync_senders.lock().unwrap().iter() {
+            let _ = sender.send(item.clone());
+        }
+        #[cfg(feature = "async")]
+        for sender in self.open_async_senders.lock().unwrap().iter() {
+            let _ = sender.send(item.clone());
+        }
+    }
+
     /// Make each `wait_connected` take `delay`, as a reconnect does; with
     /// [`Self::with_connection_resets`], a retry resumes only after it.
     pub fn with_reconnect_delay(mut self, delay: Duration) -> Self {
@@ -193,9 +263,8 @@ impl MessageBusStub {
 
     /// Make each `send_message` fail with [`Error::ConnectionReset`] after
     /// recording it, as a write to a lost connection does.
-    pub fn with_failing_sends(mut self) -> Self {
-        self.send_mode = SendMode::FailAfter(0);
-        self
+    pub fn with_failing_sends(self) -> Self {
+        self.with_sends_failing_after(0)
     }
 
     /// Make each `send_message` fail with [`Error::Reconnecting`] without recording the
@@ -207,19 +276,29 @@ impl MessageBusStub {
         self
     }
 
-    /// Let the first `n` messages send, then make each later `send_message` fail with
-    /// [`Error::ConnectionReset`] after recording it, as a connection lost partway through a
-    /// multi-order submit does.
-    pub fn with_sends_failing_after(mut self, n: usize) -> Self {
-        self.send_mode = SendMode::FailAfter(n);
+    /// Let the first `count` `send_message` calls succeed, then fail each later one as
+    /// [`Self::with_failing_sends`] does: a connection lost part-way through a series of sends.
+    pub fn with_sends_failing_after(mut self, count: usize) -> Self {
+        self.send_mode = SendMode::FailAfter(count);
         self
     }
 
-    /// Make each async `send_message` record its message, then never
-    /// complete, as a write stuck on a peer that stopped reading does.
+    fn record_message_send(&self, message: Vec<u8>) -> Result<usize, Error> {
+        if let SendMode::Refuse = self.send_mode {
+            return Err(Error::Reconnecting);
+        }
+        self.request_messages.write().unwrap().push(message);
+        let earlier = self.sends.fetch_add(1, Ordering::SeqCst);
+        if matches!(self.send_mode, SendMode::FailAfter(count) if earlier >= count) {
+            return Err(Error::ConnectionReset);
+        }
+        Ok(earlier)
+    }
+
+    /// Let the first `count` async sends succeed. Later sends record the message and stay pending.
     #[cfg(feature = "async")]
-    pub fn with_stalled_sends(mut self) -> Self {
-        self.send_mode = SendMode::Stall;
+    pub fn with_sends_stalling_after(mut self, count: usize) -> Self {
+        self.send_mode = SendMode::StallAfter(count);
         self
     }
 
@@ -257,11 +336,16 @@ impl MessageBusStub {
     /// [`Self::with_connection_resets`], in which case the leading requests get
     /// a reset instead — the transport delivers one to every in-flight
     /// subscription when the socket drops, and delivers no responses at all.
+    /// After the resets, a stub built with [`Self::with_responses_per_request`]
+    /// gives the leading requests their own responses.
     fn routed_items_for_request(&self) -> Vec<RoutedItem> {
         let remaining = self.connection_resets.load(Ordering::SeqCst);
         if remaining > 0 {
             self.connection_resets.store(remaining - 1, Ordering::SeqCst);
             return vec![RoutedItem::Error(Error::ConnectionReset)];
+        }
+        if let Some(responses) = self.request_responses.lock().unwrap().pop_front() {
+            return responses.into_iter().map(classify_like_dispatcher).collect();
         }
         self.routed_items()
     }
@@ -316,7 +400,12 @@ impl MessageBus for MessageBusStub {
         request_id: RequestId,
         message: &[u8],
         bound: Option<crate::transport::BufferBound>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<InternalSubscription, Error> {
+        if deadline.is_some_and(|deadline| deadline <= std::time::Instant::now()) {
+            return Err(Error::Timeout);
+        }
+        self.check_request_send(message)?;
         self.record_buffer_limit(bound);
         Ok(mock_request(self, MockRoute::Request(request_id), message))
     }
@@ -326,14 +415,7 @@ impl MessageBus for MessageBusStub {
     }
 
     fn send_message(&self, message: &[u8]) -> Result<(), Error> {
-        if let SendMode::Refuse = self.send_mode {
-            return Err(Error::Reconnecting);
-        }
-        self.request_messages.write().unwrap().push(message.to_vec());
-        match self.send_mode {
-            SendMode::FailAfter(n) if self.request_messages.read().unwrap().len() > n => Err(Error::ConnectionReset),
-            _ => Ok(()),
-        }
+        self.record_message_send(message.to_vec()).map(drop)
     }
 
     fn send_market_data_type(&self, message: &[u8]) -> Result<(), Error> {
@@ -386,7 +468,7 @@ impl MessageBus for MessageBusStub {
         Ok(mock_request(self, MockRoute::Shared(message_type), message))
     }
 
-    fn send_account_updates_request(&self, _account: &AccountId, message: &[u8]) -> Result<InternalSubscription, Error> {
+    fn send_account_updates_request(&self, _account: &AccountId, message: &[u8], _unsubscribe: &[u8]) -> Result<InternalSubscription, Error> {
         MessageBus::send_shared_request(self, OutgoingMessages::RequestAccountData, message)
     }
 
@@ -424,6 +506,10 @@ impl MessageBus for MessageBusStub {
 
     fn session_generation(&self) -> u64 {
         self.session_generation.load(Ordering::Relaxed)
+    }
+
+    fn farm_watch(&self) -> &crate::transport::farm_watch::sync_impl::FarmWatch {
+        &self.sync_farms
     }
 
     // fn process_messages(&mut self, _server_version: i32) -> Result<(), Error> {
@@ -466,15 +552,27 @@ fn mock_request(stub: &MessageBusStub, route: MockRoute, message: &[u8]) -> Inte
 
 #[cfg(feature = "async")]
 #[async_trait]
+#[allow(private_interfaces)]
 impl AsyncMessageBus for MessageBusStub {
     async fn send_request_capped(
         &self,
         _request_id: RequestId,
         message: Vec<u8>,
         bound: Option<crate::transport::BufferBound>,
+        admission: Option<crate::transport::r#async::WriteAdmission>,
     ) -> Result<AsyncInternalSubscription, Error> {
+        if let Some(admission) = admission {
+            admission.ensure_open()?;
+        }
+        self.check_request_send(&message)?;
         self.record_buffer_limit(bound);
-        Ok(self.seeded_subscription(message))
+        let subscription = self.seeded_subscription(message);
+        let stall = self.request_send_stall.lock().unwrap().take();
+        if let Some(stall) = stall {
+            let _ = stall.accepted.send(());
+            let _ = stall.flushed.await;
+        }
+        Ok(subscription)
     }
 
     async fn send_executions_request(&self, request_id: RequestId, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
@@ -490,20 +588,22 @@ impl AsyncMessageBus for MessageBusStub {
         Ok(self.seeded_subscription(message))
     }
 
-    async fn send_account_updates_request(&self, _account: &AccountId, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
+    async fn send_account_updates_request(
+        &self,
+        _account: &AccountId,
+        message: Vec<u8>,
+        _unsubscribe: Vec<u8>,
+        admission: &crate::transport::r#async::WriteAdmission,
+    ) -> Result<AsyncInternalSubscription, Error> {
+        admission.ensure_open()?;
         AsyncMessageBus::send_shared_request(self, OutgoingMessages::RequestAccountData, message).await
     }
 
     async fn send_message(&self, message: Vec<u8>) -> Result<(), Error> {
-        if let SendMode::Refuse = self.send_mode {
-            return Err(Error::Reconnecting);
-        }
-        self.request_messages.write().unwrap().push(message);
+        let earlier = self.record_message_send(message)?;
         match self.send_mode {
-            SendMode::Succeed | SendMode::Refuse => Ok(()),
-            SendMode::FailAfter(n) if self.request_messages.read().unwrap().len() > n => Err(Error::ConnectionReset),
-            SendMode::FailAfter(_) => Ok(()),
-            SendMode::Stall => std::future::pending().await,
+            SendMode::StallAfter(count) if earlier >= count => std::future::pending().await,
+            _ => Ok(()),
         }
     }
 
@@ -596,6 +696,10 @@ impl AsyncMessageBus for MessageBusStub {
 
     fn runtime_handle(&self) -> &tokio::runtime::Handle {
         self.runtime.as_ref().expect("MessageBusStub built outside a Tokio runtime")
+    }
+
+    fn farm_watch(&self) -> &crate::transport::farm_watch::async_impl::FarmWatch {
+        &self.async_farms
     }
 }
 

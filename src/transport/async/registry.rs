@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use log::{debug, trace};
@@ -18,9 +18,11 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::accounts::types::AccountId;
 use crate::messages::{shared_channel_configuration, IncomingMessages, OutgoingMessages, ResponseMessage};
-use crate::transport::common::{read_lock, write_lock, LeaseRef};
-use crate::transport::{Admit, BoundState, BufferBound, RoutedItem, SharedCounts, SharedTicket};
+use crate::transport::common::{lock, read_lock, record_commission, write_lock, LeaseRef};
+use crate::transport::{Admit, BoundState, BufferBound, ReplySkip, RoutedItem, SharedCounts, SharedTicket, UnansweredReplies};
 use crate::Error;
+
+use super::io::WriteAdmission;
 
 pub(super) type BroadcastSender = broadcast::Sender<RoutedItem>;
 
@@ -31,6 +33,13 @@ pub(super) struct Route {
     pub(super) sender: BroadcastSender,
     pub(super) lease: LeaseRef,
     bound: Option<RouteBound>,
+    commission: Option<Vec<u8>>,
+    /// Another route was registered under this route's key after it and its
+    /// request was written, so an error frame on the key may answer that later
+    /// request: it reaches this route as
+    /// [`RoutedItem::for_earlier_subscription`], also once the later route is
+    /// gone.
+    superseded: bool,
 }
 
 #[derive(Debug)]
@@ -52,7 +61,13 @@ impl RouteBound {
 
 impl Route {
     pub(super) fn unbounded(sender: BroadcastSender, lease: LeaseRef) -> Self {
-        Self { sender, lease, bound: None }
+        Self {
+            sender,
+            lease,
+            bound: None,
+            commission: None,
+            superseded: false,
+        }
     }
 
     /// A bounded route's channel has one slot more than `bound.limit`, for the
@@ -69,6 +84,8 @@ impl Route {
             sender,
             lease,
             bound: Some(bound),
+            commission: None,
+            superseded: false,
         }
     }
 
@@ -108,10 +125,12 @@ impl Route {
     }
 }
 
-/// Routes keyed by request id, order id, or execution id.
+/// Routes keyed by request id, order id, or execution id. A key can hold
+/// several routes: every subscription opened on one order id (`place_order`,
+/// a modify, `cancel_order`) receives that order's frames.
 #[derive(Debug)]
 pub(super) struct SenderHash<K> {
-    routes: RwLock<HashMap<K, Route>>,
+    routes: RwLock<HashMap<K, Vec<Route>>>,
 }
 
 impl<K: Hash + Eq + Display + Debug> SenderHash<K> {
@@ -121,33 +140,82 @@ impl<K: Hash + Eq + Display + Debug> SenderHash<K> {
         }
     }
 
-    fn read(&self) -> RwLockReadGuard<'_, HashMap<K, Route>> {
+    fn read(&self) -> RwLockReadGuard<'_, HashMap<K, Vec<Route>>> {
         read_lock(&self.routes)
     }
 
-    fn write(&self) -> RwLockWriteGuard<'_, HashMap<K, Route>> {
+    fn write(&self) -> RwLockWriteGuard<'_, HashMap<K, Vec<Route>>> {
         write_lock(&self.routes)
     }
 
-    /// Registers `route` under `id`, replacing any earlier registration.
+    /// Registers `route` under `id` beside the routes already there. A route
+    /// with the same lease is replaced, so one subscription never holds two
+    /// routes under a key and never receives a frame twice.
     pub(super) fn insert(&self, id: K, route: Route) {
-        self.write().insert(id, route);
+        let mut routes = self.write();
+        let registered = routes.entry(id).or_default();
+        registered.retain(|other| !other.lease.is(&route.lease));
+        registered.push(route);
     }
 
-    /// Run `f` on `id`'s route while holding the read lock, so no removal can
-    /// land between the lookup and `f`.
+    fn insert_alias(&self, id: K, source: &Route) {
+        let mut routes = self.write();
+        let registered = routes.entry(id).or_default();
+        if !registered.iter().any(|route| route.lease.is(&source.lease)) {
+            registered.push(source.alias());
+        }
+    }
+
+    /// Mark the routes registered under `id` before the one holding `lease`
+    /// as superseded, once that route's request is written. Until then they
+    /// already receive [`RoutedItem::for_earlier_subscription`] as earlier
+    /// routes; the mark keeps it so after the newer route is gone. A request
+    /// whose write fails marks nothing.
+    pub(super) fn supersede_earlier(&self, id: &K, lease: &LeaseRef) {
+        let mut routes = self.write();
+        let Some(registered) = routes.get_mut(id) else {
+            return;
+        };
+        let Some(position) = registered.iter().position(|route| route.lease.is(lease)) else {
+            return;
+        };
+        for route in &mut registered[..position] {
+            route.superseded = true;
+        }
+    }
+
+    /// Run `f` on the newest of `id`'s routes while holding the read lock, so
+    /// no removal can land between the lookup and `f`.
     #[cfg(test)]
     pub(super) fn with_route<R>(&self, id: &K, f: impl FnOnce(&Route) -> R) -> Option<R> {
-        self.read().get(id).map(f)
+        self.read().get(id).and_then(|routes| routes.last()).map(f)
     }
 
-    /// Deliver `item` to `id`'s route; hands it back when nothing is
+    pub(super) fn leases(&self, id: &K) -> Vec<LeaseRef> {
+        self.read().get(id).into_iter().flatten().map(|route| route.lease.clone()).collect()
+    }
+
+    pub(super) fn deliver_selected(&self, id: &K, item: &RoutedItem, selected: impl Fn(&LeaseRef) -> bool) -> (bool, bool) {
+        let (mut delivered, mut skipped) = (false, false);
+        let routes = self.read();
+        for route in routes.get(id).into_iter().flatten().filter(|route| route.lease.is_live()) {
+            if selected(&route.lease) {
+                route.deliver(id, item.clone());
+                delivered = true;
+            } else {
+                skipped = true;
+            }
+        }
+        (delivered, skipped)
+    }
+
+    /// Deliver `item` to each of `id`'s routes; hands it back when nothing is
     /// registered under `id`.
     pub(super) fn deliver(&self, id: &K, item: RoutedItem) -> Result<(), RoutedItem> {
         self.deliver_then(id, item, |_| {})
     }
 
-    /// Deliver `item` to `id`'s route, then alias that route under `alias`
+    /// Deliver `item` to each of `id`'s routes, then alias each under `alias`
     /// in `aliases` while still holding `id`'s read lock, so a concurrent
     /// clear can't land between the delivery and the alias. Lock order:
     /// `self` (read), then `aliases` (write); nothing takes them the other
@@ -161,20 +229,50 @@ impl<K: Hash + Eq + Display + Debug> SenderHash<K> {
     ) -> Result<(), RoutedItem> {
         self.deliver_then(id, item, |route| {
             if let Some(alias) = alias {
-                aliases.insert(alias.clone(), route.alias());
+                aliases.insert_alias(alias.clone(), route);
             }
         })
     }
 
-    /// Deliver `item` to `id`'s route and run `then` on it, both under the
-    /// read lock.
-    fn deliver_then(&self, id: &K, item: RoutedItem, then: impl FnOnce(&Route)) -> Result<(), RoutedItem> {
+    pub(super) fn deliver_commission(&self, id: &K, payload: &[u8], message: &ResponseMessage) -> bool {
+        let mut routes = self.write();
+        let Some(routes) = routes.get_mut(id) else {
+            return false;
+        };
+        let mut eligible = false;
+        for route in routes.iter_mut().filter(|route| route.lease.is_live()) {
+            eligible = true;
+            if record_commission(&mut route.commission, payload) {
+                route.deliver(id, message.clone().into());
+            }
+        }
+        eligible
+    }
+
+    pub(super) fn end_commission_aliases<A: Hash + Eq + Display + Debug>(&self, id: &K, aliases: &SenderHash<A>) {
+        if let Some(routes) = self.read().get(id) {
+            for route in routes {
+                aliases.remove_all_same(&route.lease);
+            }
+        }
+    }
+
+    /// Deliver `item` to each of `id`'s routes and run `then` on each, all
+    /// under the read lock. Superseded routes, every one but the newest and
+    /// the newest too once a later route was removed, receive
+    /// [`RoutedItem::for_earlier_subscription`].
+    fn deliver_then(&self, id: &K, item: RoutedItem, then: impl Fn(&Route)) -> Result<(), RoutedItem> {
         let routes = self.read();
-        let Some(route) = routes.get(id) else {
+        let Some((newest, earlier)) = routes.get(id).and_then(|registered| registered.split_last()) else {
             return Err(item);
         };
-        route.deliver(id, item);
-        then(route);
+        for route in earlier {
+            route.deliver(id, item.for_earlier_subscription());
+            then(route);
+        }
+        let item = if newest.superseded { item.for_earlier_subscription() } else { item };
+        newest.deliver(id, item);
+        then(newest);
         Ok(())
     }
 
@@ -184,25 +282,36 @@ impl<K: Hash + Eq + Display + Debug> SenderHash<K> {
         self.read().contains_key(id)
     }
 
-    /// Remove `id`'s registration if it matches `pred`; returns whether it
-    /// was removed.
-    fn remove_if(&self, id: K, pred: impl FnOnce(&Route) -> bool) -> bool {
-        match self.write().entry(id) {
-            Entry::Occupied(route) if pred(route.get()) => {
-                route.remove();
-                true
-            }
-            _ => false,
+    /// Remove `id`'s routes that match `pred`, and `id` once none is left;
+    /// returns whether any was removed.
+    fn remove_if(&self, id: K, pred: impl Fn(&Route) -> bool) -> bool {
+        let mut routes = self.write();
+        let Entry::Occupied(mut registered) = routes.entry(id) else {
+            return false;
+        };
+        let before = registered.get().len();
+        registered.get_mut().retain(|route| !pred(route));
+        let removed = registered.get().len() < before;
+        if registered.get().is_empty() {
+            registered.remove();
         }
+        removed
     }
 
-    /// Remove `id`'s registration only if it holds `lease`, so a newer
-    /// registration under the same id survives.
+    /// Remove `id`'s route that holds `lease`, so another registration under
+    /// the same id survives.
     pub(super) fn remove_if_same(&self, id: K, lease: &LeaseRef) {
         self.remove_if(id, |route| route.lease.is(lease));
     }
 
-    /// Remove `id`'s registration only if it holds `lease` and that lease is
+    pub(super) fn remove_all_same(&self, lease: &LeaseRef) {
+        self.write().retain(|_, routes| {
+            routes.retain(|route| !route.lease.is(lease));
+            !routes.is_empty()
+        });
+    }
+
+    /// Remove `id`'s route that holds `lease`, only if that lease is
     /// dead — every subscription and clone holding it is gone. A stale drop
     /// signal that finds a replacement under the same key, or a clone's drop
     /// while others live, is a no-op; the last holder's signal performs the
@@ -222,9 +331,14 @@ impl<K: Hash + Eq + Display + Debug> SenderHash<K> {
             return;
         }
         let mut routes = self.write();
-        let before = routes.len();
-        routes.retain(|_, route| route.lease.is_live());
-        debug!("pruned {} dead routes", before - routes.len());
+        let mut pruned = 0;
+        routes.retain(|_, registered| {
+            let before = registered.len();
+            registered.retain(|route| route.lease.is_live());
+            pruned += before - registered.len();
+            !registered.is_empty()
+        });
+        debug!("pruned {pruned} dead routes");
     }
 
     /// Send `item()` to every route, then clear them all, under one write lock
@@ -232,7 +346,7 @@ impl<K: Hash + Eq + Display + Debug> SenderHash<K> {
     /// bounded route is skipped: its stream already ended.
     pub(super) fn fail_all(&self, item: impl Fn() -> RoutedItem) {
         let mut routes = self.write();
-        for route in routes.values().filter(|route| !route.closed()) {
+        for route in routes.values().flatten().filter(|route| !route.closed()) {
             let _ = route.sender.send(item());
         }
         routes.clear();
@@ -260,10 +374,9 @@ impl<K: Hash + Eq + Display + Debug> SenderHash<K> {
     }
 }
 
-/// One persistent broadcast channel per shared request type, from
-/// `CHANNEL_MAPPINGS`. Each is allocated on its first subscription (tokio
-/// preallocates every slot) and kept from then on; every live subscription
-/// of a type reads the same channel from its own receiver.
+/// One broadcast channel per shared request type and session. Senders are
+/// allocated on the first subscription and retired on reset so that old
+/// receivers, including their clones, cannot get the next session's frames.
 #[derive(Debug)]
 pub(super) struct SharedChannels {
     /// One entry per request type; emptied at shutdown, which closes them.
@@ -273,6 +386,91 @@ pub(super) struct SharedChannels {
     /// Live subscriptions per request type; see [`SharedCounts`].
     /// A tokio lock: it spans the request write.
     counts: Mutex<SharedCounts>,
+    account_counts: Mutex<SharedCounts>,
+    /// Held across end dispatch and receiver creation so the reply cursor
+    /// and the receiver agree on which end markers the receiver can see.
+    replies: Arc<std::sync::Mutex<SharedReplies>>,
+}
+
+#[derive(Debug, Default)]
+struct SharedReplies {
+    unanswered: UnansweredReplies,
+    dispatched: HashMap<IncomingMessages, usize>,
+    generation: u64,
+    resetting: bool,
+}
+
+#[derive(Default)]
+pub(super) struct SharedReplySkip {
+    skip: ReplySkip,
+    cursor: Option<ReplyCursor>,
+    pub(super) finished: bool,
+}
+
+#[derive(Clone)]
+struct ReplyCursor {
+    replies: Arc<std::sync::Mutex<SharedReplies>>,
+    skip_through: usize,
+    generation: u64,
+}
+
+impl SharedReplySkip {
+    pub(super) fn resubscribe(&self, receiver: &broadcast::Receiver<RoutedItem>) -> (broadcast::Receiver<RoutedItem>, Self) {
+        let Some(cursor) = &self.cursor else {
+            return (receiver.resubscribe(), Self::default());
+        };
+        // The new receiver starts after every end already dispatched, even
+        // when the source receiver has not consumed those frames.
+        let replies = lock(&cursor.replies);
+        let receiver = receiver.resubscribe();
+        let mut skip = ReplySkip::default();
+        if replies.generation == cursor.generation {
+            if let Some(end) = self.skip.end {
+                let dispatched = replies.dispatched.get(&end).copied().unwrap_or(0);
+                skip = ReplySkip {
+                    end: Some(end),
+                    remaining: cursor.skip_through.saturating_sub(dispatched),
+                };
+            }
+        }
+        (
+            receiver,
+            Self {
+                skip,
+                cursor: self.cursor.clone(),
+                finished: false,
+            },
+        )
+    }
+
+    pub(super) fn session_reset(&self) -> bool {
+        self.cursor
+            .as_ref()
+            .is_some_and(|cursor| lock(&cursor.replies).generation != cursor.generation)
+    }
+
+    pub(super) fn waiting_for_end(&self) -> bool {
+        self.skip.remaining > 0
+    }
+
+    pub(super) fn skips(&mut self, message_type: IncomingMessages) -> bool {
+        self.skip.skips(message_type)
+    }
+}
+
+/// Withdraws a counted request from [`UnansweredReplies`] when dropped.
+struct Withdraw<'a> {
+    replies: &'a std::sync::Mutex<SharedReplies>,
+    message_type: OutgoingMessages,
+    started: &'a AtomicBool,
+}
+
+impl Drop for Withdraw<'_> {
+    fn drop(&mut self) {
+        if !self.started.load(Ordering::Relaxed) {
+            lock(self.replies).unanswered.withdraw(self.message_type);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -307,58 +505,139 @@ impl SharedChannels {
         Self {
             channels: RwLock::new(channels),
             counts: Mutex::new(SharedCounts::default()),
+            account_counts: Mutex::new(SharedCounts::default()),
+            replies: Arc::new(std::sync::Mutex::new(SharedReplies::default())),
         }
     }
 
     /// Runs `write` for a new subscription of `message_type` and counts it on
-    /// success; returns the receiver and the ticket. The count lock spans the
-    /// write so the count and the wire agree. `account` is the account-updates
-    /// account, checked before the write.
+    /// success; returns the receiver, the ticket, and the earlier replies the
+    /// receiver passes over. The count lock spans the write so the count and
+    /// the wire agree; the receiver is created under it, before the write, so
+    /// unanswered requests are counted in wire order. `account` is the
+    /// account-updates account, checked before the write; `write` is told
+    /// whether that account's updates are live already.
     pub(super) async fn subscribe<F: Future<Output = Result<(), Error>>>(
         &self,
         message_type: OutgoingMessages,
         account: Option<&AccountId>,
-        write: impl FnOnce() -> F,
-    ) -> Result<(broadcast::Receiver<RoutedItem>, SharedTicket), Error> {
-        let receiver = self
-            .channels()
-            .get(&message_type)
-            .map(SharedChannel::subscribe)
-            .ok_or_else(|| Error::InvalidArgument(format!("No shared channel configured for message type: {message_type:?}")))?;
-
-        let mut counts = self.counts.lock().await;
+        admission: Option<&WriteAdmission>,
+        started: &AtomicBool,
+        write: impl FnOnce(bool) -> F,
+    ) -> Result<(broadcast::Receiver<RoutedItem>, SharedTicket, SharedReplySkip), Error> {
+        let counts = self.counts_for(message_type);
+        let mut counts = if let Some(admission) = admission {
+            tokio::select! {
+                biased;
+                error = admission.stopped() => return Err(error),
+                counts = counts.lock() => counts,
+            }
+        } else {
+            counts.lock().await
+        };
         counts.check_account_updates(account)?;
-        write().await?;
-        Ok((receiver, counts.subscribe(message_type, account)))
+        let live = account.is_some_and(|account| counts.is_account_updates_live(account));
+        let (receiver, skip) = {
+            let mut replies = lock(&self.replies);
+            if replies.resetting {
+                return Err(Error::ConnectionReset);
+            }
+            replies.unanswered.check_account_updates(message_type, live)?;
+            let receiver = self
+                .channels()
+                .get(&message_type)
+                .map(SharedChannel::subscribe)
+                .ok_or_else(|| Error::InvalidArgument(format!("No shared channel configured for message type: {message_type:?}")))?;
+            let skip = replies.unanswered.add(message_type);
+            let skip_through = skip
+                .end
+                .filter(|_| skip.remaining > 0)
+                .map_or(0, |end| *replies.dispatched.entry(end).or_default() + skip.remaining);
+            let cursor = ReplyCursor {
+                replies: Arc::clone(&self.replies),
+                skip_through,
+                generation: replies.generation,
+            };
+            (
+                receiver,
+                SharedReplySkip {
+                    skip,
+                    cursor: Some(cursor),
+                    finished: false,
+                },
+            )
+        };
+        // Keep an ambiguous request counted until its End or session reset:
+        // a custom writer can expose bytes to TWS before its flush completes.
+        let pending = Withdraw {
+            replies: &self.replies,
+            message_type,
+            started,
+        };
+        write(live).await?;
+        let replies = lock(&self.replies);
+        if replies.resetting {
+            return Err(Error::ConnectionReset);
+        }
+        std::mem::forget(pending);
+        Ok((receiver, counts.subscribe(message_type, account), skip))
     }
 
     /// Uncounts `ticket`'s subscription; runs `write` (the cancel) only when
     /// `SharedCounts::unsubscribe` says so.
+    /// `cancels` says whether `write` sends a cancel. Account dumps can still
+    /// arrive after the last cancel, so their replies stay counted.
     pub(super) async fn unsubscribe<F: Future<Output = Result<(), Error>>>(
         &self,
         ticket: SharedTicket,
+        cancels: bool,
         write: impl FnOnce() -> F,
     ) -> Result<(), Error> {
-        let mut counts = self.counts.lock().await;
-        if counts.unsubscribe(ticket) {
-            write().await
-        } else {
-            Ok(())
+        let mut counts = self.counts_for(ticket.message_type).lock().await;
+        if lock(&self.replies).resetting || !counts.unsubscribe(ticket) {
+            return Ok(());
         }
+        write().await?;
+        if cancels {
+            lock(&self.replies).unanswered.cancelled(ticket.message_type);
+        }
+        Ok(())
     }
 
     fn channels(&self) -> RwLockReadGuard<'_, HashMap<OutgoingMessages, SharedChannel>> {
         read_lock(&self.channels)
     }
 
+    pub(super) fn counts_for(&self, request: OutgoingMessages) -> &Mutex<SharedCounts> {
+        if request == OutgoingMessages::RequestAccountData {
+            &self.account_counts
+        } else {
+            &self.counts
+        }
+    }
+
     fn channels_mut(&self) -> RwLockWriteGuard<'_, HashMap<OutgoingMessages, SharedChannel>> {
         write_lock(&self.channels)
     }
 
-    /// Every live shared subscription has just been failed: start a new
-    /// generation so their later drops cannot touch the next session's counts.
+    pub(super) fn retire_session(&self) {
+        let mut replies = lock(&self.replies);
+        replies.resetting = true;
+        replies.generation += 1;
+        for channel in self.channels_mut().values_mut() {
+            drop(channel.sender.take());
+        }
+    }
+
     pub(super) async fn reset_counts(&self) {
-        self.counts.lock().await.reset();
+        let mut counts = self.counts.lock().await;
+        let mut account_counts = self.account_counts.lock().await;
+        let mut replies = lock(&self.replies);
+        counts.reset();
+        account_counts.reset();
+        replies.unanswered.clear();
+        replies.dispatched.clear();
+        replies.resetting = false;
     }
 
     /// Sends `item()` once to every channel selected by `filter`; returns how
@@ -379,10 +658,17 @@ impl SharedChannels {
     /// Deliver `message` to every channel whose request maps `message_type`.
     /// Returns `false` when no channel maps it (or after shutdown).
     pub(super) fn send_message(&self, message_type: IncomingMessages, message: &ResponseMessage) -> bool {
-        self.send_to(|channel| channel.responses.contains(&message_type), || message.clone().into()) > 0
+        let mut replies = lock(&self.replies);
+        let selected = self.send_to(|channel| channel.responses.contains(&message_type), || message.clone().into());
+        replies.unanswered.answered(message_type);
+        if let Some(dispatched) = replies.dispatched.get_mut(&message_type) {
+            *dispatched += 1;
+        }
+        selected > 0
     }
 
     /// Deliver `item()` once to every channel.
+    #[cfg(test)]
     pub(super) fn notify_all(&self, item: impl Fn() -> RoutedItem) {
         self.send_to(|_| true, item);
     }
@@ -412,12 +698,17 @@ impl SharedChannels {
 
     #[cfg(test)]
     pub(super) async fn live(&self, message_type: OutgoingMessages) -> usize {
-        self.counts.lock().await.live(message_type)
+        self.counts_for(message_type).lock().await.live(message_type)
+    }
+
+    #[cfg(test)]
+    pub(super) fn unanswered(&self, end: IncomingMessages) -> usize {
+        lock(&self.replies).unanswered.pending(end)
     }
 
     #[cfg(test)]
     pub(super) async fn account_updates(&self) -> Option<AccountId> {
-        self.counts.lock().await.account_updates().cloned()
+        self.account_counts.lock().await.account_updates().cloned()
     }
 }
 

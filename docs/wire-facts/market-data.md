@@ -33,6 +33,72 @@ Generic ticks, option computations, tick types and historical bars. Format: [REA
   the overnight session alike (2026-10-29 23:55 ET: AAPL/SPY/IBKR, real bid/ask). No -1 seen.
 - **Not probed:** a weekend (true no-quote) snapshot.
 
+### Option computation ticks during US hours
+
+*Live 2026-11-24 15:57-16:04 UTC, US market open, paper TWS, server 223; streaming `reqMktData`
+for 30 s on AAPL Dec 2026 350 call and put, Nov 27 350 call and Dec 500 call, and ES Dec 2026
+7500 call and put; raw capture decoded.*
+
+- Delayed data (type 3): `DelayedBidOption` (80), `DelayedAskOption` (81), `DelayedLastOption`
+  (82) and `DelayedModelOption` (83), 172 frames in all. Bid, ask and last arrived 6 to 12 times
+  per contract in 30 s, the model 1 to 4 times. No real-time computation tick (10 to 13) came.
+- Real-time data (type 1) on the AAPL options and the ES option: 354, and no computation tick.
+- A field TWS has not computed is sent as a value, never left out: `-1` for implied volatility
+  and the option price, `-2` for delta, gamma, vega and theta. Every frame carried all eleven
+  fields. 20 of the 158 bid, ask and last frames carried `-1` and `-2` for implied volatility
+  and every greek, 11 of them also `-1` for the price (a side with no quote); the other 138
+  carried them all. The first model frame of the AAPL 350 call sent present value of dividends
+  `-1`, its later ones `0`; bid, ask and last sent `0` there every time.
+- A real value can equal a sentinel of the other group: `DelayedLastOption` on the ES 7500 put
+  sent theta `-1.0`, then `-1.25`, `-0.5` and `-0.0` as its last price aged (the other
+  computations of that put had theta about `-1.9`). Theta `-1` is a value; only `-2` means not
+  computed for a greek.
+- `tick_attribute` was `0` (return based) on every frame. `underlying_price` was always set.
+- **Not probed:** real-time computations (no option data permission); snapshots during US
+  hours; index options.
+
+### No-quote sides
+
+*Live 2026-11-23 Mon 18:47-19:00 ET (US equities and options closed, FX and CME Globex open,
+CBOT grains closed), paper TWS, server 223. Real-time data only for EUR.USD and XAUUSD; US
+stocks drew 10089 for every market data type, CME and CBOT 354 / 10167 (delayed only).*
+
+`reqMktData`, streaming and snapshot. A side with no quote arrives as a `TickPrice` with a size
+of `"0"`:
+
+| Contract                               | Data type               | Empty side (price, size) |
+| -------------------------------------- | ----------------------- | ------------------------ |
+| AAPL options, far strikes              | delayed                 | `-1`, `0`                |
+| SPX                                    | delayed                 | `-1`, `0` (bid and ask)  |
+| CBOT corn options (OZC, magnifier 100) | delayed                 | `-100`, `0`              |
+| AAPL put vertical (BAG)                | delayed, delayed-frozen | `0`, `0`                 |
+
+- The last price uses the same placeholder: `-1` / `-100` with size `0` where nothing traded.
+  EUR.USD sends a real last price with size `0`, so a zero size alone does not mean "no last".
+- Delayed-frozen on the AAPL 110 put: first `-1` / `0` for bid and ask, then
+  `MarketDataType::DelayedFrozen` and a real ask (`0.01` x `5`) with no new bid tick, so the bid
+  stays empty. The 425 put got a real frozen bid and ask.
+- Negative prices with sizes are real: an ES Dec/Mar calendar (BAG, delayed) quoted `-71` x `1` /
+  `-68.75` x `2`, and the reverse spread `68.75` / `71`.
+- Every bid, ask and last price tick carried its size. No price tick arrived without one.
+- Historical bid/ask ticks: an AAPL 110 put (2026-11-23 20:55-21:00 UTC) sent all 1009 ticks with
+  bid `0` x `0` and a real ask. AAPL (2166) and a corn option (1001) had no zero or negative
+  value; no tick carried `-1`.
+- Tick-by-tick bid/ask on EUR.USD (11 frames): real prices and sizes. AAPL drew 10089, ES 10189;
+  EUR.USD `last` drew 10189 ("No historical market data ... Last").
+- Price tick attributes: none of 170 delayed price ticks (ES, ZC, OZC, SPX, US stocks and options,
+  BAGs) set any flag, `can_auto_execute` included. Real-time EUR.USD bid and ask set
+  `can_auto_execute` (10 of 12 ticks; XAUUSD did not); `pre_open` was never set.
+- Real-time EUR.USD (IDEALPRO) for 10 minutes (*live 2026-11-26 16:28-16:38 UTC, US
+  Thanksgiving holiday, paper TWS, server 223*): 427 bid and ask `TickPrice` ticks and 1157
+  `BidSize` / `AskSize` ticks, none with size `0` and none with a price of `0` or below.
+- Settles that every placeholder price came with size `0`, and every real quote, negative ones
+  included, with a positive size. A positive price with size `0` on a bid or ask was never seen.
+- **Not probed:** `pre_open` during a real-time pre-open or halt (no such data on this account;
+  delayed ticks carry no attributes); empty sides in tick-by-tick bid/ask or last (no real-time
+  data on an illiquid contract); real-time equity and option quotes in US hours (this account has
+  no real-time US equity or option data; US markets were closed on the 2026-11-26 run).
+
 ### TickEFP is never sent
 
 *Live 2026-05-27, paper Gateway, server 220+; removed in v3.0 (#651).*
@@ -86,8 +152,8 @@ Generic ticks, option computations, tick types and historical bars. Format: [REA
   values. EUR.USD TRADES draws 420 (no Last data for CASH).
 - `reqHistoricalData` MIDPOINT and BID, 1-hour bars, AAPL, EUR.USD and ES: `volume` and `WAP`
   **sent** as `"-1"`, `barCount` as `-1`. TRADES sends real values.
-- Settles that the two bar types differ: realtime leaves the fields out, historical sends a
-  `-1` sentinel. C# reads an absent realtime value as unset (`decimal.MaxValue`).
+- In these server 226 captures, realtime bars omit volume and WAP, while historical bars send
+  the `-1` sentinel. C# reads an absent realtime value as unset (`decimal.MaxValue`).
 
 *Live 2026-11-16, paper, server 226; raw capture; #1247.*
 
@@ -107,6 +173,28 @@ Generic ticks, option computations, tick types and historical bars. Format: [REA
 - **Not probed:** AAPL realtime bars (no data overnight); a keep-up-to-date TRADES update bar
   without `bar_count` (#1057), for which stocks and futures need up-to-the-second data (2188 on
   the probing account).
+
+*Live 2026-11-23 Mon 18:55-19:05 ET (FX, crypto and CME Globex open, US equities after
+hours), paper TWS, server 223; raw capture; #1285.*
+
+- `reqRealTimeBars` MIDPOINT, BID and ASK, EUR.USD, XAUUSD and BTC (PAXOS): `volume` (7) and
+  `WAP` (8) **sent** as `"-1"` and `count` as `-1` in every frame, where server 226 left volume
+  and WAP out. TRADES and AGGTRADES on BTC send real values.
+- `reqHistoricalData` MIDPOINT, BID, ASK and BID_ASK, 1-hour bars (AAPL, ES, EUR.USD, an AAPL
+  option, a CBOT corn option, the IBUS500 CFD, XAUUSD, BTC) and daily bars (AAPL, ES,
+  EUR.USD): `-1` for all three, as on server 226. An SPX TRADES bar sends `volume` and `WAP`
+  as `"0"` with a real `barCount`.
+- The corn option (OZC, price magnifier 100) sends the non-TRADES `WAP` as `"-100"`, `-1` times
+  the magnifier. `volume` and `barCount` stay `-1`.
+- Volatility and adjusted bars (2026-11-25 Wed 11:10 ET, US equities open, same server; decoded
+  values, 1-hour bars over 2 days, AAPL): ADJUSTED_LAST sent real volume, WAP and count, the
+  same as TRADES (9 bars). HISTORICAL_VOLATILITY (1 bar) and OPTION_IMPLIED_VOLATILITY (10 bars)
+  sent volume `1` and count `0` on every bar, with the WAP a volatility (`0.289`, `0.260`), as
+  on server 226.
+- Settles that a realtime bar can carry either form, and that the WAP sentinel scales with the
+  price magnifier, so only a volume test can tell it from a price.
+- **Not probed:** realtime bars on a magnified contract; TRADES `keepUpToDate` updates (BTC draws
+  10299 for TRADES and 321 "Source price not supported with live updates" for AGGTRADES).
 
 ### One-second bars reach back at most 2000 S
 
@@ -151,6 +239,223 @@ ending now, regular hours; wire dates read from a recording.*
   documents both rules (#1267).
 - **Not probed:** daily bars in this run; a holiday on a period's last weekday, so the last
   trading day is not separated from the last weekday; other instruments; the Gateway.
+
+### Trade-price `whatToShow` by security type
+
+*Live 2026-11-23 Mon 18:55-19:05 ET (FX, crypto and CME Globex open, US equities after hours),
+paper TWS, server 223. Contracts: AAPL, ES Dec 26, EUR.USD, SPX, an AAPL option, a CBOT corn
+option (OZC), the IBUS500 index CFD, XAUUSD, BTC on PAXOS.*
+
+Accepted trade-price `whatToShow`, or the error a rejected one drew:
+
+| Security type      | Historical bars                      | Realtime bars       | Historical ticks   |
+| ------------------ | ------------------------------------ | ------------------- | ------------------ |
+| STK, FUT, OPT, FOP | TRADES                               | not probed          | TRADES             |
+| IND (SPX)          | TRADES (volume `0`)                  | not probed          | TRADES             |
+| CASH (EUR.USD)     | none: TRADES 162                     | none: TRADES 420    | none: see below    |
+| CMDTY (XAUUSD)     | none: TRADES 162                     | none: TRADES 420    | none: no answer    |
+| CFD (IBUS500)      | none: TRADES 162                     | not probed          | none: no answer    |
+| CRYPTO (BTC)       | AGGTRADES; TRADES after notice 10299 | AGGTRADES or TRADES | none: TRADES 10299 |
+
+- AGGTRADES drew 10299 on historical bars for every type except crypto, and 420 on realtime bars
+  for EUR.USD and XAUUSD. After that 10299, AAPL and ES historical bars arrive anyway as the
+  TRADES series; EUR.USD draws 162 (2026-11-24, #1298). "Not probed" realtime cells drew 10089,
+  354 or 420 for missing real-time permission. SPX drew 10187 for BID_ASK and MIDPOINT historical ticks.
+- MIDPOINT, BID and ASK bars worked for every type except IND (162). ADJUSTED_LAST follows TRADES.
+  HISTORICAL_VOLATILITY and OPTION_IMPLIED_VOLATILITY drew 162 except OPTION_IMPLIED_VOLATILITY
+  on AAPL and SPX.
+- 10299 names the expected value: "Expected what to show is AGGTRADES, please use that instead
+  of TRADES" for BTC, and the reverse for the other types. 162 reads "No historical market data
+  for EUR/CASH@FXSUBPIP Last 3600" (XAUUSD: `CMDTYBBO`, IBUS500: `UKBBO`).
+- Realtime TRADES and AGGTRADES on BTC sent identical bars for five 5-second intervals in a row,
+  so the realtime 10299 for crypto TRADES that the `AggTrades` rustdoc stated is not what this
+  server does.
+- 10299 on crypto TRADES bars is a substitution notice, not a rejection: TWS then sends the bars
+  and `HistoricalDataEnd`, identical to an AGGTRADES request (BTC and ETH, 2026-11-24). It is a
+  rejection only for historical ticks, where nothing follows it. The first run here recorded a
+  client that ended the request on the notice and so dropped the bars.
+- With `keepUpToDate`, BTC and ETH TRADES draw 10299, then the bars, `HistoricalDataEnd` and live
+  updates; a later cancel draws 162. AGGTRADES draws 321 "Source price not supported with live
+  updates" and nothing else, so TRADES is the only way to stream crypto trade bars. AAPL, ES and
+  EUR.USD AGGTRADES with `keepUpToDate` draw 10299, then 321 (2026-11-24, #1298).
+- Historical ticks TRADES on EUR.USD: TWS answers with one `HistoricalTicks` frame (midpoint
+  ticks, size `"0"`, `done`), not `HistoricalTicksLast`. `historical_ticks(..).last()` does not
+  read it and waits until its deadline. XAUUSD and IBUS500 drew no ticks and no error in 30 s, and were not
+  captured raw.
+- A stock CFD (AAPL, rerouted on `reqMktData`) drew no answer to TRADES or MIDPOINT historical
+  bars within 40 s; realtime bars drew notice 2127 and no bars.
+- The account has crypto market data (BTC on PAXOS) though it has no crypto trading permission.
+- **Streaming requests during US hours** (*live 2026-11-24 16:41-16:43 UTC, paper TWS, server
+  223; BTC on PAXOS and MSFT*): BTC realtime bars stream for `TRADES`, `AGGTRADES` and
+  `MIDPOINT`; keep-up-to-date `TRADES` draws 10299, then the batch, `HistoricalDataEnd` and an
+  update every 5 seconds, and `AGGTRADES` draws 321 alone. Tick-by-tick `Last`, `AllLast` and
+  `BidAsk` stream BTC; tick-by-tick takes no `whatToShow`. MSFT, without real-time permission:
+  realtime `TRADES` bars draw 420 ("No market data permissions for ISLAND STK"), `AGGTRADES`,
+  `MIDPOINT` and every tick-by-tick type draw 10089, keep-up-to-date `TRADES` draws 162 ("HMDS
+  query returned no data"), and `AGGTRADES` draws 10299 and then 321.
+- **Not probed:** realtime bars for STK, FUT, OPT, FOP, IND and CFD with real-time permission;
+  BOND, WAR, FUND, IOPT, EC, BAG; crypto on ZEROHASH; live accounts.
+
+### Keep-up-to-date bar updates
+
+*Live 2026-11-24 Tue 09:15-09:35 UTC (FX, crypto and Xetra open; US equities overnight), paper,
+server 223.*
+
+- `reqHistoricalData` with `keepUpToDate`, EUR.USD MIDPOINT (5-second, 30-second, 1-minute and
+  5-minute bars), BTC PAXOS MIDPOINT and SAP IBIS TRADES (1-minute bars): `HistoricalDataUpdate`
+  arrives on a 5-second grid of the wall clock, 0.05 to 1 s after each boundary (one outlier at
+  4.3 s). Each carries the bar that holds the 5 seconds just ended, sent even when nothing
+  changed: 16 identical consecutive updates in 3 minutes of SAP, 10 in 5 minutes of EUR.USD.
+- A 1-minute bar gets 12 updates. The 12th arrives 0.3 to 2.6 s after the bar ends and carries
+  its final values; the next bar's first update arrives 5.3 to 6.1 s after that bar starts. A
+  5-second bar gets one update, 5.3 to 9.3 s after it starts, so every update is already final.
+- The initial batch sometimes ends with the forming bar (1-minute at 34 s into the bar, 5-minute
+  at 2 min in), and the first update repeats or revises it. Other times it ends with the last
+  complete bar (30-second at 6 s into the bar), and the first update is for the next bar. Once,
+  with 5-second bars, the bar between the batch and the first update was never sent: the batch
+  ended at 09:16:25, the first update was for 09:16:35.
+- No update carried an earlier bar than the one before it (700+ updates).
+- MIDPOINT updates send `volume`, `WAP` and `barCount` as `-1`, like the batch. TRADES updates
+  send real values, but a bar's first update can report `barCount` 0 with volume 305.
+- Refused or silent: crypto `AGGTRADES` and `BID_ASK` draw 321 "Source price not supported with
+  live updates"; crypto `TRADES` draws 10299 (use AGGTRADES). Without real-time permission (ES,
+  DAX and ESTX50 indices) and for AAPL and NVDA overnight, TWS sends the batch and then no update
+  and no error.
+- **Batch, then nothing** (*11:23 UTC, ES Dec 26 TRADES 1-minute, no real-time permission*): the
+  batch's 30 bars ended with the 21:59 UTC bar of the previous day, the last before CME's
+  daily break, followed by the batch end and no update in 150 s. `BarCompletion::apply` left
+  that bar forming; `BarCompletion::expire` with a 10 s grace completed it at once. EUR.USD
+  MIDPOINT on the same connection: updates completed each bar 0.3 to 0.5 s after its end, and
+  `expire` with a 10 s grace never fired.
+- Settles `historical::BarCompletion`: a bar is final when
+  an update for it arrives after its end, or when an update for a later bar arrives.
+- **Not probed:** RTH-only requests; daily and longer bars; BID, ASK and other MIDPOINT
+  contracts. Session ends: see
+  [keep-up-to-date bars at session boundaries](#keep-up-to-date-bars-at-session-boundaries).
+
+### Keep-up-to-date bars at session boundaries
+
+*Live 2026-11-24 16:24-16:49 UTC (Xetra close), 21:41-22:35 UTC (FX daily break, CME close),
+paper TWS, server 223; 1-minute bars.*
+
+- **Xetra close, SAP SMART TRADES** (primary IBIS, continuous trading ends 16:30 UTC, closing
+  auction after it): updates kept coming every 5 seconds through the end of the run at 16:49,
+  because SMART includes German venues that trade until 21:00 UTC. The 16:30 to 16:33 bars
+  carried volume 0 and `barCount` 0 at the last price, updated 12 times each. The closing
+  auction reached the 16:35 bar at 16:35:25 as volume 1,053,001 with `barCount` 0; later
+  updates of that bar moved its open from 189.42 to 190.1.
+- The full-day historical request for the same contract afterwards returned the same zero-volume
+  bars (168 of 930 bars between 06:30 and 21:59 had volume 0: 16:30 to 16:33, 16:37 and 16:42 around
+  the close), so they are TWS's bars, not artifacts of the stream. Several carried a new price with
+  volume 0 (16:37: 190.08 after 189.94).
+- The last update of each streamed bar matched that bar in the later historical reply on open,
+  high, low, close and volume, for all 26 bars from 16:23 to 16:48. WAP matched to the three
+  decimals the historical reply sends, except the auction bar: streamed 189.4236, historical
+  190.1.
+- **FX daily break, EUR.USD MIDPOINT**: a stream opened at 22:01:57 got a batch ending with the
+  21:59 bar, then no update and no notice until 22:15:06, when the first update carried the
+  22:15 bar. No bar for 22:00 to 22:14 was ever sent, neither in the batch nor later. The stream
+  survived the break; `BarCompletion` completed the 22:15 bar at 22:16:00.8 from its last
+  update.
+- **Farm disconnect ends the stream**: at 21:56:59 notice 2105 "HMDS data farm connection is
+  broken:cashhmds" was followed on the EUR.USD stream (and on a second client's EUR.USD stream)
+  by error 10182 "Failed to request live updates (disconnected)." No update followed it. Reuse
+  the `BarCompletion` across the new subscription.
+- **No real-time permission, CME close**: ES and MES TRADES streams, with and without
+  `switch_market_data_type(Delayed)`, got a batch whose last bar was 10 to 11 minutes old
+  (21:35 at 21:46) and no update through the 22:00 close and the break. `BarCompletion::expire`
+  completed the batch's last bar one second after the batch.
+- **Historical service silent** (*2026-11-25 00:55-06:19 UTC, until a TWS restart*): every
+  historical request, keep-up-to-date or not, on 700 SEHK, the HSI future and EUR.USD, got no
+  batch, no update and no error, while `reqMktData` and realtime bars on the same connections
+  kept working. A stream gives no sign of this: it looks like a session break.
+  Contract-detail and completed-order requests went unanswered in the same stall.
+- **SEHK close, 700 TRADES** (*2026-11-25 07:45-08:11 UTC*; continuous trading ends 08:00,
+  closing auction to 08:10): the 07:59 bar got its last update at 08:00:01.2 and
+  `BarCompletion::apply` completed it then. Bars for 08:00 to 08:09 followed through the auction,
+  updated every 5 seconds at volume 0 and the last price; the auction print came in the 08:08
+  bar's first update (08:08:06, volume 1,521,600, `barCount` 1, 337.4). The 08:09 bar's last
+  update at 08:10:01.2 was the last frame: nothing followed to 08:11. Realtime 5-second bars on
+  the same contract showed the same, ending with the 08:09:55 bar at 08:10:01.2.
+- **Not probed:** the last bar before the FX daily break (the farm disconnect ended that stream
+  first) and before the SEHK and HKFE lunch break (historical service silent); RTH-only
+  requests at a close.
+
+### Historical bar durations start at 30 S
+
+*Live 2026-11-23 22:21-22:23Z (Monday, after the US close), paper TWS, server 223. AAPL TRADES,
+regular hours.*
+
+- 1-second bars ending 21:00 and 19:00 UTC: 1, 10 and 29 S each draw 321 "Error validating
+  request.-'D' : cause - Historical data requested duration is invalid". 30, 59 and 60 S return
+  30, 59 and 60 bars, the last one stamped one second before the end date.
+- The same 321 for 29 S of 5-second, 1-minute and 1-hour bars. 30 S returns 6 five-second bars
+  and one 1-minute bar.
+- Settles that the minimum is 30 S for every bar size probed, so `between` asks for at least
+  30 S.
+- **Not probed:** 30 S of 1-hour bars; a minimum for `D`, `W`, `M` or `Y`; other instruments;
+  the Gateway.
+
+### Historical bar requests count back across closed hours
+
+*Live 2026-11-23 22:22Z (Monday, after the US close), paper TWS, server 223. AAPL 1-second
+TRADES, 2000 S.*
+
+- Regular hours, ending after the close (23:00 UTC): 2000 bars, 20:26:40 to 20:59:59 UTC that
+  day. Ending at Monday's open (14:30 UTC): Friday 2026-11-20 20:26:40 to 20:59:59. Ending at
+  14:40 UTC: Friday 20:36:40 to Monday 14:39:59, 1400 seconds of Friday and 600 of Monday.
+- A request ending at the earliest bar of the 14:40 reply (Friday 20:36:40) returns 20:03:20
+  to 20:36:39: the end second is excluded and the start second included, so the two replies
+  meet without a repeated or missing bar.
+- Extended hours, ending Monday 06:00 and 09:00 UTC (in the overnight closure and at the 04:00 ET
+  open): both return Saturday 00:26:40 to 00:59:59 UTC, the end of Friday's 20:00 ET session.
+- The reported window is wall clock (08:56:40 to 09:30 ET for the request ending at the open),
+  so it does not say where the bars start.
+- Eight requests chained this way, sent back to back from 21:00 UTC, took 3.1 s (six within
+  2.1 s); each returned 2000 bars with no pacing error.
+- Settles how `fetch` splits a 1-second `between` range: each request ends at the earliest bar
+  of the reply before, and the replies tile the range. Ends computed in wall-clock time would
+  repeat bars across a closure. The 2000 S limit itself is in "One-second bars reach back at
+  most 2000 S" (#1264).
+- Twelve requests through `between(..).fetch()`, 0.5 s apart (*live 2026-11-26 17:36 UTC, US
+  Thanksgiving holiday, same server*): EUR.USD `MIDPOINT` 1-second bars, extended hours, over the
+  24,000 s before now took 10.0 s and returned 24,000 bars, one per second, with no repeat, gap
+  or pacing error.
+- **Not probed:** count-back across futures session breaks, more than twelve requests in a row,
+  several clients paging at once, or Gateway.
+
+### Fixed-end historical bar requests can end with a no-data error
+
+*Live 2026-11-26 23:46-23:47 UTC (after US close), paper TWS, server 223; #1270.*
+
+- Three fixed-end requests for 2000 S of 1-second CME futures `TRADES` bars with extended hours
+  returned only error 162. ESZ7 ending 2026-11-25 16:00 UTC and 2026-11-26 06:00 UTC returned
+  `Historical Market Data Service error message:HMDS query returned no data: ESZ7@CME Trades`.
+  ESZ8 ending 2026-11-25 16:00 UTC returned the same message for ESZ8.
+- Two AAPL `TRADES` regular-hours controls with the same duration and bar size each returned
+  2000 bars in `HistoricalData` followed by `HistoricalDataEnd`. Both ended at 21:00 UTC,
+  one on 2026-11-25 and the other on 2025-11-25.
+- Split `between(..).fetch()` treats this no-data form of error 162 as an empty page and
+  continues paging.
+- **Not probed:** an empty page between populated pages of the same contract, an all-empty
+  split fetch, or Gateway.
+
+### Second-sized bar limits from 5 to 30 seconds
+
+*Live 2026-11-23 22:23-22:27Z (Monday, after the US close), paper TWS, server 223. AAPL TRADES,
+regular hours, ending 21:00 UTC.*
+
+- 86400 S: 5-second bars 17280 (27.7 s), 10-second 8640 (14.7 s), 15-second 5760 (14.7 s),
+  30-second 2880 (0.6 s). Each count is 86400 S over the bar size, so the duration counts
+  trading seconds and reaches back to 2026-11-18 16:30 UTC.
+- 2 D: 5-second bars 9360 (26.3 s), 10-second 4680, 15-second 3120, 30-second 1560, each from
+  Friday's open to Monday's close.
+- 10 D of 5-second bars returned nothing within 120 s; the probe cancelled it.
+- Settles that these sizes take any `S` duration `between` asks for (up to 86400 S, a range of
+  one day), so only 1-second bars are split.
+- **Not probed:** where these sizes' limits lie, including the 3 D and longer that `between`
+  asks for over a range of more than one day; whether the 10 D request ends in data or an
+  error; other instruments; the Gateway.
 
 ### Historical bars for a continuous future take no end date
 
@@ -202,6 +507,34 @@ hours, TRADES.*
   `now - start`: a 1-second `between` on a continuous future must start no more than about
   2000 s before now, however short the range.
 - **Not probed:** ranges starting between 2000 and 2500 s back; other bar sizes.
+
+### Historical tick pages: whole seconds, but one tick of a quote page's earliest second
+
+*Live 2026-11-13 Fri near the US cash open (ES Z6, trades) and 2026-11-23 Mon 04:30 ET (ES
+Z6, all three types, extended hours), paper TWS, server 223.*
+
+- The end is read to the whole second and its second is excluded: ending at 14:30:00 returns
+  trades up to 14:29:59, and ending at 14:28:35.5 returns the same ticks as 14:28:35. Ending
+  at 09:17:01.5 and at 09:17:01 return the same bid/ask, midpoint and trade ticks.
+- A trade page holds whole seconds, so it can exceed the count asked for: 100 trades ending
+  09:17:01 returned 115, the earliest second (09:16:36) holding all 21 of its trades.
+- A bid/ask or midpoint page holds whole seconds after its earliest second, but only one tick of
+  that second. In all 12 quote pages probed (2 ends, 100 and 1000 ticks, both types) the
+  earliest second held 1 tick; the same seconds hold 4 to 95 when they are not the earliest.
+- So a page that ends where the previous page's earliest second begins loses that second's
+  quotes but no trades. Over 09:16:46.5 to 09:18:46.5, paging that way returned 4345 bid/ask
+  ticks with 100-tick pages and 5852 with 1000-tick pages; refetching the earliest second
+  returned 6185 with both, and the same 511 trades and 992 midpoints with both.
+- A stock pages the same way: AAPL trades over 2026-11-23 15:00 to 15:02 UTC (RTH) returned
+  the same 5845 trades with 100-tick and 1000-tick pages.
+- A request ending in a closed market returns the ticks before it: AAPL trades over Saturday
+  2026-11-21 15:00 to 15:02 UTC (RTH) paged to `start` with no ticks in the range. A request
+  ending before TWS's tick history returns no ticks: AAPL trades over 2005-01-03 15:00 to
+  15:02 UTC (extended hours) got an empty first page. *Live 2026-11-23, paper TWS.*
+- Settles the paging rules of `historical_ticks_between` and `historical_ticks_latest`, and when they
+  report `PagingStop::ReachedStart` or `PagingStop::EmptyPage`.
+- **Not probed:** stock bid/ask pages, `IgnoreSize::Yes` pages, whether the single tick is the
+  first or the last of its second, or whether a quote reply covering just one second is complete.
 
 ### Size fields are always sent
 
@@ -276,6 +609,80 @@ server 223.*
 - **Not probed:** real-time `Volume` (8) (no real-time US equity permission on this account);
   delayed volume during regular hours; other markets.
 
+### Open interest ticks
+
+*Live 2026-11-24 Tue 09:47-09:50 UTC (US equities and options closed, CME Globex open), paper,
+server 223; delayed data (type 3).*
+
+- `reqMktData` with generic tick `101` on an AAPL Dec 2026 350 call: `OptionCallOpenInterest`
+  (27) `30680` and `OptionPutOpenInterest` (28) `0`, as size ticks, 0.2 s after the request. The
+  350 put: 27 `0`, 28 `9762`. ES Dec 2026 7200 futures options (FOP) the same way: call 27
+  `4957` / 28 `0`, put 27 `0` / 28 `9796`. Each pair arrived once in 20 s.
+- Generic tick `588` on ES Dec 2026: `FuturesOpenInterest` (86) `2111144`, once in 20 s. On an ES
+  futures option, `588` (with `101`) added nothing.
+- `101` on AAPL stock drew 10089 (no stock data on this account), so the stock's aggregate call and
+  put open interest was not seen.
+- A snapshot with generic tick `101` draws 321 "Snapshot market data subscription is not
+  applicable to generic ticks".
+- Settles that an option's own open interest is the tick for its right, and the other tick's `0`
+  is not a value for the contract. IB's tick type table describes `101` as "currently for
+  stocks".
+- **US trading hours** (*live 2026-11-24 15:57-16:04 UTC, US market open, paper TWS, server
+  223*): the same shape. Delayed (type 3), `101` on the AAPL Dec 2026 350 call drew 27 `30568`
+  and 28 `0` 0.1 s after the request, the 350 put 27 `0` and 28 `10223`, the ES Dec 2026 7500
+  call 27 `7259` / 28 `0` and the put 27 `0` / 28 `13667`; each pair once in a 30 s window.
+  The AAPL call's value differs from the 09:47 UTC read
+  (30680) of the same day. Real-time (type 1) on the AAPL call and the ES option drew 354
+  and no open interest tick.
+- **Not probed:** real-time data on an account with option data permission; `OpenInterest` (22),
+  which never arrived; a stock's aggregate values.
+
+### Market depth rates, rows and refusals
+
+*Live 2026-11-24 Tue 09:16-09:59 UTC (FX and Xetra open; US equities overnight), paper, server
+223; nautechsystems/nautilus_trader#5395.*
+
+- `reqMktDepth` EUR.USD (IDEALPRO), 10 rows, two concurrent 26-minute subscriptions, one with
+  `isSmartDepth` false and one true: both sides updated every minute, 2,400 to 9,200 updates per
+  side per minute; the longest silence was 5.4 s, on both sides at the same moment. Totals per
+  subscription: about 218,000 updates, 8,900 inserts and 9,000 deletes.
+- `isSmartDepth` false sends `MarketDepth` rows; true sends `MarketDepthL2` rows with market
+  maker `IDEALPRO` and `isSmartDepth` true, after a 2152 notice "Exchanges - Depth: IDEALPRO;".
+- Rows: 50 requested on EUR.USD gives positions 0-9 (10 rows) on each side. 5 requested on
+  GBP.USD and USD.JPY gives positions 0-4 on each side, built with 5 inserts per side and then
+  updates only.
+- A fourth concurrent request, from any client id on the same TWS, draws 309 "Max number (3) of
+  market depth requests has been reached" and ends the stream.
+- Refusals: AAPL `SMART` without smart depth draws 10092 and ends; AAPL `ISLAND` draws 10089
+  and then no rows; SAP `IBIS` and ES draw 354. AAPL smart
+  depth draws a 2152 listing the exchanges without depth permission, then nothing overnight.
+- No 317 (depth reset) or 316 (halted) arrived in 52 subscription-minutes.
+- No one-sided stall (one side silent while the other updates) reproduced on FX depth.
+- **Not probed:** US stock depth during US trading hours; a 317 reset (which rows TWS resends
+  after it); depth longer than 26 minutes.
+
+### Historical ticks of another kind
+
+*Live 2026-11-24 00:46Z (Monday 19:46 ET, off-hours), paper TWS, server 223; raw capture.*
+
+- `reqHistoricalTicks` TRADES, 50 ticks ending 2026-11-23 20:00 UTC, for EUR.USD (IDEALPRO),
+  XAUUSD (CMDTY, SMART) and the IBUS500 CFD: one `HistoricalTick` (midpoint) frame each, with
+  `isDone` true, then nothing for 20 s. No `HistoricalTickLast` frame and no error. EUR.USD
+  sent the same 56 ticks for TRADES and for MIDPOINT (first tick 1.09043, `size` `"0"`).
+  1,000 ticks and a `startDateTime` request instead of an end date answered the same way.
+- AAPL TRADES got one `HistoricalTickLast` frame (114 ticks, `isDone` true). An AAPL TRADES
+  window with no ticks (start 2026-11-24 00:30 UTC, regular hours) got one
+  `HistoricalTickLast` frame with no ticks and `isDone` true: an empty answer keeps the
+  requested kind, so a frame of another kind means TWS has none of the requested kind.
+- BID_ASK and MIDPOINT were each answered with their own kind for all four contracts. Earlier
+  the same day (23:56Z), SPX index BID_ASK and MIDPOINT drew error 10187 and BTC (PAXOS)
+  TRADES drew 10299 ("Expected what to show is AGGTRADES"): errors, not another kind.
+- So `historical_ticks(..)` ends with `Error::UnexpectedTickKind` on a frame of another kind.
+  Skipping the frame waits forever, or until `one_shot_timeout`, because TWS sends nothing more.
+- **Not probed:** a BID_ASK or MIDPOINT request answered with another kind (none provoked);
+  futures, options and bonds TRADES without trades; whether the substitute frame is ever
+  split across several frames with `isDone` false.
+
 ### Tick-by-tick sizes and `IgnoreSize`
 
 *Live 2026-11-16 03:33Z (Sunday evening ET), paper Gateway, server 226, BTC/PAXOS; #1244.*
@@ -301,3 +708,202 @@ server 223.*
   drops size-only updates here too.
 - ES and EUR.USD tick-by-tick sizes, all sent: [Size fields are always sent](#size-fields-are-always-sent).
 - **Not probed:** live stock ticks during RTH, live accounts, TWS rather than the Gateway.
+
+### Realtime bars across the SEHK and HKFE lunch break
+
+*Live 2026-11-25 01:38-05:00 UTC (SEHK and HKFE trading, lunch 04:00-05:00 UTC), paper TWS,
+server 223; `realtime_bars` (5-second TRADES bars, all trading hours) on 700 (SEHK) and the HSI
+December future (HKFE), both with real-time permission.*
+
+- During the session TWS sent a bar every 5 seconds, 5 to 6 s after the bar's start, including
+  bars with volume 0 at the last price (700 at 03:58:00, 03:58:15; HSI at 03:59:50, 03:59:55).
+- The last bar before the break, 03:59:55, arrived at 04:00:01.3 like any other. Then nothing,
+  no bar and no notice, for both contracts until 05:00:05.4, when the 05:00:00 bar arrived.
+  No bar was sent for the break.
+- The first 700 bar after the break carried 196,800 shares against hundreds to tens of thousands
+  per bar before it.
+- **Not probed:** the SEHK closing auction (08:00-08:10 UTC); RTH-only realtime bars;
+  keep-up-to-date historical bars across the same break (historical requests went unanswered
+  from 00:55 UTC that night, with no error, while market data kept working).
+
+### EUR.USD depth rows are fixed positions
+
+*Live 2026-11-25 19:16-19:19 UTC, paper TWS, server 223; EUR.USD on IDEALPRO, 5 rows, 150 s.
+Reported downstream the same day: a 3-minute recording with 10 rows.*
+
+- 12,336 row operations: 73 inserts, 12,139 updates and 124 deletes. The downstream recording had
+  46,775.
+- An update replaces the price and size of the row at `position`: 2,052 of the updates changed
+  the row's price, so a row is a slot, not a price level.
+- Every insert after the first dump landed above every row present on its side, that is at the
+  end of the side (73 here, all 1,322 downstream).
+- Deletes target the last row and arrive with price 0 and size 0 (124 of 124). Here 64 removed
+  the side's last row and 60 repeated a delete of a row already gone, at the same position.
+  Downstream, 1,292 removed the last row, 17 a lower row and 18 an absent one.
+- Read the operations as fixed slots: insert and update set row `position`, delete clears it and
+  the rows after it. Downstream, a model that shifts rows on insert and delete left a side
+  unsorted after 31,049 of the operations, against 3,775 transient states for fixed slots. In
+  this run both models gave the same book, because no delete hit a lower row.
+- **Not probed:** depth of other instruments (no CME or US stock depth permission); SMART depth
+  (`MarketDepthL2`).
+
+### Long historical bar requests take minutes
+
+*Live 2026-11-25 19:12-19:16 UTC, paper TWS, server 223; one request at a time. ES `CONTFUT`
+reported downstream the same day.*
+
+| Request                                               | Time    | Bars   |
+| ----------------------------------------------------- | ------- | ------ |
+| EUR.USD MIDPOINT, 1-minute bars, 30 D                 | 102.8 s | 42,583 |
+| EUR.USD MIDPOINT, 1-hour bars, 5 Y                    | 138.0 s | 31,072 |
+| ES `CONTFUT` TRADES, 1-minute bars, 30 D (downstream) | 107.6 s | 40,877 |
+| ES `CONTFUT` TRADES, 1-hour bars, 5 Y (downstream)    | 161.8 s | 16,121 |
+
+- Inferred from the times, not run: a `one_shot_timeout` of 60 s would end each of these with
+  `Error::Timeout` before the bars arrive. Size the timeout to the longest request, or split the
+  range.
+- **Not probed:** other bar sizes and instruments; how the time grows with concurrent requests.
+
+### 10299 `whatToShow` substitution
+
+*Live 2026-11-24 10:20-10:35 UTC, paper TWS, server 223; #1286.*
+
+10299 names the `whatToShow` TWS expects: "Expected what to show is AGGTRADES, please use that
+instead of TRADES" on crypto, "Expected what to show is TRADES ..." on others. What follows it:
+
+| Request | Contract, `whatToShow` | After 10299 |
+| --- | --- | --- |
+| Historical bars (`fetch`, `subscribe`) | BTC, ETH (PAXOS) `TRADES` | the bars and `HistoricalDataEnd`; bars identical to an `AGGTRADES` request |
+| Historical bars | AAPL, ES `AGGTRADES` | the `TRADES` bars and `HistoricalDataEnd` |
+| Historical bars | EUR.USD `AGGTRADES` | 162 "No historical market data" |
+| `keepUpToDate` bars (`subscribe_with_updates`) | BTC, ETH `TRADES` | the bars, `HistoricalDataEnd`, then updates every few seconds; a cancel draws 162 (cancelled) |
+| `keepUpToDate` bars | AAPL, EUR.USD, ES `AGGTRADES` | 321 "Source price not supported with live updates" at once (AAPL, again 2026-11-26: same millisecond, then nothing for 65 s); a cancel draws 366 |
+| Historical ticks | BTC, ETH `TRADES` | nothing for 20 s; a cancel draws no reply |
+
+- Without 10299: crypto `AGGTRADES` bars come with no notice; crypto `AGGTRADES` with
+  `keepUpToDate` draws 321 and nothing else, so `TRADES` is the only way to stream crypto bars.
+- `head_timestamp` with crypto `TRADES` or `AGGTRADES` answers with no 10299 (2019-03-13 for
+  BTC). With `AGGTRADES` on AAPL, EUR.USD and ES it draws 162. `histogram_data` takes no
+  `whatToShow` and answers for BTC and ETH.
+- A cancel sent within ~1 ms of the 10299 on a crypto `TRADES` `keepUpToDate` request (earlier
+  run) drew 366 while the updates kept coming: TWS had not yet set up the substituted query.
+  One sent seconds later drew 162 and stopped them.
+- **Not probed:** other crypto venues (ZEROHASH), RTH equities, bar sizes other than 1 hour
+  and 1 minute.
+
+### Streams across an internet outage
+
+*Live 2026-11-25 12:40-13:08 UTC and 2026-11-26 12:00-12:35 UTC (US pre-market, FX open), paper
+TWS, server 223; EUR.USD IDEALPRO; Wi-Fi off for 15 s, 2 min, 6 min and 20 min, router uplink
+unplugged for 2 min; one client never cancelled or re-requested; #1300.*
+
+- `reqMktData`, tick-by-tick, depth and realtime bars resumed on the same request 0.5 to 1.5 s
+  before the 1102. A re-request at the last farm OK or the 1102 delivered 3.4 to 4.4 s later.
+  2026-11-26: they resumed within [-2.2, +0.9] s of the 1102; tick-by-tick 0.1 to 0.9 s after it.
+- Realtime bars: TWS sent every missed 5-second bar on the original request in one burst (5, 30,
+  81 bars, no slot missing; 2026-11-26: 244 bars from 12:00:50 to 12:21:05 and 27 bars, no slot
+  missing). A re-request delivers only new bars. Across a TWS restart nothing is back-filled; see
+  [TWS restart and reconnect](protocol.md#tws-restart-and-reconnect).
+- No tick-by-tick tick stamped more than 5 s before arrival; rate after restore was normal.
+- Depth: 317 arrived in the same millisecond as 2103 for `cashfarm`, at the loss. Rows resumed on
+  the same request with no second 317. 2026-11-26: the first rows after the restore inserted all
+  10 rows, so the book refills from empty.
+- Keep-up-to-date bars: 10182 "Failed to request live updates (disconnected)." arrived in the
+  same millisecond as 2105 for `cashhmds`, after it, every run, every client (one also got 165);
+  2026-11-26, about 1 ms after it. No frame followed in 270 s, 389 s, 635 s, 1587 s and 390 s.
+  A cancel after the 10182 drew 366 within 3 ms (4 of 4), so the stream sends none. A new
+  request after the restore returned a batch covering every outage minute, 2.5 to 3.7 s after
+  the 1102. One sent at the first HMDS OK was answered 0.6 s after the 1102, one sent at the
+  second HMDS OK 0.1 s before it. `Client::resubscribing` reopens the request once no HMDS farm
+  reports broken, and once more if TWS confirms the farms back later and the reopened request
+  has delivered no bar.
+- The second reopen ran live in the 20-minute run: the reopen at the 15-minute limit, with the
+  HMDS farms still broken, got no frame; at the `cashhmds` OK the wrapper cancelled it and
+  reopened, and the batch held all 21 outage minutes:
+
+  ```text
+  12:01:30.656 [10182] on 1500000003; the wrapper yields it and drops the request
+  12:16:30.660 reqHistoricalData 1500000007 (15 min after the 10182; farms still broken)
+  12:21:11.428 2106 cashhmds OK; cancel 1500000007, reqHistoricalData 1500000008
+  12:21:11.960 [366] for the cancel of 1500000007
+  12:21:12.490 batch on 1500000008, 21 of 21 outage minutes, 0.1 s before the 1102
+  ```
+
+- 10197 "No market data during competing live session" does not end a market data request: drawn
+  51 s into the 6-minute outage on all clients; on the client that sent no cancel, ticks resumed
+  on the same id at restore (2233 to the end). Tick-by-tick, depth and realtime bars got no 10197.
+  A market data subscription yields it as a notice and keeps reading
+  (`TickTypes::error_continues_request`).
+- **Not probed:** 1101, and whether streams resume on their own ids after it (a reopen after 1101
+  loses the realtime bar back-fill if they do); whether TWS answers a keep-up-to-date bar request
+  sent during the outage once its farm is back (every such request was replaced before the
+  restore); the path where an HMDS farm goes inactive (2107) instead of reporting OK; stocks,
+  futures, RTH; depth update rows after restore; 10197 during a real competing session.
+
+### Market data type and permission notices
+
+*Live 2026-11-24 10:00-10:30 UTC (US pre-market, CME Globex and FX open), paper TWS, server 223;
+#677.*
+
+Each request under each market data type set with `switch_market_data_type`, read for 10-15 s;
+"nothing" means no tick or bar for that time. A cancel sent afterwards shows whether TWS still
+held the request (300: it did not).
+
+| Request | Type 1 live / 2 frozen | Type 3 delayed / 4 delayed frozen |
+| --- | --- | --- |
+| AAPL market data, snapshot, realtime bars, tick-by-tick | 10089, nothing; cancel 300 | the same (10089, nothing, 300) |
+| MSFT, IBM market data and snapshot | 10089, nothing; cancel 300 | `MarketDataType(Delayed)`, 10167, delayed ticks; snapshot ends |
+| ES market data and snapshot | 354 | `MarketDataType(Delayed)`, 10167, delayed ticks |
+| VOD (LSE) market data | 10090, then 354 (frozen snapshot: 10168) | 10090, 10167, delayed ticks |
+| ES, VOD realtime bars | 420 | 420 |
+| ES, VOD tick-by-tick | 354 | 354 |
+| EUR.USD, all four | real-time data, `MarketDataType(Realtime)` | the same: real-time data |
+
+- **10089 is never followed by data.** It ended the request in 36 of 36 requests across all
+  four types and four request kinds; every later cancel drew 300. On types 3 and 4 TWS sends
+  10167 instead when it has delayed data for the contract (MSFT, IBM), and still sends 10089
+  when it does not (AAPL on this account, at this time; AAPL had delayed data at 09:22 UTC the
+  same day). So the market data type does not decide what 10089 means.
+- **10167 is followed by delayed data**, after a `MarketDataType(Delayed)` tick.
+- **10090 is followed by whatever else the request gets**: 354 on types 1 and 2, delayed data
+  on types 3 and 4.
+- Generic ticks 233, 236, 258, 456 drew 10358 (fundamentals) on stocks and futures and 321 on
+  forex before any notice above.
+- Market depth (*live 2026-11-26 16:27 UTC, US Thanksgiving holiday, same server, type 1*): AAPL
+  `ISLAND`, 5 rows, drew 10089 ("... AAPL NASDAQ.NMS/DEEP") 0.5 s after the request, then no row
+  for 65 s; the cancel then drew 310 "Can't find the subscribed market depth with tickerId", so
+  TWS had ended it.
+- **Not probed:** 10091; RTH; an account with real-time US equity data; options; depth on other
+  contracts.
+
+### Historical ticks reply
+
+*Live 2026-11-15 weekend (Sunday 08:27 ET), 2026-11-16 RTH (09:58 ET) and 2026-11-16 after the
+close (17:58-18:05 ET), paper Gateway, server 226; the first two runs AAPL with `ending`
+2026-11-13 20:00 UTC, the third AAPL, SEB, ES, EUR.USD and BTC/PAXOS with `starting` or `ending` (#1317).*
+
+- Every answered request (23) got one frame with `is_done` true. With `ending`: 10 trades asked
+  → one `HistoricalTickLast` of 14 ticks; 1000 asked → 1004; 10 midpoints → one `HistoricalTick`
+  of 19; 10 bid/asks → one `HistoricalTickBidAsk` of 17. Notice 2188 preceded each AAPL frame.
+- TWS returns whole seconds, so a reply can be much longer than asked. AAPL trades with
+  `starting` at the open (2026-11-13 14:30:00 UTC): 10 asked → 332 ticks, all in that second;
+  1000 asked → 2058 ticks over three seconds. Ticks arrive oldest first.
+- A midpoint or bid/ask reply holds one tick of its earliest second. That was so in all 10
+  distinct replies with more than a few ticks per second (12 frames, the 20:00 requests being
+  repeated in two runs), where later seconds held up to 385. With `starting`, that tick is
+  stamped before the start (14:29:59 for a 14:30:00 start; 14:28:56 on the thin ES 202712). A
+  trades reply with `starting` returned its first second whole: the open's second held 332 ticks
+  whether 10 or 1000 were asked.
+- A contract with no trades in the window gets one frame with no ticks (ES 202712).
+- 1001 and 5000 trades asked → 10187 "Failed to request historical ticks:Max length exceeded"
+  and no frame. 0 asked → 321 "... Number of ticks must be > 0". IB's historical-ticks page
+  (interactivebrokers.com/docs/tws-api/doc/md/historical-ticks.md) reads "Max is 1000 per
+  request".
+- Trades asked for a forex pair (EUR.USD): no error, and the reply is a `HistoricalTick`
+  (midpoint) frame, not `HistoricalTickLast`, so `last()` returns `Error::UnexpectedTickKind`
+  ([another kind](#historical-ticks-of-another-kind)); use `mid_point()` or `bid_ask(..)` for
+  forex. BTC/PAXOS trades → 10299 "Expected what to show is AGGTRADES".
+- The reply is finite and one frame here, which is why `historical_ticks` returns a `Vec`; the
+  crate still reads frames until `is_done`, so a reply TWS split would be returned whole.
+- **Not probed:** whether the 1000 cap depends on the account or its market data subscriptions
+  (one paper account); a reply of more than one frame, which was not seen; non-US stocks.

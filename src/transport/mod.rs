@@ -4,7 +4,9 @@
 pub(crate) mod common;
 
 #[cfg(feature = "sync")]
-use std::{sync::Mutex, time::Duration};
+use std::sync::Mutex;
+#[cfg(all(feature = "sync", test))]
+use std::time::Duration;
 
 #[cfg(feature = "sync")]
 use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
@@ -28,6 +30,7 @@ pub mod sync;
 #[cfg(feature = "async")]
 pub mod r#async;
 
+pub(crate) mod farm_watch;
 pub(crate) mod order_taps;
 pub(crate) mod rate_limiter;
 
@@ -37,7 +40,7 @@ pub(crate) use crate::subscriptions::common::RoutedItem;
 
 /// A request route's unread-item cap (`buffer_limit`), opened with
 /// `send_request_capped`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct BufferBound {
     /// The most unread items the route queues.
     pub limit: usize,
@@ -45,6 +48,11 @@ pub(crate) struct BufferBound {
     /// a result that fills the cap exactly still ends normally. Empty: only an
     /// error ends the stream.
     pub end: &'static [crate::messages::IncomingMessages],
+    /// The decoder's `error_continues_request`, read with `context`. An error
+    /// it accepts is not terminal: TWS goes on sending data after it, so the
+    /// route stays open and the error counts against the cap like data.
+    pub continues: fn(&crate::messages::Notice, &crate::subscriptions::DecoderContext) -> bool,
+    pub context: crate::subscriptions::DecoderContext,
 }
 
 /// The largest `buffer_limit`. The async client allocates its channel's slots
@@ -53,10 +61,13 @@ pub(crate) struct BufferBound {
 pub const MAX_BUFFER_LIMIT: usize = 65_535;
 
 impl BufferBound {
-    /// The bound for a `buffer_limit` on a `T` stream, or `None` when unset.
-    /// Errors if `limit` is outside `1..=MAX_BUFFER_LIMIT`.
+    /// The bound for a `buffer_limit` on a `T` stream opened with `context`,
+    /// or `None` when unset. Errors if `limit` is outside `1..=MAX_BUFFER_LIMIT`.
     #[cfg(any(feature = "sync", feature = "async"))]
-    pub(crate) fn for_stream<T: crate::subscriptions::StreamDecoder<T>>(limit: Option<usize>) -> Result<Option<Self>, Error> {
+    pub(crate) fn for_stream<T: crate::subscriptions::StreamDecoder<T>>(
+        limit: Option<usize>,
+        context: &crate::subscriptions::DecoderContext,
+    ) -> Result<Option<Self>, Error> {
         let Some(limit) = limit else {
             return Ok(None);
         };
@@ -65,7 +76,12 @@ impl BufferBound {
                 "buffer_limit must be 1..={MAX_BUFFER_LIMIT}, got {limit}"
             )));
         }
-        Ok(Some(Self { limit, end: T::END_MESSAGES }))
+        Ok(Some(Self {
+            limit,
+            end: T::END_MESSAGES,
+            continues: T::error_continues_request,
+            context: context.clone(),
+        }))
     }
 }
 
@@ -85,9 +101,10 @@ pub(crate) enum Admit {
 #[derive(Debug)]
 pub(crate) struct BoundState {
     bound: BufferBound,
-    /// Set once a terminal item (end marker, error, or the overflow error)
-    /// was queued: the stream has ended, so later items are discarded and
-    /// at most one item ever uses the slot past the cap.
+    /// Set once a terminal item (end marker, an error the decoder does not
+    /// continue after, or the overflow error) was queued: the stream has
+    /// ended, so later items are discarded and at most one item ever uses the
+    /// slot past the cap.
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -104,13 +121,17 @@ impl BoundState {
     }
 
     /// Decide `item`'s fate with `unread` items queued. End markers and
-    /// errors always get through; anything else past the cap overflows.
+    /// terminal errors always get through; anything else past the cap,
+    /// including an error the request continues after, overflows.
     pub(crate) fn admit(&self, item: &RoutedItem, unread: usize) -> Admit {
         use std::sync::atomic::Ordering;
         if self.closed() {
             return Admit::Discard;
         }
         let terminal = match item {
+            RoutedItem::Error(Error::Notice(notice)) | RoutedItem::FarmDisconnected(notice, _) => {
+                !(self.bound.continues)(notice, &self.bound.context)
+            }
             RoutedItem::Error(_) => true,
             RoutedItem::Response(message) => self.bound.end.contains(&message.message_type()),
             RoutedItem::Notice(_) => false,
@@ -202,6 +223,11 @@ impl SharedCounts {
         }
     }
 
+    /// `true` while subscriptions to `account`'s updates are live.
+    pub(crate) fn is_account_updates_live(&self, account: &AccountId) -> bool {
+        self.account_updates.as_ref() == Some(account)
+    }
+
     /// Uncounts `ticket`'s subscription. `true` when the cancel should be
     /// written: the ticket is from this session and no other subscription of
     /// the type is live. A ticket with no counted subscription (one
@@ -243,24 +269,144 @@ impl SharedCounts {
     }
 }
 
+/// Requests written but not yet answered, per reply end marker, for the
+/// shared requests TWS answers one at a time with a full reply each
+/// (`ChannelMapping::reply_end`).
+/// Every reply reaches every live subscription of its message types, so a
+/// subscription made while `n` replies of its end marker are outstanding
+/// skips those `n` and then reads its own: without it, `open_orders` called
+/// during another `open_orders` ends at the earlier reply's end marker with
+/// the tail of that reply, and `all_open_orders` overlapping `open_orders`
+/// reads the other request's result set.
+///
+/// Counted under the same lock as the request write, so the count follows
+/// wire order; decremented under the lock that delivers the end marker, so a
+/// new subscription sees each end marker exactly when the count does.
+///
+/// A request TWS stops answering is uncounted when its cancel goes out
+/// ([`cancelled`](Self::cancelled)): `reqPositions` sent during a connectivity
+/// loss (1100) never ended, and every later `positions()` would otherwise pass
+/// over its own reply waiting for that one. Requests without a cancel
+/// (`reqOpenOrders`, `reqAllOpenOrders`, `reqCompletedOrders`) stay counted
+/// after their subscription is dropped, since TWS still sends the reply.
+/// Account dumps can also arrive after the last unsubscribe. A fresh account
+/// subscription is refused until those replies have ended or the session resets.
+#[cfg(any(feature = "sync", feature = "async"))]
+#[derive(Debug, Default)]
+pub(crate) struct UnansweredReplies {
+    pending: std::collections::HashMap<crate::messages::IncomingMessages, usize>,
+}
+
+#[cfg(any(feature = "sync", feature = "async"))]
+impl UnansweredReplies {
+    pub(crate) fn check_account_updates(&self, request: OutgoingMessages, live: bool) -> Result<(), Error> {
+        if request == OutgoingMessages::RequestAccountData && !live && self.pending(crate::messages::IncomingMessages::AccountDownloadEnd) > 0 {
+            return Err(Error::AlreadySubscribed);
+        }
+        Ok(())
+    }
+
+    /// Counts a request of `request` about to be written and returns what its
+    /// subscription skips: the replies still outstanding ahead of it.
+    pub(crate) fn add(&mut self, request: OutgoingMessages) -> ReplySkip {
+        let Some(end) = crate::messages::shared_channel_configuration::reply_end(request) else {
+            return ReplySkip::default();
+        };
+        let pending = self.pending.entry(end).or_insert(0);
+        let skip = ReplySkip {
+            end: Some(end),
+            remaining: *pending,
+        };
+        *pending += 1;
+        skip
+    }
+
+    /// Uncounts a request whose write failed after [`add`](Self::add).
+    pub(crate) fn withdraw(&mut self, request: OutgoingMessages) {
+        if let Some(end) = crate::messages::shared_channel_configuration::reply_end(request) {
+            self.answered(end);
+        }
+    }
+
+    /// Records a frame of `message_type`: an end marker answers the oldest
+    /// outstanding request. One with nothing outstanding (TWS sends this
+    /// client's open orders and an `OpenOrderEnd` at connect) changes nothing.
+    pub(crate) fn answered(&mut self, message_type: crate::messages::IncomingMessages) {
+        if let Some(pending) = self.pending.get_mut(&message_type) {
+            *pending = pending.saturating_sub(1);
+        }
+    }
+
+    /// Uncounts cancelled replies that TWS can stop sending. Keep abandoned
+    /// account dumps counted because TWS can still send their end markers.
+    pub(crate) fn cancelled(&mut self, request: OutgoingMessages) {
+        let end = crate::messages::shared_channel_configuration::reply_end(request);
+        if let Some(end) = end.filter(|end| *end != crate::messages::IncomingMessages::AccountDownloadEnd) {
+            self.pending.remove(&end);
+        }
+    }
+
+    /// Starts a new session: nothing written before it will be answered.
+    pub(crate) fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    pub(crate) fn pending(&self, end: crate::messages::IncomingMessages) -> usize {
+        self.pending.get(&end).copied().unwrap_or(0)
+    }
+}
+
+/// The earlier replies a shared subscription has yet to pass over before its
+/// own; see [`UnansweredReplies`].
+#[cfg(any(feature = "sync", feature = "async"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReplySkip {
+    end: Option<crate::messages::IncomingMessages>,
+    remaining: usize,
+}
+
+#[cfg(any(feature = "sync", feature = "async"))]
+impl ReplySkip {
+    /// `true` when a frame of `message_type` belongs to an earlier reply, and
+    /// so is not this subscription's. Counts down on each end marker.
+    pub(crate) fn skips(&mut self, message_type: crate::messages::IncomingMessages) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        if self.end == Some(message_type) {
+            self.remaining -= 1;
+        }
+        true
+    }
+}
+
 // MessageBus trait - defines the interface for message handling
 #[cfg(feature = "sync")]
 pub(crate) trait MessageBus: Send + Sync {
     /// Open a request-id route and write `packet`. With `bound`, unread items
     /// are capped: see [`BoundState::admit`]. Past the cap the route queues
     /// `Error::BufferLimitExceeded` and discards later frames.
-    fn send_request_capped(&self, request_id: RequestId, packet: &[u8], bound: Option<BufferBound>) -> Result<InternalSubscription, Error>;
+    fn send_request_capped(
+        &self,
+        request_id: RequestId,
+        packet: &[u8],
+        bound: Option<BufferBound>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<InternalSubscription, Error>;
 
     /// [`send_request_capped`](Self::send_request_capped) without a cap.
     fn send_request(&self, request_id: RequestId, packet: &[u8]) -> Result<InternalSubscription, Error> {
-        self.send_request_capped(request_id, packet, None)
+        self.send_request_capped(request_id, packet, None, None)
     }
 
     fn send_shared_request(&self, message_id: OutgoingMessages, packet: &[u8]) -> Result<InternalSubscription, Error>;
 
     /// `send_shared_request` for `RequestAccountData`, refused with
-    /// `Error::AccountUpdatesInUse` while another account is live.
-    fn send_account_updates_request(&self, account: &AccountId, packet: &[u8]) -> Result<InternalSubscription, Error>;
+    /// `Error::AccountUpdatesInUse` while another account is live. While
+    /// `account` is live already, writes `unsubscribe` ahead of `packet`:
+    /// TWS answers a repeated subscribe with nothing, but an unsubscribe and
+    /// subscribe with the full initial dump, which reaches every subscription.
+    fn send_account_updates_request(&self, account: &AccountId, packet: &[u8], unsubscribe: &[u8]) -> Result<InternalSubscription, Error>;
 
     /// Ends one subscription of `message_id`. `packet` is the cancel to write
     /// for the last one; `None` for a stream TWS never cancels, which still
@@ -298,6 +444,10 @@ pub(crate) trait MessageBus: Send + Sync {
     /// was sent in: once they differ, the request died with an earlier
     /// session and a cancel would name an id the current session never saw.
     fn session_generation(&self) -> u64;
+
+    /// Historical-data farm state from the global notices, which
+    /// `Client::resubscribing` waits on after a 10182.
+    fn farm_watch(&self) -> &farm_watch::sync_impl::FarmWatch;
 }
 
 // InternalSubscription - handles receiving messages for sync subscriptions
@@ -378,9 +528,41 @@ impl InternalSubscription {
     }
 
     /// Bounded-wait variant of [`next_routed`](Self::next_routed). Returns
-    /// `None` if no `RoutedItem` arrives within `timeout`.
+    /// `None` if no `RoutedItem` arrives before `deadline`.
+    pub(crate) fn next_before_routed(&self, deadline: std::time::Instant) -> Option<RoutedItem> {
+        self.pick_receiver()?.recv_deadline(deadline).ok()
+    }
+
+    /// Receives a routed item, with a relative timeout.
+    #[cfg(test)]
     pub(crate) fn next_timeout_routed(&self, timeout: Duration) -> Option<RoutedItem> {
         self.pick_receiver()?.recv_timeout(timeout).ok()
+    }
+
+    /// [`next_routed`](Self::next_routed), or `None` once `wake` receives
+    /// first. Either may win when both are ready.
+    pub(crate) fn next_routed_unless(&self, wake: &Receiver<()>) -> Option<Option<RoutedItem>> {
+        let Some(receiver) = self.pick_receiver() else {
+            return Some(None);
+        };
+        crossbeam::select! {
+            recv(receiver) -> item => Some(item.ok()),
+            recv(wake) -> _ => None,
+        }
+    }
+
+    /// Like `next_routed_unless`, with an optional deadline and a ready wake
+    /// taking precedence over queued data.
+    pub(crate) fn next_routed_before_unless(&self, deadline: Option<std::time::Instant>, wake: &Receiver<()>) -> Option<Option<RoutedItem>> {
+        let Some(receiver) = self.pick_receiver() else {
+            return Some(None);
+        };
+        let timer = deadline.map_or_else(crossbeam::channel::never, crossbeam::channel::at);
+        crossbeam::channel::select_biased! {
+            recv(wake) -> _ => None,
+            recv(timer) -> _ => Some(None),
+            recv(receiver) -> item => Some(item.ok()),
+        }
     }
 
     pub(crate) fn cancel(&self) {

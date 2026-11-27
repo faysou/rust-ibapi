@@ -115,6 +115,10 @@ pub(crate) enum ExpiryInput {
 impl ContractBuilder {
     /// Creates a new [ContractBuilder]
     ///
+    /// An unset exchange or currency stays empty. Set [`exchange`](Self::exchange) to `SMART` for
+    /// smart routing. A contract named by symbol or local symbol needs a security type. A nonzero
+    /// contract ID, or a security ID paired with its scheme, can identify it without a type.
+    ///
     /// # Examples
     ///
     /// ```no_run

@@ -298,6 +298,8 @@ mod sync_impl {
 // Async implementations
 #[cfg(feature = "async")]
 mod async_impl {
+    use std::future::Future;
+
     use futures::StreamExt;
     use tokio::time::Instant;
 
@@ -307,6 +309,7 @@ mod async_impl {
     use crate::subscriptions::common::{filter_notice, lag_as_error};
     use crate::subscriptions::r#async::Subscription;
     use crate::subscriptions::StreamDecoder;
+    use crate::transport::r#async::WriteAdmission;
     use crate::Error;
 
     /// Deadline for a request-id one-shot starting now: `one_shot_timeout`
@@ -324,6 +327,36 @@ mod async_impl {
             Some(deadline) if Instant::now() >= deadline => Err(Error::Timeout),
             _ => Ok(()),
         }
+    }
+
+    /// Stop waiting at the deadline. Keep an accepted write owned until the frame
+    /// finishes and the subscription can be cancelled without truncating the socket.
+    pub(crate) async fn send_with_deadline<T, Fut>(
+        client: &Client,
+        deadline: Option<Instant>,
+        send: impl FnOnce(Option<WriteAdmission>) -> Result<Fut, Error>,
+    ) -> Result<Subscription<T>, Error>
+    where
+        T: StreamDecoder<T> + Send + 'static,
+        Fut: Future<Output = Result<Subscription<T>, Error>> + Send + 'static,
+    {
+        let Some(deadline) = deadline else {
+            return send(None)?.await;
+        };
+        check_deadline(Some(deadline))?;
+        let (admission, cancel_write) = WriteAdmission::new(deadline);
+        let task = client.message_bus.runtime_handle().spawn(send(Some(admission))?);
+        let subscription = tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => return Err(Error::Timeout),
+            result = task => match result {
+                Ok(subscription) => subscription?,
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(_) => return Err(Error::Shutdown),
+            },
+        };
+        drop(cancel_write);
+        Ok(subscription)
     }
 
     /// One-shot request answered on the shared channel for its message type,

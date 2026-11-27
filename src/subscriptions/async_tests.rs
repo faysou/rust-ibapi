@@ -1241,7 +1241,7 @@ async fn drain_after_error_returns_cancel_write_error() {
 /// The deadline bounds a stuck cancel write too.
 #[tokio::test]
 async fn drain_deadline_bounds_cancel_write() {
-    let f = drain_fixture_on(MessageBusStub::default().with_stalled_sends());
+    let f = drain_fixture_on(MessageBusStub::default().with_sends_stalling_after(0));
 
     let started = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(50);

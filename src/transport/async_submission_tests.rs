@@ -33,13 +33,13 @@ impl AsyncIo for SubmissionStream {
         self.inner.read_message().await
     }
 
-    async fn write_all(&self, bytes: &[u8]) -> Result<(), Error> {
+    async fn write_all(&self, bytes: &[u8], admission: Option<&crate::transport::r#async::WriteAdmission>) -> Result<(), Error> {
         self.attempts.lock().unwrap().push(bytes.to_vec());
         let mode = *self.mode.lock().unwrap();
         match mode {
-            WriteMode::Succeed => self.inner.write_all(bytes).await,
+            WriteMode::Succeed => self.inner.write_all(bytes, admission).await,
             WriteMode::Pending => {
-                self.inner.write_all(&bytes[..2]).await?;
+                self.inner.write_all(&bytes[..2], admission).await?;
                 std::future::pending().await
             }
         }
@@ -90,7 +90,7 @@ impl Registration {
     async fn submit(self, bus: &AsyncTcpMessageBus<SubmissionStream>) -> Result<AsyncInternalSubscription, Error> {
         match self {
             Self::Request => bus.send_request(RequestId::nth(ID), packet()).await,
-            Self::BoundedRequest => bus.send_request_capped(RequestId::nth(ID), packet(), Some(bound(8))).await,
+            Self::BoundedRequest => bus.send_request_capped(RequestId::nth(ID), packet(), Some(bound(8)), None).await,
             Self::Order => bus.send_order_request(OrderId::from(ID), packet()).await,
         }
     }
@@ -111,7 +111,11 @@ async fn dropping_a_pending_write_releases_its_registration() {
         let (stream, bus) = make_bus(WriteMode::Pending);
         let mut submitting = Box::pin(kind.submit(&bus));
         assert!(futures::poll!(submitting.as_mut()).is_pending());
-        assert!(kind.registered(&bus).await.is_some(), "{kind:?}: registered before the write");
+        assert_eq!(
+            kind.registered(&bus).await.is_some(),
+            !matches!(kind, Registration::Order),
+            "{kind:?}: registration while the write is pending"
+        );
         assert_eq!(
             stream.inner.captured(),
             encode_raw_length(&packet())[..2].to_vec(),
