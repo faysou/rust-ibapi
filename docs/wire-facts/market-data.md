@@ -531,10 +531,10 @@ Z6, all three types, extended hours), paper TWS, server 223.*
   2026-11-21 15:00 to 15:02 UTC (RTH) paged to `start` with no ticks in the range. A request
   ending before TWS's tick history returns no ticks: AAPL trades over 2005-01-03 15:00 to
   15:02 UTC (extended hours) got an empty first page. *Live 2026-11-23, paper TWS.*
-- Settles the paging rules of `HistoricalTicksBuilder::between` and `latest`, and when they
+- Settles the paging rules of `historical_ticks_between` and `historical_ticks_latest`, and when they
   report `PagingStop::ReachedStart` or `PagingStop::EmptyPage`.
 - **Not probed:** stock bid/ask pages, `IgnoreSize::Yes` pages, whether the single tick is the
-  first or the last of its second.
+  first or the last of its second, or whether a quote reply covering just one second is complete.
 
 ### Size fields are always sent
 
@@ -677,8 +677,8 @@ server 223; delayed data (type 3).*
 - BID_ASK and MIDPOINT were each answered with their own kind for all four contracts. Earlier
   the same day (23:56Z), SPX index BID_ASK and MIDPOINT drew error 10187 and BTC (PAXOS)
   TRADES drew 10299 ("Expected what to show is AGGTRADES"): errors, not another kind.
-- So `TickSubscription` ends with `Error::UnexpectedTickKind` on a frame of another kind; it
-  skipped the frame and waited forever, because the channel stays open.
+- So `historical_ticks(..)` ends with `Error::UnexpectedTickKind` on a frame of another kind.
+  Skipping the frame waits forever, or until `one_shot_timeout`, because TWS sends nothing more.
 - **Not probed:** a BID_ASK or MIDPOINT request answered with another kind (none provoked);
   futures, options and bonds TRADES without trades; whether the substitute frame is ever
   split across several frames with `isDone` false.
@@ -791,7 +791,6 @@ instead of TRADES" on crypto, "Expected what to show is TRADES ..." on others. W
 - **Not probed:** other crypto venues (ZEROHASH), RTH equities, bar sizes other than 1 hour
   and 1 minute.
 
-
 ### Streams across an internet outage
 
 *Live 2026-11-25 12:40-13:08 UTC and 2026-11-26 12:00-12:35 UTC (US pre-market, FX open), paper
@@ -876,3 +875,35 @@ held the request (300: it did not).
   TWS had ended it.
 - **Not probed:** 10091; RTH; an account with real-time US equity data; options; depth on other
   contracts.
+
+### Historical ticks reply
+
+*Live 2026-11-15 weekend (Sunday 08:27 ET), 2026-11-16 RTH (09:58 ET) and 2026-11-16 after the
+close (17:58-18:05 ET), paper Gateway, server 226; the first two runs AAPL with `ending`
+2026-11-13 20:00 UTC, the third AAPL, SEB, ES, EUR.USD and BTC/PAXOS with `starting` or `ending` (#1317).*
+
+- Every answered request (23) got one frame with `is_done` true. With `ending`: 10 trades asked
+  → one `HistoricalTickLast` of 14 ticks; 1000 asked → 1004; 10 midpoints → one `HistoricalTick`
+  of 19; 10 bid/asks → one `HistoricalTickBidAsk` of 17. Notice 2188 preceded each AAPL frame.
+- TWS returns whole seconds, so a reply can be much longer than asked. AAPL trades with
+  `starting` at the open (2026-11-13 14:30:00 UTC): 10 asked → 332 ticks, all in that second;
+  1000 asked → 2058 ticks over three seconds. Ticks arrive oldest first.
+- A midpoint or bid/ask reply holds one tick of its earliest second. That was so in all 10
+  distinct replies with more than a few ticks per second (12 frames, the 20:00 requests being
+  repeated in two runs), where later seconds held up to 385. With `starting`, that tick is
+  stamped before the start (14:29:59 for a 14:30:00 start; 14:28:56 on the thin ES 202712). A
+  trades reply with `starting` returned its first second whole: the open's second held 332 ticks
+  whether 10 or 1000 were asked.
+- A contract with no trades in the window gets one frame with no ticks (ES 202712).
+- 1001 and 5000 trades asked → 10187 "Failed to request historical ticks:Max length exceeded"
+  and no frame. 0 asked → 321 "... Number of ticks must be > 0". IB's historical-ticks page
+  (interactivebrokers.com/docs/tws-api/doc/md/historical-ticks.md) reads "Max is 1000 per
+  request".
+- Trades asked for a forex pair (EUR.USD): no error, and the reply is a `HistoricalTick`
+  (midpoint) frame, not `HistoricalTickLast`, so `last()` returns `Error::UnexpectedTickKind`
+  ([another kind](#historical-ticks-of-another-kind)); use `mid_point()` or `bid_ask(..)` for
+  forex. BTC/PAXOS trades → 10299 "Expected what to show is AGGTRADES".
+- The reply is finite and one frame here, which is why `historical_ticks` returns a `Vec`; the
+  crate still reads frames until `is_done`, so a reply TWS split would be returned whole.
+- **Not probed:** whether the 1000 cap depends on the account or its market data subscriptions
+  (one paper account); a reply of more than one frame, which was not seen; non-US stocks.

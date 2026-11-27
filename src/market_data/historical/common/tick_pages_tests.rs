@@ -15,15 +15,31 @@ fn prices(ticks: &[TickLast]) -> Vec<f64> {
 }
 
 #[test]
-fn first_request_ends_after_the_end_second() {
+fn fractional_end_rounds_up_for_the_wire() {
     let pages = TickPages::<TickLast>::new(Some(datetime!(2026-11-13 14:26:44 UTC)), datetime!(2026-11-13 14:29:59.4 UTC), None).unwrap();
 
     assert_eq!(pages.request_end(), datetime!(2026-11-13 14:30:00 UTC));
 }
 
 #[test]
+fn whole_second_end_excludes_the_resume_boundary() {
+    let start = datetime!(2026-11-13 14:00:00 UTC);
+    let boundary = datetime!(2026-11-13 14:30:00 UTC);
+    let mut resumed = TickPages::new(Some(start), boundary, None).unwrap();
+    assert_eq!(resumed.request_end(), boundary);
+
+    let more = resumed.push(vec![tick(start, 1.0), tick(boundary, 2.0)]);
+
+    assert_eq!(more, ControlFlow::Break(PagingStop::ReachedStart));
+    let result = resumed.finish(PagingStop::ReachedStart);
+    assert_eq!(prices(&result.ticks), vec![1.0]);
+    assert_eq!(result.from, Some(start));
+    assert_eq!(result.stop, PagingStop::ReachedStart);
+}
+
+#[test]
 fn next_request_ends_at_the_earliest_second() {
-    let mut pages = TickPages::new(Some(datetime!(2026-11-13 14:26:44 UTC)), datetime!(2026-11-13 14:29:59 UTC), None).unwrap();
+    let mut pages = TickPages::new(Some(datetime!(2026-11-13 14:26:44 UTC)), datetime!(2026-11-13 14:29:59.5 UTC), None).unwrap();
 
     let more = pages.push(vec![
         tick(datetime!(2026-11-13 14:28:35 UTC), 1.0),
@@ -38,7 +54,7 @@ fn next_request_ends_at_the_earliest_second() {
 #[test]
 fn pages_join_oldest_first_and_stop_at_the_start_second() {
     let start = datetime!(2026-11-13 14:26:44.5 UTC);
-    let end = datetime!(2026-11-13 14:29:59 UTC);
+    let end = datetime!(2026-11-13 14:29:59.5 UTC);
     let mut pages = TickPages::new(Some(start), end, None).unwrap();
 
     let first = pages.push(vec![
@@ -134,7 +150,7 @@ fn bids(ticks: &[TickBidAsk]) -> Vec<f64> {
 
 #[test]
 fn quote_page_refetches_its_partial_earliest_second() {
-    let mut pages = TickPages::new(Some(datetime!(2026-11-23 09:16:00 UTC)), datetime!(2026-11-23 09:17:01 UTC), None).unwrap();
+    let mut pages = TickPages::new(Some(datetime!(2026-11-23 09:16:00 UTC)), datetime!(2026-11-23 09:17:01.5 UTC), None).unwrap();
 
     // TWS sends one tick of the earliest second of a bid/ask page
     let more = pages.push(vec![
@@ -162,19 +178,70 @@ fn quote_page_refetches_its_partial_earliest_second() {
 }
 
 #[test]
-fn quote_page_holding_only_a_partial_second_keeps_it() {
-    let mut pages = TickPages::new(Some(datetime!(2026-11-23 09:00:00 UTC)), datetime!(2026-11-23 09:17:00 UTC), None).unwrap();
+fn sole_quote_tick_is_kept_without_certifying_the_second() {
+    let start = datetime!(2026-11-23 09:17:00 UTC);
+    let end = datetime!(2026-11-23 09:17:01 UTC);
+    let mut pages = TickPages::new(Some(start), end, None).unwrap();
 
-    let more = pages.push(vec![quote(datetime!(2026-11-23 09:17:00 UTC), 1.0)]);
+    let stop = pages.push(vec![quote(start, 1.0)]);
+    assert_eq!(stop, ControlFlow::Break(PagingStop::ReachedStart));
 
-    assert_eq!(more, ControlFlow::Continue(()));
-    assert_eq!(pages.request_end(), datetime!(2026-11-23 09:17:00 UTC));
-    assert_eq!(bids(&pages.into_ticks()), vec![1.0]);
+    let result = pages.finish(PagingStop::ReachedStart);
+    assert_eq!(bids(&result.ticks), vec![1.0]);
+    assert_eq!(result.from, None);
+    assert_eq!(result.stop, PagingStop::UnverifiedQuoteSecond);
+}
+
+#[test]
+fn sole_quote_second_with_multiple_ticks_can_cover_the_range() {
+    let start = datetime!(2026-11-23 09:17:00 UTC);
+    let end = datetime!(2026-11-23 09:17:01 UTC);
+    let mut pages = TickPages::new(Some(start), end, None).unwrap();
+
+    let stop = pages.push(vec![quote(start, 1.0), quote(start, 2.0)]);
+    assert_eq!(stop, ControlFlow::Break(PagingStop::ReachedStart));
+
+    let result = pages.finish(PagingStop::ReachedStart);
+    assert_eq!(bids(&result.ticks), vec![1.0, 2.0]);
+    assert_eq!(result.from, Some(start));
+    assert_eq!(result.stop, PagingStop::ReachedStart);
+}
+
+#[test]
+fn resuming_after_an_unverified_quote_replaces_that_second() {
+    let mut pages = TickPages::new(None, datetime!(2026-11-23 09:17:03 UTC), None).unwrap();
+    let ambiguous = datetime!(2026-11-23 09:16:59 UTC);
+    let complete = datetime!(2026-11-23 09:17:00 UTC);
+    assert_eq!(
+        pages.push(vec![quote(ambiguous, 1.0), quote(complete, 2.0), quote(complete, 2.0)]),
+        ControlFlow::Continue(())
+    );
+    assert_eq!(pages.request_end(), complete);
+    assert_eq!(pages.push(vec![quote(ambiguous, 1.0)]), ControlFlow::Continue(()));
+    assert_eq!(pages.request_end(), ambiguous);
+
+    let error = pages.fail(Error::Timeout);
+
+    assert!(matches!(error.error, Error::Timeout));
+    assert_eq!(bids(&error.ticks), vec![1.0, 2.0, 2.0]);
+    assert_eq!(error.from, Some(complete));
+
+    let resume_at = error.from.unwrap();
+    let mut resumed = TickPages::new(Some(ambiguous), resume_at, None).unwrap();
+    assert_eq!(resumed.request_end(), complete);
+    assert_eq!(
+        resumed.push(vec![quote(ambiguous, 1.0), quote(ambiguous, 1.0), quote(complete, 2.0)]),
+        ControlFlow::Break(PagingStop::ReachedStart)
+    );
+    let mut ticks = resumed.finish(PagingStop::ReachedStart).ticks;
+    ticks.extend(error.ticks.into_iter().filter(|tick| tick.time >= resume_at));
+
+    assert_eq!(bids(&ticks), vec![1.0, 1.0, 2.0, 2.0]);
 }
 
 #[test]
 fn failure_keeps_the_complete_seconds_fetched() {
-    let mut pages = TickPages::new(Some(datetime!(2026-11-23 09:00:00 UTC)), datetime!(2026-11-23 09:17:01 UTC), None).unwrap();
+    let mut pages = TickPages::new(Some(datetime!(2026-11-23 09:00:00 UTC)), datetime!(2026-11-23 09:17:01.5 UTC), None).unwrap();
     let more = pages.push(vec![
         quote(datetime!(2026-11-23 09:16:59 UTC), 1.0),
         quote(datetime!(2026-11-23 09:17:00 UTC), 2.0),
@@ -192,7 +259,7 @@ fn failure_keeps_the_complete_seconds_fetched() {
 
 #[test]
 fn failure_before_any_page_keeps_nothing() {
-    let pages = TickPages::<TickLast>::new(Some(datetime!(2026-11-23 09:00:00 UTC)), datetime!(2026-11-23 09:17:01 UTC), None).unwrap();
+    let pages = TickPages::<TickLast>::new(Some(datetime!(2026-11-23 09:00:00 UTC)), datetime!(2026-11-23 09:17:01.5 UTC), None).unwrap();
 
     let error = pages.fail(Error::ConnectionReset);
 
@@ -215,7 +282,7 @@ fn trade_page() -> Vec<TickLast> {
 
 #[test]
 fn limit_keeps_the_latest_whole_seconds() {
-    let mut pages = TickPages::new(None, datetime!(2026-11-13 14:29:59 UTC), Some(3)).unwrap();
+    let mut pages = TickPages::new(None, datetime!(2026-11-13 14:29:59.5 UTC), Some(3)).unwrap();
     assert!(!pages.limit_reached());
 
     assert_eq!(pages.push(trade_page()), ControlFlow::Continue(()));
@@ -255,7 +322,7 @@ fn limit_counts_only_ticks_in_the_range() {
 
 #[test]
 fn limit_of_zero_is_reached_before_any_request() {
-    let pages = TickPages::<TickLast>::new(None, datetime!(2026-11-13 14:29:59 UTC), Some(0)).unwrap();
+    let pages = TickPages::<TickLast>::new(None, datetime!(2026-11-13 14:29:59.5 UTC), Some(0)).unwrap();
 
     assert!(pages.limit_reached());
     assert_eq!(
@@ -270,7 +337,7 @@ fn limit_of_zero_is_reached_before_any_request() {
 
 #[test]
 fn limit_dropping_ticks_after_the_start_reports_the_limit() {
-    let mut pages = TickPages::new(Some(datetime!(2026-11-13 14:28:34 UTC)), datetime!(2026-11-13 14:29:59 UTC), Some(3)).unwrap();
+    let mut pages = TickPages::new(Some(datetime!(2026-11-13 14:28:34 UTC)), datetime!(2026-11-13 14:29:59.5 UTC), Some(3)).unwrap();
 
     let more = pages.push(trade_page());
     let result = pages.finish(PagingStop::ReachedStart);
@@ -284,7 +351,7 @@ fn limit_dropping_ticks_after_the_start_reports_the_limit() {
 #[test]
 fn limit_dropping_nothing_keeps_the_stop() {
     let start = datetime!(2026-11-13 14:28:34 UTC);
-    let mut pages = TickPages::new(Some(start), datetime!(2026-11-13 14:29:59 UTC), Some(6)).unwrap();
+    let mut pages = TickPages::new(Some(start), datetime!(2026-11-13 14:29:59.5 UTC), Some(6)).unwrap();
 
     let more = pages.push(trade_page());
     let result = pages.finish(PagingStop::ReachedStart);
@@ -297,7 +364,7 @@ fn limit_dropping_nothing_keeps_the_stop() {
 
 #[test]
 fn without_a_start_paging_goes_on_until_an_empty_page() {
-    let mut pages = TickPages::new(None, datetime!(2026-11-13 14:29:59 UTC), Some(100)).unwrap();
+    let mut pages = TickPages::new(None, datetime!(2026-11-13 14:29:59.5 UTC), Some(100)).unwrap();
 
     let first = pages.push(trade_page());
     let second = pages.push(Vec::new());

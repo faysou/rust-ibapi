@@ -422,3 +422,76 @@ fn what_to_show_trades_for_updates_security_type() {
         assert_eq!(WhatToShow::trades_for_updates(&security_type), expected, "{security_type:?}");
     }
 }
+
+fn tick_frame_kind_error<T: TickDecoder<T>>(message_type: IncomingMessages) -> Option<(WhatToShow, WhatToShow)> {
+    let message = crate::common::test_utils::helpers::proto_response(message_type, vec![]);
+    match TickFrame::<T>::decode(&DecoderContext::default(), &message) {
+        Err(Error::UnexpectedTickKind { requested, received }) => Some((requested, received)),
+        _ => None,
+    }
+}
+
+// TWS answers a TRADES request for EUR.USD with a HistoricalTick (midpoint) frame and nothing after it
+#[test]
+fn tick_frame_of_another_kind_is_an_error() {
+    let cases = [
+        (
+            "last <- midpoint",
+            tick_frame_kind_error::<TickLast>(IncomingMessages::HistoricalTick),
+            WhatToShow::Trades,
+            WhatToShow::MidPoint,
+        ),
+        (
+            "last <- bid/ask",
+            tick_frame_kind_error::<TickLast>(IncomingMessages::HistoricalTickBidAsk),
+            WhatToShow::Trades,
+            WhatToShow::BidAsk,
+        ),
+        (
+            "bid/ask <- last",
+            tick_frame_kind_error::<TickBidAsk>(IncomingMessages::HistoricalTickLast),
+            WhatToShow::BidAsk,
+            WhatToShow::Trades,
+        ),
+        (
+            "bid/ask <- midpoint",
+            tick_frame_kind_error::<TickBidAsk>(IncomingMessages::HistoricalTick),
+            WhatToShow::BidAsk,
+            WhatToShow::MidPoint,
+        ),
+        (
+            "midpoint <- last",
+            tick_frame_kind_error::<TickMidpoint>(IncomingMessages::HistoricalTickLast),
+            WhatToShow::MidPoint,
+            WhatToShow::Trades,
+        ),
+        (
+            "midpoint <- bid/ask",
+            tick_frame_kind_error::<TickMidpoint>(IncomingMessages::HistoricalTickBidAsk),
+            WhatToShow::MidPoint,
+            WhatToShow::BidAsk,
+        ),
+    ];
+    for (name, actual, requested, received) in cases {
+        assert_eq!(actual, Some((requested, received)), "{name}");
+    }
+}
+
+#[test]
+fn tick_frame_of_the_requested_kind_decodes() {
+    use crate::testdata::builders::market_data::{historical_ticks_response, tick_midpoint};
+    use crate::testdata::builders::ResponseProtoEncoder;
+
+    let message = crate::common::test_utils::helpers::proto_response(
+        IncomingMessages::HistoricalTick,
+        historical_ticks_response()
+            .tick(tick_midpoint(1_795_463_984, 1.09043))
+            .done(true)
+            .encode_proto(),
+    );
+
+    let frame = TickFrame::<TickMidpoint>::decode(&DecoderContext::default(), &message).expect("a midpoint frame");
+
+    assert_eq!(frame.ticks.iter().map(|tick| tick.price).collect::<Vec<_>>(), [1.09043]);
+    assert!(frame.done);
+}

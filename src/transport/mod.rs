@@ -4,7 +4,9 @@
 pub(crate) mod common;
 
 #[cfg(feature = "sync")]
-use std::{sync::Mutex, time::Duration};
+use std::sync::Mutex;
+#[cfg(all(feature = "sync", test))]
+use std::time::Duration;
 
 #[cfg(feature = "sync")]
 use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
@@ -532,6 +534,7 @@ impl InternalSubscription {
     }
 
     /// Receives a routed item, with a relative timeout.
+    #[cfg(test)]
     pub(crate) fn next_timeout_routed(&self, timeout: Duration) -> Option<RoutedItem> {
         self.pick_receiver()?.recv_timeout(timeout).ok()
     }

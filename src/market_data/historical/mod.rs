@@ -4,8 +4,8 @@
 //!
 //! Historical-data methods are inherent methods on `ibapi::Client` — call
 //! `client.historical_data(...)`, `client.historical_ticks_mid_point(...)`,
-//! etc. The public types (`Bar`, `BarSize`, `WhatToShow`, `TickSubscription`,
-//! and the per-tick payload types) live at
+//! etc. The public types (`Bar`, `BarSize`, `WhatToShow`, and the per-tick
+//! payload types) live at
 //! `ibapi::market_data::historical::*` and via `ibapi::prelude::*`.
 //!
 //! The `historical::sync` and `historical::r#async` submodules where the impls
@@ -30,6 +30,8 @@ use crate::messages::{
     IncomingMessages, Notice, ResponseMessage, NO_SECURITY_DEFINITION_CODE, REQUEST_VALIDATION_CODE, SUBSCRIPTION_DISCONNECTED_CODE,
     WHAT_TO_SHOW_SUBSTITUTED_CODE,
 };
+use crate::protocol::Features;
+use crate::subscriptions::common::is_undeclared;
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
@@ -973,24 +975,11 @@ impl_wire_string_serde!(WhatToShow as "HistoricalWhatToShow" {
     AdjustedLast
 });
 
-// Re-export non-function items
-#[cfg(feature = "async")]
-pub use r#async::TickSubscription;
-
-/// Trait implemented by historical tick types that can decode IB messages.
-///
-/// External users can name the trait as a bound on [`TickSubscription<T>`], but
-/// cannot call [`decode`](Self::decode) themselves — the argument
-/// `ResponseMessage` is crate-private. Implementations are restricted to the
-/// three built-in tick types ([`TickBidAsk`], [`TickLast`], [`TickMidpoint`]);
-/// custom implementations are not supported.
-#[allow(private_interfaces)]
-pub trait TickDecoder<T> {
-    /// Message types this decoder consumes; everything else on the channel is
-    /// skipped. Named and shaped to match `StreamDecoder::RESPONSE_MESSAGE_IDS`
-    /// so the tick driver's skip filter is the same decision as the two
-    /// subscription drivers', not a third copy of it — a tick type happens to
-    /// declare exactly one entry.
+/// Implemented by the three historical tick types: how one reply frame decodes
+/// into ticks.
+pub(crate) trait TickDecoder<T> {
+    /// Message types this decoder consumes. A tick type declares exactly one;
+    /// [`TickFrame`] ends the request on a frame of another tick kind.
     const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages];
     /// The kind of tick this decoder reads, as the request names it.
     const WHAT_TO_SHOW: WhatToShow;
@@ -1002,7 +991,6 @@ pub trait TickDecoder<T> {
     fn decode(message: &ResponseMessage) -> Result<(Vec<T>, bool), Error>;
 }
 
-#[allow(private_interfaces)]
 impl TickDecoder<TickBidAsk> for TickBidAsk {
     const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[IncomingMessages::HistoricalTickBidAsk];
     const WHAT_TO_SHOW: WhatToShow = WhatToShow::BidAsk;
@@ -1012,7 +1000,6 @@ impl TickDecoder<TickBidAsk> for TickBidAsk {
     }
 }
 
-#[allow(private_interfaces)]
 impl TickDecoder<TickLast> for TickLast {
     const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[IncomingMessages::HistoricalTickLast];
     const WHAT_TO_SHOW: WhatToShow = WhatToShow::Trades;
@@ -1022,7 +1009,6 @@ impl TickDecoder<TickLast> for TickLast {
     }
 }
 
-#[allow(private_interfaces)]
 impl TickDecoder<TickMidpoint> for TickMidpoint {
     const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[IncomingMessages::HistoricalTick];
     const WHAT_TO_SHOW: WhatToShow = WhatToShow::MidPoint;
@@ -1032,9 +1018,56 @@ impl TickDecoder<TickMidpoint> for TickMidpoint {
     }
 }
 
-// Re-export TickSubscription and iterator types based on active feature
-#[cfg(all(feature = "sync", not(feature = "async")))]
-pub use sync::{TickSubscription, TickSubscriptionIter, TickSubscriptionOwnedIter, TickSubscriptionTimeoutIter, TickSubscriptionTryIter};
+/// One frame of a historical ticks reply: its ticks, and whether TWS has
+/// finished the request with it.
+pub(crate) struct TickFrame<T> {
+    pub(crate) ticks: Vec<T>,
+    pub(crate) done: bool,
+}
+
+impl<T: TickDecoder<T>> StreamDecoder<TickFrame<T>> for TickFrame<T> {
+    /// Every tick kind, not only the requested one: TWS answers a request for
+    /// a kind the contract has none of with another kind, and sends nothing
+    /// after it (`docs/wire-facts/market-data.md#historical-ticks-of-another-kind`).
+    const RESPONSE_MESSAGE_IDS: &'static [IncomingMessages] = &[
+        IncomingMessages::HistoricalTickLast,
+        IncomingMessages::HistoricalTickBidAsk,
+        IncomingMessages::HistoricalTick,
+    ];
+
+    fn decode(_context: &DecoderContext, message: &ResponseMessage) -> Result<Self, Error> {
+        if is_undeclared(T::RESPONSE_MESSAGE_IDS, message) {
+            let received = match message.message_type() {
+                IncomingMessages::HistoricalTickLast => WhatToShow::Trades,
+                IncomingMessages::HistoricalTickBidAsk => WhatToShow::BidAsk,
+                IncomingMessages::HistoricalTick => WhatToShow::MidPoint,
+                _ => return Err(Error::unexpected_response(message)),
+            };
+            return Err(Error::UnexpectedTickKind {
+                requested: T::WHAT_TO_SHOW,
+                received,
+            });
+        }
+        let (ticks, done) = T::decode(message)?;
+        Ok(Self { ticks, done })
+    }
+
+    /// Below server 215 TWS has no historical-ticks cancel, so dropping the
+    /// subscription writes nothing.
+    fn cancel_message(server_version: i32, request_id: Option<i32>, _context: Option<&DecoderContext>) -> Result<Option<Vec<u8>>, Error> {
+        if !Features::CANCEL_CONTRACT_DATA.is_supported_by(server_version) {
+            return Ok(None);
+        }
+        let request_id = error_helpers::require_request_id_for(request_id, "encode cancel historical ticks")?;
+        common::encoders::encode_cancel_historical_ticks(request_id).map(Some)
+    }
+
+    /// The `done` frame is the last: TWS has finished the request, so drop
+    /// writes no cancel.
+    fn ends_request(&self) -> bool {
+        self.done
+    }
+}
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]

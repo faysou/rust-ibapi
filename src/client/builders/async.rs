@@ -110,11 +110,6 @@ impl<'a> RequestBuilder<'a> {
                 .await
         }
     }
-
-    /// Send the request without creating a subscription
-    pub async fn send_raw(self, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
-        self.client.send_request(self.request_id, message).await
-    }
 }
 
 /// Builder for creating shared channel requests (without request IDs)

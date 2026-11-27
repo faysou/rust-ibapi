@@ -1,5 +1,6 @@
 // The decoder is not exercised; each test asserts that the right wire request
-// is sent, so the stub needs no responses.
+// is sent. The stub sends no reply, so the terminal ends with
+// `UnexpectedEndOfStream`.
 #[cfg(feature = "sync")]
 mod sync_tests {
     use time::macros::datetime;
@@ -17,11 +18,8 @@ mod sync_tests {
         let contract = Contract::stock("AAPL").build();
         let start = datetime!(2026-04-15 9:30:00 UTC);
 
-        let _sub = client
-            .historical_ticks(&contract, 100)
-            .starting(start)
-            .last()
-            .expect("last terminal failed");
+        let result = client.historical_ticks(&contract, 100).starting(start).last();
+        assert!(matches!(result, Err(crate::Error::UnexpectedEndOfStream)), "{result:?}");
 
         assert_request(
             &bus,
@@ -42,12 +40,12 @@ mod sync_tests {
         let contract = Contract::stock("AAPL").build();
         let end = datetime!(2026-04-15 16:00:00 UTC);
 
-        let _sub = client
+        let result = client
             .historical_ticks(&contract, 50)
             .ending(end)
             .trading_hours(TradingHours::Extended)
-            .mid_point()
-            .expect("mid_point terminal failed");
+            .mid_point();
+        assert!(matches!(result, Err(crate::Error::UnexpectedEndOfStream)), "{result:?}");
 
         assert_request(
             &bus,
@@ -68,11 +66,8 @@ mod sync_tests {
         let contract = Contract::stock("AAPL").build();
         let start = datetime!(2026-04-15 9:30:00 UTC);
 
-        let _sub = client
-            .historical_ticks(&contract, 25)
-            .starting(start)
-            .bid_ask(IgnoreSize::Yes)
-            .expect("bid_ask terminal failed");
+        let result = client.historical_ticks(&contract, 25).starting(start).bid_ask(IgnoreSize::Yes);
+        assert!(matches!(result, Err(crate::Error::UnexpectedEndOfStream)), "{result:?}");
 
         assert_request(
             &bus,
@@ -93,10 +88,8 @@ mod sync_tests {
         let (client, bus) = create_blocking_test_client_with_version(server_versions::HISTORICAL_TICKS);
         let contract = Contract::stock("AAPL").build();
 
-        let _sub = client
-            .historical_ticks(&contract, 10)
-            .bid_ask(IgnoreSize::No)
-            .expect("bid_ask terminal failed");
+        let result = client.historical_ticks(&contract, 10).bid_ask(IgnoreSize::No);
+        assert!(matches!(result, Err(crate::Error::UnexpectedEndOfStream)), "{result:?}");
 
         assert_request(
             &bus,
@@ -129,12 +122,8 @@ mod async_tests {
         let contract = Contract::stock("AAPL").build();
         let start = datetime!(2026-04-15 9:30:00 UTC);
 
-        let _sub = client
-            .historical_ticks(&contract, 100)
-            .starting(start)
-            .last()
-            .await
-            .expect("last terminal failed");
+        let result = client.historical_ticks(&contract, 100).starting(start).last().await;
+        assert!(matches!(result, Err(crate::Error::UnexpectedEndOfStream)), "{result:?}");
 
         assert_request(
             &bus,
@@ -155,13 +144,13 @@ mod async_tests {
         let contract = Contract::stock("AAPL").build();
         let end = datetime!(2026-04-15 16:00:00 UTC);
 
-        let _sub = client
+        let result = client
             .historical_ticks(&contract, 50)
             .ending(end)
             .trading_hours(TradingHours::Extended)
             .mid_point()
-            .await
-            .expect("mid_point terminal failed");
+            .await;
+        assert!(matches!(result, Err(crate::Error::UnexpectedEndOfStream)), "{result:?}");
 
         assert_request(
             &bus,
@@ -182,12 +171,8 @@ mod async_tests {
         let contract = Contract::stock("AAPL").build();
         let start = datetime!(2026-04-15 9:30:00 UTC);
 
-        let _sub = client
-            .historical_ticks(&contract, 25)
-            .starting(start)
-            .bid_ask(IgnoreSize::Yes)
-            .await
-            .expect("bid_ask terminal failed");
+        let result = client.historical_ticks(&contract, 25).starting(start).bid_ask(IgnoreSize::Yes).await;
+        assert!(matches!(result, Err(crate::Error::UnexpectedEndOfStream)), "{result:?}");
 
         assert_request(
             &bus,
@@ -253,7 +238,7 @@ mod sync_between_tests {
         ticks.iter().map(|tick| tick.price).collect()
     }
 
-    // A failed page's subscription also writes a cancel when dropped, so only the requests are counted
+    // A page that fails before TWS finishes it also writes a cancel, so only the requests are counted
     fn assert_request_ends(bus: &MessageBusStub, contract: &Contract, ends: &[OffsetDateTime]) {
         assert_eq!(
             count_proto_msgs(&bus.request_messages(), OutgoingMessages::RequestHistoricalTicks),
@@ -280,8 +265,7 @@ mod sync_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .trading_hours(TradingHours::Extended)
             .last()
             .expect("between failed");
@@ -306,8 +290,7 @@ mod sync_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .trading_hours(TradingHours::Extended)
             .last()
             .expect("between failed");
@@ -324,8 +307,7 @@ mod sync_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .trading_hours(TradingHours::Extended)
             .last()
             .expect("between failed");
@@ -342,8 +324,7 @@ mod sync_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .trading_hours(TradingHours::Extended)
             .last()
             .expect("between failed");
@@ -364,8 +345,7 @@ mod sync_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let error = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .trading_hours(TradingHours::Extended)
             .last()
             .expect_err("between succeeded");
@@ -389,8 +369,7 @@ mod sync_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let error = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .trading_hours(TradingHours::Extended)
             .last()
             .expect_err("between succeeded");
@@ -405,13 +384,12 @@ mod sync_between_tests {
     #[test]
     fn between_times_out_an_unanswered_page_and_keeps_the_ticks_before_it() {
         let bus = std::sync::Arc::new(MessageBusStub::with_responses_per_request(vec![vec![page()], vec![]]).keeping_channels_open());
-        let client = crate::client::blocking::Client::stubbed(bus.clone(), server_versions::SIZE_RULES)
+        let client = crate::client::blocking::Client::stubbed(bus.clone(), server_versions::CANCEL_CONTRACT_DATA)
             .with_one_shot_timeout(std::time::Duration::from_millis(50));
         let contract = Contract::stock("AAPL").build();
 
         let error = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .trading_hours(TradingHours::Extended)
             .last()
             .expect_err("between succeeded");
@@ -450,8 +428,7 @@ mod sync_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .limit(2)
             .trading_hours(TradingHours::Extended)
             .last()
@@ -469,8 +446,7 @@ mod sync_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .between(datetime!(2026-11-13 14:28:00 UTC), END)
+            .historical_ticks_between(&contract, datetime!(2026-11-13 14:28:00 UTC), END)
             .limit(1000)
             .trading_hours(TradingHours::Extended)
             .last()
@@ -492,8 +468,7 @@ mod sync_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let error = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .limit(10)
             .trading_hours(TradingHours::Extended)
             .last()
@@ -511,8 +486,7 @@ mod sync_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .latest(3, END)
+            .historical_ticks_latest(&contract, 3, END)
             .trading_hours(TradingHours::Extended)
             .last()
             .expect("latest failed");
@@ -529,8 +503,7 @@ mod sync_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .latest(10, END)
+            .historical_ticks_latest(&contract, 10, END)
             .trading_hours(TradingHours::Extended)
             .last()
             .expect("latest failed");
@@ -554,8 +527,7 @@ mod sync_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let error = client
-            .historical_ticks(&contract, 1000)
-            .latest(10, END)
+            .historical_ticks_latest(&contract, 10, END)
             .trading_hours(TradingHours::Extended)
             .last()
             .expect_err("latest succeeded");
@@ -571,7 +543,7 @@ mod sync_between_tests {
         let (client, bus) = create_blocking_test_client_with_version(server_versions::HISTORICAL_TICKS);
         let contract = Contract::stock("AAPL").build();
 
-        let result = client.historical_ticks(&contract, 1000).latest(0, END).last().expect("latest failed");
+        let result = client.historical_ticks_latest(&contract, 0, END).last().expect("latest failed");
 
         assert!(result.ticks.is_empty());
         assert_eq!(result.from, None);
@@ -586,8 +558,7 @@ mod sync_between_tests {
         let time = datetime!(2026-11-13 14:30 UTC);
 
         let error = client
-            .historical_ticks(&contract, 1000)
-            .between(time, time)
+            .historical_ticks_between(&contract, time, time)
             .mid_point()
             .expect_err("end == start was accepted");
 
@@ -619,7 +590,7 @@ mod async_between_tests {
     use crate::Error;
 
     const START: OffsetDateTime = datetime!(2026-11-23 09:16:00 UTC);
-    const END: OffsetDateTime = datetime!(2026-11-23 09:17:01 UTC);
+    const END: OffsetDateTime = datetime!(2026-11-23 09:17:01.5 UTC);
 
     // Midpoints at 09:16:59, 09:17:00 and 09:17:01 UTC. TWS sends one tick of a midpoint page's
     // earliest second, so the page is complete from 09:17:00.
@@ -643,7 +614,7 @@ mod async_between_tests {
         ticks.iter().map(|tick| tick.price).collect()
     }
 
-    // A failed page's subscription also writes a cancel when dropped, so only the requests are counted
+    // A page that fails before TWS finishes it also writes a cancel, so only the requests are counted
     fn assert_request_ends(bus: &MessageBusStub, contract: &Contract, ends: &[OffsetDateTime]) {
         assert_eq!(
             count_proto_msgs(&bus.request_messages(), OutgoingMessages::RequestHistoricalTicks),
@@ -665,7 +636,7 @@ mod async_between_tests {
     }
 
     #[tokio::test]
-    async fn between_pages_back_to_the_earliest_second() {
+    async fn between_keeps_a_single_quote_without_certifying_its_second() {
         let (client, bus) = create_test_client_with_ordered_proto_responses(vec![proto_response(
             IncomingMessages::HistoricalTickBidAsk,
             historical_ticks_bid_ask_response()
@@ -678,16 +649,15 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .between(datetime!(2026-11-13 14:26:44 UTC), datetime!(2026-11-13 14:29:59.5 UTC))
+            .historical_ticks_between(&contract, datetime!(2026-11-13 14:26:44 UTC), datetime!(2026-11-13 14:29:59.5 UTC))
             .bid_ask(IgnoreSize::Yes)
             .await
             .expect("between failed");
 
         let bids: Vec<f64> = result.ticks.iter().map(|tick| tick.price_bid).collect();
         assert_eq!(bids, vec![7_100.00, 7_101.25]);
-        assert_eq!(result.from, Some(datetime!(2026-11-13 14:28:35 UTC)));
-        assert_eq!(result.stop, PagingStop::EmptyPage);
+        assert_eq!(result.from, Some(datetime!(2026-11-13 14:28:36 UTC)));
+        assert_eq!(result.stop, PagingStop::UnverifiedQuoteSecond);
         // The earliest second of a bid/ask page is partial, so the second request ends after it;
         // the repeated page then holds only that second, kept as it is
         let ends = [
@@ -727,8 +697,7 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .mid_point()
             .await
             .expect("between failed");
@@ -745,8 +714,7 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .mid_point()
             .await
             .expect("between failed");
@@ -763,8 +731,7 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .mid_point()
             .await
             .expect("between failed");
@@ -785,8 +752,7 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let error = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .mid_point()
             .await
             .expect_err("between succeeded");
@@ -810,8 +776,7 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let error = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .mid_point()
             .await
             .expect_err("between succeeded");
@@ -826,13 +791,12 @@ mod async_between_tests {
     #[tokio::test]
     async fn between_times_out_an_unanswered_page_and_keeps_the_ticks_before_it() {
         let bus = std::sync::Arc::new(MessageBusStub::with_responses_per_request(vec![vec![page()], vec![]]).keeping_channels_open());
-        let client =
-            crate::Client::stubbed(bus.clone(), crate::server_versions::SIZE_RULES).with_one_shot_timeout(std::time::Duration::from_millis(50));
+        let client = crate::Client::stubbed(bus.clone(), crate::server_versions::CANCEL_CONTRACT_DATA)
+            .with_one_shot_timeout(std::time::Duration::from_millis(50));
         let contract = Contract::stock("AAPL").build();
 
         let error = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .mid_point()
             .await
             .expect_err("between succeeded");
@@ -865,8 +829,7 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .limit(1)
             .mid_point()
             .await
@@ -884,8 +847,7 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .between(datetime!(2026-11-23 09:16:59 UTC), END)
+            .historical_ticks_between(&contract, datetime!(2026-11-23 09:16:59 UTC), END)
             .limit(1000)
             .mid_point()
             .await
@@ -907,8 +869,7 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let error = client
-            .historical_ticks(&contract, 1000)
-            .between(START, END)
+            .historical_ticks_between(&contract, START, END)
             .limit(10)
             .mid_point()
             .await
@@ -926,8 +887,7 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .latest(3, END)
+            .historical_ticks_latest(&contract, 3, END)
             .mid_point()
             .await
             .expect("latest failed");
@@ -945,8 +905,7 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .latest(10, END)
+            .historical_ticks_latest(&contract, 10, END)
             .mid_point()
             .await
             .expect("latest failed");
@@ -970,8 +929,7 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let error = client
-            .historical_ticks(&contract, 1000)
-            .latest(10, END)
+            .historical_ticks_latest(&contract, 10, END)
             .mid_point()
             .await
             .expect_err("latest succeeded");
@@ -988,8 +946,7 @@ mod async_between_tests {
         let contract = Contract::stock("AAPL").build();
 
         let result = client
-            .historical_ticks(&contract, 1000)
-            .latest(0, END)
+            .historical_ticks_latest(&contract, 0, END)
             .mid_point()
             .await
             .expect("latest failed");

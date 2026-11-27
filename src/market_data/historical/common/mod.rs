@@ -1,6 +1,5 @@
 pub(super) mod decoders;
 pub(super) mod encoders;
-pub(crate) mod tick;
 pub(crate) mod tick_pages;
 
 #[cfg(test)]

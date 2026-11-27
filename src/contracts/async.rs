@@ -66,25 +66,11 @@ impl Client {
     pub async fn contract_details(&self, contract: &Contract) -> Result<Vec<ContractDetails>, Error> {
         let deadline = request_helpers::one_shot_deadline(self);
         let request = self.contract_details_stream(contract);
-        let Some(deadline) = deadline else {
-            return request.subscribe().await?.collect_to_end().await;
-        };
-        request_helpers::check_deadline(Some(deadline))?;
-        let (admission, cancel_write) = WriteAdmission::new(deadline);
-        let sending = request.subscribe_before(Some(admission))?;
-        // Keep a write in progress owned after timeout so it cannot truncate the shared socket.
-        let task = self.message_bus.runtime_handle().spawn(sending);
-        let mut subscription = tokio::select! {
-            biased;
-            () = tokio::time::sleep_until(deadline) => return Err(Error::Timeout),
-            result = task => match result {
-                Ok(subscription) => subscription?,
-                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-                Err(_) => return Err(Error::Shutdown),
-            },
-        };
-        drop(cancel_write);
-        subscription.collect_to_end_before(deadline).await
+        let mut subscription = request_helpers::send_with_deadline(self, deadline, |admission| request.subscribe_before(admission)).await?;
+        match deadline {
+            Some(deadline) => subscription.collect_to_end_before(deadline).await,
+            None => subscription.collect_to_end().await,
+        }
     }
 
     /// Build a contract-details request whose subscription yields one
