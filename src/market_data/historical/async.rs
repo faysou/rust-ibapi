@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use time::OffsetDateTime;
 
 use crate::client::ids::RequestId;
@@ -8,10 +10,11 @@ use crate::contracts::Contract;
 use crate::subscriptions::r#async::Subscription;
 use crate::{Client, Error};
 
+use super::common::tick_pages::{PagedTick, TickPages, PAGE_SIZE};
 use super::common::{self, encoders};
 use super::{
-    BarRequest, BarSize, Duration, HeadTimestampRequest, HistogramEntry, HistogramRequest, HistoricalData, HistoricalDataFrame, Schedule,
-    ScheduleRequest, TickDecoder, TickFrame, WhatToShow,
+    BarRequest, BarSize, Duration, HeadTimestampRequest, HistogramEntry, HistogramRequest, HistoricalData, HistoricalDataFrame, PagingStop, Schedule,
+    ScheduleRequest, TickDecoder, TickFrame, TicksBetween, TicksBetweenError, WhatToShow,
 };
 use crate::market_data::TradingHours;
 
@@ -200,6 +203,68 @@ impl Client {
         super::HistoricalTicksBuilder::new(self, contract, number_of_ticks)
     }
 
+    /// Page historical ticks in an inclusive-start, exclusive-end range.
+    ///
+    /// Each request asks for 1,000 ticks. See [`HistoricalTicksBetweenBuilder`](super::HistoricalTicksBetweenBuilder)
+    /// for tick types, limits, and partial results.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::Client;
+    /// use ibapi::contracts::Contract;
+    /// use time::macros::datetime;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), ibapi::Error> {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await?;
+    ///     let contract = Contract::stock("AAPL").build();
+    ///     let start = datetime!(2026-11-13 14:30 UTC);
+    ///     let end = datetime!(2026-11-13 14:35 UTC);
+    ///     let trades = client.historical_ticks_between(&contract, start, end).last().await?;
+    ///     println!("{} trades", trades.ticks.len());
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn historical_ticks_between<'a>(
+        &'a self,
+        contract: &'a Contract,
+        start: OffsetDateTime,
+        end: OffsetDateTime,
+    ) -> super::HistoricalTicksBetweenBuilder<'a, Self> {
+        super::HistoricalTicksBetweenBuilder::new(self, contract, Some(start), end, None)
+    }
+
+    /// Page backward before `end` until at least `limit` ticks are collected or TWS has no older ticks.
+    ///
+    /// The result may exceed `limit` to retain a whole second. A zero limit sends no requests.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::Client;
+    /// use ibapi::contracts::Contract;
+    /// use time::macros::datetime;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), ibapi::Error> {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await?;
+    ///     let contract = Contract::stock("AAPL").build();
+    ///     let end = datetime!(2026-11-13 14:35 UTC);
+    ///     let trades = client.historical_ticks_latest(&contract, 100, end).last().await?;
+    ///     println!("{} trades", trades.ticks.len());
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn historical_ticks_latest<'a>(
+        &'a self,
+        contract: &'a Contract,
+        limit: usize,
+        end: OffsetDateTime,
+    ) -> super::HistoricalTicksBetweenBuilder<'a, Self> {
+        super::HistoricalTicksBetweenBuilder::new(self, contract, None, end, Some(limit))
+    }
+
     /// Requests data histogram of specified contract.
     ///
     /// # Arguments
@@ -348,6 +413,50 @@ pub(crate) async fn historical_ticks<T: TickDecoder<T> + Send + 'static>(
         }
     })
     .await
+}
+
+// Pages `historical_ticks` backward from `end`, back to `start` or until `limit` ticks; see
+// `TickPages` for the rules. Same builder-to-encoder seam as `historical_ticks`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn historical_ticks_between<T: TickDecoder<T> + PagedTick + Send + 'static>(
+    client: &Client,
+    contract: &Contract,
+    start: Option<OffsetDateTime>,
+    end: OffsetDateTime,
+    limit: Option<usize>,
+    what_to_show: WhatToShow,
+    trading_hours: TradingHours,
+    ignore_size: bool,
+) -> Result<TicksBetween<T>, TicksBetweenError<T>> {
+    let mut pages = TickPages::new(start, end, limit)?;
+
+    loop {
+        if pages.limit_reached() {
+            return Ok(pages.finish(PagingStop::LimitReached));
+        }
+
+        // Each page is one request, so `one_shot_timeout` bounds each page on its own
+        let page = historical_ticks::<T>(
+            client,
+            contract,
+            None,
+            Some(pages.request_end()),
+            PAGE_SIZE,
+            what_to_show,
+            trading_hours,
+            ignore_size,
+        )
+        .await;
+
+        match page {
+            Ok(page) => {
+                if let ControlFlow::Break(stop) = pages.push(page) {
+                    return Ok(pages.finish(stop));
+                }
+            }
+            Err(error) => return Err(pages.fail(error)),
+        }
+    }
 }
 
 pub(crate) async fn historical_schedule(

@@ -32,7 +32,10 @@ use crate::{Error, ToField};
 pub(crate) mod common;
 
 mod builder;
-pub use builder::{HistoricalDataBuilder, HistoricalScheduleBuilder, HistoricalTicksBuilder};
+pub use builder::{
+    HistoricalDataBuilder, HistoricalScheduleBuilder, HistoricalTicksBetweenBuilder, HistoricalTicksBuilder, PagingStop, TicksBetween,
+    TicksBetweenError,
+};
 
 pub use super::{TickAttributeBidAsk, TickAttributeLast, TickBidAsk, TickLast, TickMidpoint};
 
